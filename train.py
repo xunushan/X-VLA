@@ -287,7 +287,11 @@ def main(args):
     model = XVLA.from_pretrained(args.models, config=config)
     processor = XVLAProcessor.from_pretrained(args.models)
 
-    # Iterable dataloader (don't wrap with prepare)
+    # Iterable dataloader。多进程数据分片：accelerate 对 IterableDataset 自动套
+    # IterableDatasetShard 按 rank 切流（不是 DistributedSampler——那只适用 map-style
+    # 数据集）。必须 device_placement=[False]：否则走 DataLoaderDispatcher，对 batch 内
+    # language_instruction 字符串字段无法 concatenate 而崩溃；batch 由下方
+    # inputs.to(accelerator.device) 搬运，不影响设备放置。
     train_dataloader = create_dataloader(
         batch_size=args.batch_size,
         metas_path=args.train_metas_path,
@@ -295,6 +299,7 @@ def main(args):
         action_mode=model.action_mode,
         training=True,
     )
+    train_dataloader = accelerator.prepare(train_dataloader, device_placement=[False])
     train_iter = iter(train_dataloader)
 
     # Optimizer
@@ -321,18 +326,15 @@ def main(args):
     )
 
     # InfiniteDataReader 是无限流，不会抛 StopIteration，无需重启处理
-    last_cfg_step = -1
     while global_step < args.iters:
+        # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
+        # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
+        # 冻结组阶段一 False、阶段二 True）。
+        configure_training_step(optim, global_step, args)
+
         with accelerator.accumulate(model):
             # 取一个 micro-batch
             batch = next(train_iter)
-
-            # 统一配置：学习率 + 冻结状态。每个 optimizer 步在首个 micro-batch 的
-            # forward 前配置一次（门控避免累积期间重复遍历 vlm 参数），且须在
-            # backward 之前生效——真冻结参数才不计算梯度。
-            if last_cfg_step != global_step:
-                configure_training_step(optim, global_step, args)
-                last_cfg_step = global_step
 
             # Encode language
             lang = processor.encode_language(batch["language_instruction"])
