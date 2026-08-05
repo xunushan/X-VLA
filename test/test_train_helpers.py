@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -134,3 +135,77 @@ def test_accumulated_loss_average():
         losses.append(F.mse_loss(y, torch.zeros_like(y)) / 2)
     full = F.mse_loss(x @ w, torch.zeros_like(x @ w))
     assert sum(losses).item() == pytest.approx(full.item(), rel=1e-6)
+
+
+# ---------------------------------------------------------------- checkpoint / resume
+def test_resolve_resume_dir_none(tmp_path):
+    """未传 --resume → 返回 None。"""
+    from train import resolve_resume_dir
+    args = argparse.Namespace(output_dir=str(tmp_path), resume=None)
+    assert resolve_resume_dir(args) is None
+
+
+def test_resolve_resume_dir_latest(tmp_path):
+    """--resume latest：取 step 最大的 ckpt-*。"""
+    from train import resolve_resume_dir
+    for step in (100, 50, 1000):
+        (tmp_path / f"ckpt-{step}").mkdir()
+    args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
+    assert resolve_resume_dir(args) == str(tmp_path / "ckpt-1000")
+
+
+def test_resolve_resume_dir_explicit_incomplete(tmp_path):
+    """显式路径缺 optimizer.pt → 判为不可恢复，抛错。"""
+    from train import resolve_resume_dir
+    d = tmp_path / "ckpt-10"
+    d.mkdir()
+    (d / "state.json").write_text('{"global_step": 10}')
+    args = argparse.Namespace(output_dir=str(tmp_path), resume=str(d))
+    with pytest.raises(ValueError, match="optimizer.pt"):
+        resolve_resume_dir(args)
+
+
+def test_optimizer_state_roundtrip(tmp_path):
+    """AdamW state（exp_avg/exp_avg_sq/param_groups 含 name）save→load 往返等价：
+    resume 靠它恢复优化器动量与参数组划分。"""
+    from train import build_optimizer
+    model = FakeXVLA()
+    optim = build_optimizer(model, 1e-4, 0.0, (0.9, 0.95), 1.0)
+    # 产生梯度并 step，形成 optimizer state
+    (model.vlm.lin.weight.sum() + model.transformer.block.weight.sum()).backward()
+    optim.step()
+    optim.zero_grad()
+    state = optim.state_dict()
+    assert state["state"], "step 后 optimizer 应有 state"
+    path = tmp_path / "optimizer.pt"
+    torch.save(state, path)
+
+    model2 = FakeXVLA()
+    optim2 = build_optimizer(model2, 1e-4, 0.0, (0.9, 0.95), 1.0)
+    optim2.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    s2 = optim2.state_dict()
+    assert set(s2["state"]) == set(state["state"])
+    for i in state["state"]:
+        assert torch.equal(s2["state"][i]["exp_avg"], state["state"][i]["exp_avg"])
+        assert torch.equal(s2["state"][i]["exp_avg_sq"], state["state"][i]["exp_avg_sq"])
+    # param_groups 的 name 字段一并恢复（configure_training_step 依赖它定位冻结组）
+    assert [g["name"] for g in s2["param_groups"]] == [g["name"] for g in state["param_groups"]]
+
+
+def test_rng_state_roundtrip(tmp_path):
+    """RNG save→load：restore 后 torch/random 采样序列与保存时一致。"""
+    from train import load_rng_state, save_rng_state
+    import random as pyrandom
+    path = tmp_path / "rng_state.pt"
+    torch.manual_seed(7)
+    pyrandom.seed(7)
+    np.random.seed(7)
+    save_rng_state(path)
+    a_t, a_py, a_np = torch.rand(1).item(), pyrandom.random(), np.random.rand()
+
+    torch.manual_seed(99)
+    pyrandom.seed(99)
+    np.random.seed(99)
+    load_rng_state(path)
+    b_t, b_py, b_np = torch.rand(1).item(), pyrandom.random(), np.random.rand()
+    assert a_t == b_t and a_py == b_py and a_np == b_np

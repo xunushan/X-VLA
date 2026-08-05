@@ -83,6 +83,12 @@ def get_args_parser():
         default="runnings",
         help="Directory to save checkpoints",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume from a checkpoint dir; 'latest'/'auto' picks the newest ckpt-* in --output_dir",
+    )
 
     # Data
     parser.add_argument(
@@ -141,6 +147,59 @@ def set_seed(seed: int):
     np.random.seed(seed)
     random.seed(seed)
     cudnn.benchmark = True
+
+
+def resolve_resume_dir(args) -> str | None:
+    """解析 `--resume` 为具体 checkpoint 目录（未 resume 时返回 None）。
+
+    - `<path>`：显式 checkpoint 目录，必须含 state.json + optimizer.pt（完整可恢复）；
+    - `latest` / `auto`：取 --output_dir 下 step 最大的 ckpt-*。
+    """
+    if not args.resume:
+        return None
+    if args.resume in ("latest", "auto"):
+        ckpts = sorted(
+            (d for d in Path(args.output_dir).glob("ckpt-*") if d.is_dir()),
+            key=lambda d: int(d.name.split("-")[-1]),
+        )
+        if not ckpts:
+            raise ValueError(
+                f"--resume={args.resume} but no ckpt-* dir found under {args.output_dir}"
+            )
+        return str(ckpts[-1])
+    resume_dir = Path(args.resume)
+    for required in ("state.json", "optimizer.pt"):
+        if not (resume_dir / required).exists():
+            raise ValueError(
+                f"--resume dir {resume_dir} missing {required}: not a complete checkpoint"
+            )
+    return str(resume_dir)
+
+
+def save_rng_state(path):
+    """保存 RNG（torch/cuda/numpy/random）供 resume 恢复模型内 dropout 序列。
+
+    注：数据流在 worker 进程内（num_workers=4），worker RNG 在 spawn 时重新播种，
+    无法随 checkpoint 恢复——无限流数据顺序 resume 后不严格连续（见 docs/todo.md）。
+    """
+    state = {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy": np.random.get_state(),
+        "random": random.getstate(),
+    }
+    torch.save(state, path)
+
+
+def load_rng_state(path):
+    """恢复 RNG（与 save_rng_state 对称）。自产文件，含 numpy state，需 weights_only=False。"""
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None and torch.cuda.is_available():
+        # 截断到当前 device 数：resume 时 GPU 数量可能与保存时不同
+        torch.cuda.set_rng_state_all(state["cuda"][: torch.cuda.device_count()])
+    np.random.set_state(state["numpy"])
+    random.setstate(state["random"])
 
 
 def build_optimizer(
@@ -273,18 +332,37 @@ def main(args):
     accelerator.wait_for_everyone()
     logger = get_logger(__name__, output_dir=output_dir, accelerator=accelerator)
 
+    # ---- Resume 解析：None 或具体 ckpt 目录 ----
+    resume_dir = resolve_resume_dir(args)
+
     set_seed(args.seed + accelerator.process_index)
+    if resume_dir is not None:
+        rng_path = os.path.join(resume_dir, "rng_state.pt")
+        if os.path.exists(rng_path):
+            load_rng_state(rng_path)
+        else:
+            logger.warning(f"No rng_state.pt in {resume_dir}; skip RNG restore")
     logger.info(f"Args: {args}")
 
     # Load model & processor
-    # action_mode 覆盖属配置层职责：由 XVLAConfig.from_pretrained 的 kwargs 直接完成
-    # （PretrainedConfig.from_dict 会把已有属性用 kwargs 覆盖），不再在训练代码里改 config。
-    config = XVLAConfig.from_pretrained(args.models)
-    if args.action_mode is not None:
-        config.action_mode = args.action_mode
-        logger.info(f"Override action_mode -> {config.action_mode}")
-
-    model = XVLA.from_pretrained(args.models, config=config)
+    # 正常训练：预训练权重 + action_mode 覆盖（覆盖属配置层职责，由 XVLAConfig 完成）。
+    # Resume：以 checkpoint 自身 config.json 为准（即训练时真实结构/action_mode），权重从
+    # checkpoint 加载，避免手传 --action_mode 与 checkpoint 不一致导致形状错配。
+    if resume_dir is not None:
+        config = XVLAConfig.from_pretrained(resume_dir)
+        if args.action_mode is not None and config.action_mode != args.action_mode:
+            logger.warning(
+                f"--action_mode {args.action_mode} != checkpoint action_mode "
+                f"{config.action_mode}; using checkpoint config"
+            )
+        logger.info(f"Resume from {resume_dir} (action_mode={config.action_mode})")
+        model = XVLA.from_pretrained(resume_dir, config=config)
+    else:
+        config = XVLAConfig.from_pretrained(args.models)
+        if args.action_mode is not None:
+            config.action_mode = args.action_mode
+            logger.info(f"Override action_mode -> {config.action_mode}")
+        model = XVLA.from_pretrained(args.models, config=config)
     processor = XVLAProcessor.from_pretrained(args.models)
 
     # Iterable dataloader。多进程数据分片：accelerate 对 IterableDataset 自动套
@@ -302,7 +380,8 @@ def main(args):
     train_dataloader = accelerator.prepare(train_dataloader, device_placement=[False])
     train_iter = iter(train_dataloader)
 
-    # Optimizer
+    # Optimizer（resume 时在 prepare 之前把动量/步数灌回裸 AdamW；optim.state_dict()/load_state_dict
+    # 由 AcceleratedOptimizer 委托到底层 AdamW，param_groups 的 name 字段一并恢复）
     optim = build_optimizer(
         model=model,
         lr=args.learning_rate,
@@ -310,12 +389,26 @@ def main(args):
         betas=tuple(args.betas),
         lr_coef_soft=args.learning_coef,
     )
+    if resume_dir is not None:
+        optim.load_state_dict(
+            torch.load(
+                os.path.join(resume_dir, "optimizer.pt"),
+                map_location="cpu",
+                weights_only=True,
+            )
+        )
+        logger.info(f"Optimizer state restored from {resume_dir}")
     model, optim = accelerator.prepare(model, optim)
 
     # Training loop
     model.train()
     base_model = accelerator.unwrap_model(model)
-    global_step, t0 = 0, time.time()
+    global_step = 0
+    if resume_dir is not None:
+        with open(os.path.join(resume_dir, "state.json")) as f:
+            global_step = int(json.load(f)["global_step"])
+        logger.info(f"Resume: continue from global_step={global_step}")
+    t0 = time.time()
     effective_batch = (
         args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     )
@@ -388,6 +481,10 @@ def main(args):
                     accelerator.print(f"💾 Saving model to {save_dir}")
                     base_model.save_pretrained(save_dir, safe_serialization=True)
                     processor.save_pretrained(save_dir)
+                    # Resume 必需状态：optimizer 动量/步数 + RNG（dropout 序列）+ global_step
+                    # （此前只存权重，无法恢复优化器，故 checkpoint 不可 resume）
+                    torch.save(optim.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+                    save_rng_state(os.path.join(save_dir, "rng_state.pt"))
                     with open(os.path.join(save_dir, "state.json"), "w") as f:
                         json.dump({"global_step": global_step}, f)
 
