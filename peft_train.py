@@ -80,6 +80,10 @@ def get_args_parser():
     # Data
     parser.add_argument("--train_metas_path", type=str, required=True, help="Path to training metadata")
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument(
+        "--num_workers", type=int, default=4,
+        help="DataLoader worker processes per rank (each worker independently decodes video)",
+    )
 
     # Optimizer
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -216,6 +220,7 @@ def main(args):
         num_actions=model.num_actions,
         action_mode=model.action_mode,
         training=True,
+        num_workers=args.num_workers,
     )
 
     # Optimizer

@@ -41,3 +41,15 @@
       状态恢复、loss 曲线连续。
 - [ ] resume 与冻结阶段交错：`freeze_steps` 前后各 resume 一次（阶段一冻结组 requires_grad
       恢复、阶段二全量解冻）。
+
+## 训练/推理图像预处理对齐（待验证风险）
+> 训练侧 `dataset.image_aug`（datasets/dataset.py）用 Resize(224, BICUBIC) → ToTensor(/255) →
+> Normalize **ImageNet 统计** (0.485,0.456,0.406)/(0.229,0.224,0.225)；推理侧
+> `processor.encode_image` 走 HF Florence-2 image_processor，默认 resize + rescale(/255) + normalize
+> 但统计量可能是 **CLIP 风格** (0.48145466,0.4578275,0.40821073)/(0.26862954,0.26130258,0.27577711)。
+- [ ] 确认预训练权重的 `preprocessor_config.json`（或 processor config）里 `image_mean/image_std`
+      到底用哪套统计；若与训练侧不同，统一成同一套（训练或推理二选一改）。
+- [ ] 原始图像不是 224 分辨率（如 720p/1280×720），resize 参数/插值方式需训练推理一致；
+      若推理 feed 的是已 CHW/0-1 化的 tensor，须还原为 HWC 0-255 或手动套同一 Normalize，
+      否则与训练不对齐（DaViT 内部不做任何归一化，见 models/modeling_florence2.py forward_features_unpool）。
+- [ ] 确认 DaViT 输入必须为 ImageNet 标准化后的 [C,H,W] float；任何一侧省掉 Normalize 都会破坏对齐。

@@ -96,6 +96,11 @@ def get_args_parser():
     )
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument(
+        "--num_workers", type=int, default=4,
+        help="DataLoader worker processes per rank (each worker independently decodes video; "
+             "on CPU-rich test machines raise this to parallelize decode)",
+    )
+    parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
@@ -182,7 +187,7 @@ def save_rng_state(path):
     按进程独立调用：每个 rank 写入 `rng_state_rank{process_index}.pt`，resume 时各 rank
     读回自己的文件，避免多进程 resume 后所有进程 dropout/augmentation 序列同步。
 
-    注：数据流在 worker 进程内（num_workers=4），worker RNG 在 spawn 时重新播种，
+    注：数据流在 worker 进程内（num_workers 由 --num_workers 指定，默认 4），worker RNG 在 spawn 时重新播种，
     无法随 checkpoint 恢复——无限流数据顺序 resume 后不严格连续（见 docs/todo.md）。
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -395,6 +400,7 @@ def main(args):
         num_actions=model.num_actions,
         action_mode=model.action_mode,
         training=True,
+        num_workers=args.num_workers,
     )
     train_dataloader = accelerator.prepare(train_dataloader, device_placement=[False])
     train_iter = iter(train_dataloader)
