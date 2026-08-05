@@ -82,6 +82,11 @@ def get_args_parser():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Micro-batches per optimizer step; effective batch = batch_size * world_size * accum")
 
+    # Mixed precision
+    parser.add_argument("--mixed_precision", type=str, default=None,
+                        help="Mixed precision mode (e.g. bf16/fp16). None falls back to the `accelerate launch` setting "
+                             "(ACCELERATE_MIXED_PRECISION). Forward is wrapped in accelerator.autocast() so it takes effect.")
+
     # Action space
     parser.add_argument("--action_mode", type=str, default=None,
                         help="Override pretrained action_mode (e.g. arx_ee6d); None keeps the pretrained config")
@@ -159,7 +164,13 @@ def linear_warmup_cosine(step, start, warmup, total, base_lr, min_ratio):
 
 
 def update_group_lrs(optim, step, args):
-    """Elegant group-wise LR scheduler."""
+    """Group-wise LR scheduler；同时是两阶段冻结机制。
+
+    与原始 train.py 一致的冻结方式：通过 optimizer 参数组把 lr 置 0。
+    阶段一（step < freeze_steps）：vlm / transformer_core 参数组 lr=0 → 冻结；
+      soft_prompts / action_heads 以恒定 base lr 训练。
+    阶段二：全组进入 warmup+cosine（或恒定为 base lr）。
+    """
     base = {
         "vlm": args.learning_rate * args.learning_coef,
         "transformer_core": args.learning_rate,
@@ -179,40 +190,19 @@ def update_group_lrs(optim, step, args):
             set_group_lr(optim, name, new_lr)
 
 
-def configure_training_step(base_model: XVLA, step: int, freeze_steps: int) -> str:
-    """两阶段完全冻结：按 optimizer 步切换 requires_grad。
-
-    阶段一（step < freeze_steps）：VLM + transformer 核心真 `requires_grad=False`
-      （不计算梯度、不分配 grad buffer），仅 soft_prompt_hub + action_encoder/decoder 训练。
-    阶段二：全量解冻微调。
-
-    必须在 accelerator.prepare 之后、对 `accelerator.unwrap_model(model)` 调用，
-    否则 DDP 包装对象没有 `.vlm` / `.transformer` 属性。
-    """
-    warmup = step < freeze_steps
-    for p in base_model.vlm.parameters():
-        p.requires_grad = not warmup
-    for p in base_model.transformer.parameters():
-        p.requires_grad = not warmup
-    if warmup:
-        for p in base_model.transformer.soft_prompt_hub.parameters():
-            p.requires_grad = True
-        for p in base_model.transformer.action_encoder.parameters():
-            p.requires_grad = True
-        for p in base_model.transformer.action_decoder.parameters():
-            p.requires_grad = True
-        return "prompt_action_warmup"
-    return "joint_finetuning"
-
-
 # ============================================================
 # Main Training
 # ============================================================
 def main(args):
     output_dir = Path(args.output_dir)
     accelerator = Accelerator(
-        log_with="tensorboard", 
-        project_dir=output_dir
+        log_with="tensorboard",
+        project_dir=output_dir,
+        # 必须显式传梯度累积步数：`accelerate launch` 没有对应 CLI flag，
+        # 不传则默认 1，accumulate()/sync_gradients 不会按累积步数工作。
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        # None 时回落到 accelerate launch 的 --mixed_precision（ACCELERATE_MIXED_PRECISION env）。
+        mixed_precision=args.mixed_precision,
     )
     accelerator.init_trackers("XVLA-Training")
     
@@ -222,10 +212,11 @@ def main(args):
     set_seed(args.seed + accelerator.process_index)
     logger.info(f"Args: {args}")
 
-    # Load model & processor (action_mode 可选覆盖预训练 config)
+    # Load model & processor
+    # action_mode 覆盖属配置层职责：由 XVLAConfig.from_pretrained 的 kwargs 直接完成
+    # （PretrainedConfig.from_dict 会把已有属性用 kwargs 覆盖），不再在训练代码里改 config。
     if args.action_mode is not None:
-        config = XVLAConfig.from_pretrained(args.models)
-        config.action_mode = args.action_mode
+        config = XVLAConfig.from_pretrained(args.models, action_mode=args.action_mode)
         model = XVLA.from_pretrained(args.models, config=config)
         logger.info(f"Override action_mode -> {config.action_mode}")
     else:
@@ -253,9 +244,8 @@ def main(args):
 
     # Training loop
     model.train()
-    base_model = accelerator.unwrap_model(model)
     accum_steps = max(1, args.gradient_accumulation_steps)
-    global_step, micro_step, t0 = 0, 0, time.time()
+    global_step, t0 = 0, time.time()
     effective_batch = args.batch_size * accelerator.num_processes * accum_steps
     logger.info(
         f"🚀 Start training for {args.iters} optimizer steps | "
@@ -268,60 +258,62 @@ def main(args):
         lang = processor.encode_language(batch["language_instruction"])
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
-        inputs = {k: v.cuda(non_blocking=True) for k, v in inputs.items()}
-        # 按 optimizer 步更新 LR 与冻结状态（梯度累积期间不变）
-        update_group_lrs(optim, global_step, args)
-        configure_training_step(base_model, global_step, args.freeze_steps)
+        inputs = {k: v.to(accelerator.device, non_blocking=True) for k, v in inputs.items()}
 
-        # Forward & backward（loss 除以 accum 保证累积平均）
-        loss_dict: Dict[str, torch.Tensor] = model(**inputs)
-        loss = sum(loss_dict.values())
-        if accum_steps > 1:
-            loss = loss / accum_steps
-        accelerator.backward(loss)
-        micro_step += 1
+        # 每次循环 = 一个 micro-batch。accelerator.accumulate(model)：
+        #   - 非末个微批 sync_gradients=False，DDP 下进入 no_sync() 跳过梯度 all-reduce；
+        #   - AcceleratedOptimizer 在非末微批自动跳过 step/zero_grad；
+        #   - accelerator.backward 自动按 1/gradient_accumulation_steps 缩放 loss（累积平均）。
+        with accelerator.accumulate(model):
+            # 混合精度生效的关键：forward 需在 accelerator.autocast() 内执行
+            with accelerator.autocast():
+                loss_dict: Dict[str, torch.Tensor] = model(**inputs)
+            loss: torch.Tensor = sum(loss_dict.values())
+            accelerator.backward(loss)
 
-        # 梯度累积：未满 accum 个微批则继续
-        if micro_step % accum_steps != 0:
-            continue
+            if accelerator.sync_gradients:
+                # —— 一个有效 optimizer step（已累积 accum 个 micro-batch）——
+                if args.max_grad_norm > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                # LR / 冻结按 optimizer 步更新：vlm 与 transformer_core 参数组在
+                # step < freeze_steps 时 lr=0（见 update_group_lrs），无需 requires_grad 切换。
+                update_group_lrs(optim, global_step, args)
+                optim.step()
+                optim.zero_grad()
+                global_step += 1
 
-        if args.max_grad_norm:
-            accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-        optim.step()
-        optim.zero_grad()
-        global_step += 1
+                # Logging
+                if global_step % args.log_interval == 0:
+                    logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
+                    logs["loss_total"] = float(loss.detach().item())  # 末个 micro-batch loss（未缩放）
+                    logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
+                    accelerator.log(logs, step=global_step)
 
-        # Logging
-        if global_step % args.log_interval == 0:
-            logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
-            logs["loss_total"] = float(loss.detach().item() * accum_steps)  # 还原单微批 loss
-            logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
-            accelerator.log(logs, step=global_step)
+                    if accelerator.is_main_process:
+                        dt = (time.time() - t0) / args.log_interval
+                        t0 = time.time()
+                        cpu_mem = psutil.Process(os.getpid()).memory_info().rss / 1024**3
+                        gpu_mem = torch.cuda.memory_allocated() / 1024**3
+                        logger.info(
+                            f"[{global_step}/{args.iters}] "
+                            f"loss={logs['loss_total']:.4f} "
+                            f"lr_core={logs['lr_transformer_core']:.2e} "
+                            f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
+                            f"USED_CPU={cpu_mem:.2e} GB "
+                            f"USED_GPU={gpu_mem:.2e} GB "
+                        )
 
-            if accelerator.is_main_process:
-                dt = (time.time() - t0) / args.log_interval
-                t0 = time.time()
-                cpu_mem = psutil.Process(os.getpid()).memory_info().rss / 1024**3
-                gpu_mem = torch.cuda.memory_allocated() / 1024**3
-                logger.info(
-                    f"[{global_step}/{args.iters}] "
-                    f"loss={logs['loss_total']:.4f} "
-                    f"lr_core={logs['lr_transformer_core']:.2e} "
-                    f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
-                    f"USED_CPU={cpu_mem:.2e} GB "
-                    f"USED_GPU={gpu_mem:.2e} GB "
-                )
-
-        # Checkpointing
-        if accelerator.is_main_process:
-            if global_step == args.iters or global_step % args.save_interval == 0:
-                save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
-                accelerator.print(f"💾 Saving model to {save_dir}")
-                accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
-                processor.save_pretrained(save_dir)
-                with open(os.path.join(save_dir, "state.json"), "w") as f:
-                    json.dump({"global_step": global_step}, f)
-        if global_step >= args.iters: break
+                # Checkpointing
+                if accelerator.is_main_process:
+                    if global_step == args.iters or global_step % args.save_interval == 0:
+                        save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
+                        accelerator.print(f"💾 Saving model to {save_dir}")
+                        accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
+                        processor.save_pretrained(save_dir)
+                        with open(os.path.join(save_dir, "state.json"), "w") as f:
+                            json.dump({"global_step": global_step}, f)
+                if global_step >= args.iters:
+                    break
 
     accelerator.end_training()
 

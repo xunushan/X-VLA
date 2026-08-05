@@ -1,6 +1,7 @@
 # ------------------------------------------------------------------------------
 # train.py 辅助函数测试（无需加载真实模型/GPU）：
-#   configure_training_step 两阶段冻结、update_group_lrs、linear_warmup_cosine
+#   update_group_lrs 两阶段冻结（参数组 lr）、linear_warmup_cosine、
+#   Accelerator 梯度累积（loss 自动按 1/accum 缩放）
 # ------------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -51,30 +52,8 @@ def args():
     return a
 
 
-# ---------------------------------------------------------------- configure_training_step
-def test_freeze_warmup_phase(model):
-    from train import configure_training_step
-    phase = configure_training_step(model, step=0, freeze_steps=100)
-    assert phase == "prompt_action_warmup"
-    # VLM 与 transformer 核心真冻结
-    assert all(not p.requires_grad for p in model.vlm.parameters())
-    assert not model.transformer.block.weight.requires_grad
-    # soft prompt 与 action 头可训练
-    assert model.transformer.soft_prompt_hub.weight.requires_grad
-    assert model.transformer.action_encoder.weight.requires_grad
-    assert model.transformer.action_decoder.weight.requires_grad
-
-
-def test_unfreeze_after_freeze(model):
-    from train import configure_training_step
-    configure_training_step(model, step=0, freeze_steps=100)
-    phase = configure_training_step(model, step=100, freeze_steps=100)
-    assert phase == "joint_finetuning"
-    assert all(p.requires_grad for p in model.vlm.parameters())
-    assert all(p.requires_grad for p in model.transformer.parameters())
-
-
 # ---------------------------------------------------------------- update_group_lrs
+# 冻结 = optimizer 参数组 lr=0（原始 train.py 机制），无 requires_grad 切换。
 def test_lr_zero_in_freeze_phase(args):
     from train import build_optimizer, update_group_lrs
     model = FakeXVLA()
@@ -110,9 +89,21 @@ def test_linear_warmup_cosine(args):
     assert v2 < 1e-4 and v2 > 1e-5
 
 
-# ---------------------------------------------------------------- 梯度累积数学
+# ---------------------------------------------------------------- Accelerator 梯度累积
+def test_accelerator_backward_scales_loss():
+    """Accelerator(gradient_accumulation_steps=N) 的 backward 自动按 1/N 缩放 loss，
+    即 accumulate() 循环下不用手动除 accum_steps（train.py 依赖此行为）。"""
+    from accelerate import Accelerator
+    acc = Accelerator(gradient_accumulation_steps=4)
+    x = torch.randn(4, 4, requires_grad=True)
+    acc.backward(x.sum())
+    assert x.grad is not None
+    # 期望梯度 = 1/4（accelerate 内部 loss/N 后 backward）
+    assert torch.allclose(x.grad, torch.full_like(x, 0.25), atol=1e-6)
+
+
 def test_accumulated_loss_average():
-    """loss 除以 accum_steps 再 backward，等价于累积平均。"""
+    """累积平均数学：N 个 micro-batch 的 loss/N 求和 ≈ 全批量平均 loss。"""
     from torch.nn import functional as F
     x = torch.randn(4, 20)
     w = torch.randn(20, 1)
