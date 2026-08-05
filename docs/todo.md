@@ -53,3 +53,29 @@
       若推理 feed 的是已 CHW/0-1 化的 tensor，须还原为 HWC 0-255 或手动套同一 Normalize，
       否则与训练不对齐（DaViT 内部不做任何归一化，见 models/modeling_florence2.py forward_features_unpool）。
 - [ ] 确认 DaViT 输入必须为 ImageNet 标准化后的 [C,H,W] float；任何一侧省掉 Normalize 都会破坏对齐。
+
+## 视频解码策略（记录，当前不改）
+> 背景：训练时每访问一个 episode，三路相机各**整段重解码**一次
+> （`datasets/domain_handler/lerobot_v3_robodojo.py` `_decode_episode_video`；`lerobotv21.py` 的
+> `read_video_to_frames` 同理）。episode 被无限重采样（`datasets/dataset.py:117`）→ 跨访问重复解码；
+> 且每个 DataLoader worker 各持一份 handler 各解码一遍（进程内 4× 冗余，见本文件上文）。
+>
+> **决策：当前不改**，先上服务器量化解码是否瓶颈（`--num_workers` 已可调，见 `train.py`）。若确为
+> 瓶颈，两条改造路线对比：
+
+### 方案 A：自研解码缓存（无依赖）
+- 做法：handler 内按 `(cam_key, chunk_index)` 或 `(cam_key, ep_idx)` 做 LRU 缓存解码帧；同一 chunk
+  mp4 内多个 episode、以及同一 episode 的重复访问共享一次解码。
+- 收益：消除重复访问的重解码；不引入依赖；接口不变（改动集中在 `_decode_episode_video` 一层）。
+- 代价：原生分辨率整段缓存内存巨大（720p≈0.55GB/相机/episode，×3≈1.7GB/episode），须解码后立即
+  降分辨率（如 Resize 到 224）再缓存，才可接受；需 LRU/内存上限 + episode→chunk→帧区间映射；
+  **不解决跨 worker 冗余**（每 worker 各缓存一份，除非上共享内存）。
+
+### 方案 B：换 lerobot 官方解码基建
+- 数据本为原生 lerobot v3.0 格式（data/ chunk parquet + videos/ 多 episode shard），可上
+  `LeRobotDataset` / `read_video_frame`（官方自带模块级 decoder cache + 按帧 seek）。
+- 收益：官方维护、解决重复解码；与上游格式演进同步。
+- 代价：引入 lerobot 依赖；sample schema、image_aug 链、16→20 维 + gripper 反转、tasks 取指令、
+  num_views/image_mask、lang_aug、多数据集加权都要适配重挂；v3.0 API 新（随 v0.4.0 发布）且演化；
+  v2.1/v3.0 两个 handler 的动作时间对齐语义需与官方 `delta_timestamps` 核对。
+- 状态：尚未验证官方 v3.0 API 在本仓库训练/推理链路的落地成本，若推进先做最小 spike。
