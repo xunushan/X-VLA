@@ -75,12 +75,14 @@ goai-2026 数据目录（只读引用）：`/Users/isuntaiyang/Documents/competi
 **图像预处理（评估结论：现有 `image_aug` 直接适用，无需改动）**：
 - `dataset.py` 构造**统一**的 `image_aug`（[dataset.py:76](datasets/dataset.py#L76)），经 `_iter_one_dataset` 传给**所有 handler**，各 handler 内部自行调用
 - 现有 pipeline：`Resize((224,224),BICUBIC) → ColorJitter(训练) → ToTensor → Normalize(ImageNet mean/std)`
-- 对**我们的图像（[C,H,W] float 0~1）**逐项评估：
-  1. `Resize((224,224))`：torchvision 支持 [C,H,W] tensor ✅
+- **解码格式实测**：pyav 解码 mp4 输出 **[H,W,C] uint8 0-255**（实测 `(480,640,3)` min/max 0/255）；`stats.json` 图像 min/max 0~1 是 **lerobot API 层 `/255` 约定**（视频文件内即 uint8）→ handler 需 `arr.transpose(2,0,1) / 255` 转 **[C,H,W] float 0~1**
+- **`Normalize` 的 mean/std = ImageNet 标准常量** `(0.485,0.456,0.406)/(0.229,0.224,0.225)`，硬编码 [dataset.py:81](datasets/dataset.py#L81)，**与 Florence2（X-VLA 的 VLM encoder）预训练图像处理器一致，不可改动**（改会破坏预训练权重输入分布；stats.json 图像 mean≈[0.426,0.323,0.283] 佐证其合理性）
+- 对 **[C,H,W] float 0~1** 逐项评估：
+  1. `Resize((224,224))`：支持 [C,H,W] tensor ✅
   2. `ColorJitter`（训练时）：支持 float tensor ✅
-  3. `ToTensor`：**对 float tensor 不缩放、不 permute**（仅 uint8/PIL 才 `/255` 且 HWC→CHW）→ 保持 0~1、CHW 原样 ✅（**关键：不会二次缩放**）
+  3. `ToTensor`：**对 float tensor 不缩放、不 permute**（仅 uint8/PIL 才 `/255` + HWC→CHW）→ 0~1 CHW 原样 ✅（不会二次缩放）
   4. `Normalize`：(x-mean)/std → [-2.4, 2.4] ✅
-- handler 本地解码输出 **[C,H,W] float 0~1**（对齐 info.json `3×H×W` 约定），直接传 `image_aug`，无需转 PIL
+- handler 本地解码 → `[C,H,W] float 0~1` 直接传 `image_aug`，无需转 PIL
 
 **插值**（对齐 [base.py:143](datasets/domain_handler/base.py#L143) 语义，参数按数据实况）：
 - `lt = arange(T)/25.0`（**真实 25Hz**）
