@@ -26,6 +26,13 @@
 - [ ] **resume 后数据顺序不严格连续**：InfiniteDataReader 无限流 + 每轮 `random.shuffle`，
       worker RNG 无法随 checkpoint 恢复，resume 后样本顺序变化（不影响梯度正确性）。
 
+### 已解决（后续 review 反馈）
+- [x] **多进程 RNG 同步**：resume 改为 per-rank RNG 文件（`rng_state_rank{N}.pt`，各进程存/读各自的），
+      避免所有进程 dropout/augmentation 序列同步。已确认 `accelerator.save_state` 也做 per-rank
+      RNG（checkpointing.py:156），但本实现未采用（无重复模型落盘、CPU 可测、恢复显式）。
+- [x] **optim.state_dict() 的 FSDP/DeepSpeed 限制**：已加注释，普通 DDP 下完整；切 FSDP/DeepSpeed
+      需改用 `accelerator.save_state()/load_state()`。
+
 ### 环境限制
 - [ ] macOS 无法可靠验证多进程 DataLoader，需在服务器跑训练冒烟。
 

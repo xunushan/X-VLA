@@ -179,9 +179,13 @@ def resolve_resume_dir(args) -> str | None:
 def save_rng_state(path):
     """保存 RNG（torch/cuda/numpy/random）供 resume 恢复模型内 dropout 序列。
 
+    按进程独立调用：每个 rank 写入 `rng_state_rank{process_index}.pt`，resume 时各 rank
+    读回自己的文件，避免多进程 resume 后所有进程 dropout/augmentation 序列同步。
+
     注：数据流在 worker 进程内（num_workers=4），worker RNG 在 spawn 时重新播种，
     无法随 checkpoint 恢复——无限流数据顺序 resume 后不严格连续（见 docs/todo.md）。
     """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     state = {
         "torch": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -200,6 +204,15 @@ def load_rng_state(path):
         torch.cuda.set_rng_state_all(state["cuda"][: torch.cuda.device_count()])
     np.random.set_state(state["numpy"])
     random.setstate(state["random"])
+
+
+def resolve_rng_path(resume_dir, process_index) -> str | None:
+    """按 rank 定位 RNG 文件：优先 per-rank，回退到旧版单一 rng_state.pt。"""
+    rank_path = Path(resume_dir) / f"rng_state_rank{process_index}.pt"
+    if rank_path.exists():
+        return str(rank_path)
+    legacy = Path(resume_dir) / "rng_state.pt"
+    return str(legacy) if legacy.exists() else None
 
 
 def build_optimizer(
@@ -337,11 +350,12 @@ def main(args):
 
     set_seed(args.seed + accelerator.process_index)
     if resume_dir is not None:
-        rng_path = os.path.join(resume_dir, "rng_state.pt")
-        if os.path.exists(rng_path):
+        # 按 rank 恢复各自 RNG：避免多进程 resume 后所有进程随机序列同步（削弱多样性）
+        rng_path = resolve_rng_path(resume_dir, accelerator.process_index)
+        if rng_path is not None:
             load_rng_state(rng_path)
         else:
-            logger.warning(f"No rng_state.pt in {resume_dir}; skip RNG restore")
+            logger.warning(f"No per-rank RNG state in {resume_dir}; skip RNG restore")
     logger.info(f"Args: {args}")
 
     # Load model & processor
@@ -363,7 +377,12 @@ def main(args):
             config.action_mode = args.action_mode
             logger.info(f"Override action_mode -> {config.action_mode}")
         model = XVLA.from_pretrained(args.models, config=config)
-    processor = XVLAProcessor.from_pretrained(args.models)
+    # resume 时 processor 也从 checkpoint 目录加载（即训练时实际使用的配置），保持一致
+    processor = (
+        XVLAProcessor.from_pretrained(resume_dir)
+        if resume_dir is not None
+        else XVLAProcessor.from_pretrained(args.models)
+    )
 
     # Iterable dataloader。多进程数据分片：accelerate 对 IterableDataset 自动套
     # IterableDatasetShard 按 rank 切流（不是 DistributedSampler——那只适用 map-style
@@ -433,7 +452,12 @@ def main(args):
             lang = processor.encode_language(batch["language_instruction"])
             batch.pop("language_instruction", None)
             inputs = {**batch, **lang}
-            inputs = {k: v.to(accelerator.device, non_blocking=True) for k, v in inputs.items()}
+            # 只对 tensor 字段搬设备：language_instruction 已 pop，但为防未来引入非 tensor 字段
+            # （字符串/None 等），非 tensor 原样保留，否则 v.to() 直接 AttributeError 崩溃
+            inputs = {
+                k: v.to(accelerator.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in inputs.items()
+            }
 
             # Forward & backward
             with accelerator.autocast():
@@ -475,18 +499,23 @@ def main(args):
                     )
 
             # Checkpointing
-            if accelerator.is_main_process:
-                if global_step == args.iters or global_step % args.save_interval == 0:
-                    save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
+            if global_step == args.iters or global_step % args.save_interval == 0:
+                save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
+                if accelerator.is_main_process:
                     accelerator.print(f"💾 Saving model to {save_dir}")
                     base_model.save_pretrained(save_dir, safe_serialization=True)
                     processor.save_pretrained(save_dir)
-                    # Resume 必需状态：optimizer 动量/步数 + RNG（dropout 序列）+ global_step
-                    # （此前只存权重，无法恢复优化器，故 checkpoint 不可 resume）
+                    # Resume 必需状态：optimizer 动量/步数 + global_step
+                    # 注意：optim.state_dict() 仅在普通 DDP（accelerate launch 默认）下完整。
+                    # 若切 DeepSpeed / FSDP，优化器状态是分片的，state_dict() 不完整——需改用
+                    # accelerator.save_state()/load_state()（内部对 FSDP/DeepSpeed 有专门处理，
+                    # 且 random_states_{rank}.pkl 自动 per-rank）。
                     torch.save(optim.state_dict(), os.path.join(save_dir, "optimizer.pt"))
-                    save_rng_state(os.path.join(save_dir, "rng_state.pt"))
                     with open(os.path.join(save_dir, "state.json"), "w") as f:
                         json.dump({"global_step": global_step}, f)
+                # 所有进程各自保存自己的 RNG（per-rank 文件），resume 后各 rank 随机性独立
+                save_rng_state(os.path.join(save_dir, f"rng_state_rank{accelerator.process_index}.pt"))
+                accelerator.wait_for_everyone()
 
     accelerator.end_training()
 

@@ -209,3 +209,32 @@ def test_rng_state_roundtrip(tmp_path):
     load_rng_state(path)
     b_t, b_py, b_np = torch.rand(1).item(), pyrandom.random(), np.random.rand()
     assert a_t == b_t and a_py == b_py and a_np == b_np
+
+
+def test_resolve_rng_path_per_rank(tmp_path):
+    """per-rank RNG 解析：各 rank 读回自己的文件，缺失时回退旧版 rng_state.pt。"""
+    from train import resolve_rng_path
+    (tmp_path / "rng_state_rank0.pt").write_bytes(b"x")
+    (tmp_path / "rng_state_rank1.pt").write_bytes(b"y")
+    assert resolve_rng_path(tmp_path, 0).endswith("rng_state_rank0.pt")
+    assert resolve_rng_path(tmp_path, 1).endswith("rng_state_rank1.pt")
+    assert resolve_rng_path(tmp_path, 2) is None  # 无 rank2 文件也无旧版 → None
+
+    # 旧版单一文件回退
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / "rng_state.pt").write_bytes(b"z")
+    assert resolve_rng_path(legacy, 0).endswith("rng_state.pt")
+
+
+def test_inputs_device_guard_keeps_non_tensor():
+    """inputs.to(device) 对非 tensor 字段不崩溃：isinstance 守卫保留非 tensor 原样。"""
+    t = torch.randn(2, 3)
+    inputs = {"pixel_values": t, "meta": "str-field", "none": None}
+    moved = {
+        k: v.to("cpu", non_blocking=True) if isinstance(v, torch.Tensor) else v
+        for k, v in inputs.items()
+    }
+    assert moved["pixel_values"] is not None and moved["pixel_values"].dtype == torch.float32
+    assert moved["meta"] == "str-field"
+    assert moved["none"] is None
