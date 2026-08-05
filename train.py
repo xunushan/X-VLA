@@ -279,12 +279,11 @@ def main(args):
     # Load model & processor
     # action_mode 覆盖属配置层职责：由 XVLAConfig.from_pretrained 的 kwargs 直接完成
     # （PretrainedConfig.from_dict 会把已有属性用 kwargs 覆盖），不再在训练代码里改 config。
-    config = None
+    config = XVLAConfig.from_pretrained(args.models)
     if args.action_mode is not None:
-        config = XVLAConfig.from_pretrained(args.models, action_mode=args.action_mode)
+        config.action_mode = args.action_mode
         logger.info(f"Override action_mode -> {config.action_mode}")
 
-    # 覆盖后的 config 必须传给模型加载，否则 action_mode 覆盖不生效
     model = XVLA.from_pretrained(args.models, config=config)
     processor = XVLAProcessor.from_pretrained(args.models)
 
@@ -321,15 +320,12 @@ def main(args):
         f"effective_batch={effective_batch}"
     )
 
+    # InfiniteDataReader 是无限流，不会抛 StopIteration，无需重启处理
     last_cfg_step = -1
     while global_step < args.iters:
         with accelerator.accumulate(model):
             # 取一个 micro-batch
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_dataloader)
-                batch = next(train_iter)
+            batch = next(train_iter)
 
             # 统一配置：学习率 + 冻结状态。每个 optimizer 步在首个 micro-batch 的
             # forward 前配置一次（门控避免累积期间重复遍历 vlm 参数），且须在
@@ -352,8 +348,9 @@ def main(args):
 
             # Grad clip
             if accelerator.sync_gradients:
-                if args.max_grad_norm > 0:
+                if args.max_grad_norm:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
                 optim.step()
                 optim.zero_grad()
 
