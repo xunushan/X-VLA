@@ -45,11 +45,11 @@ goai-2026 数据目录（只读引用）：`/Users/isuntaiyang/Documents/competi
 
 继承 `DomainHandler`（[base.py:31](datasets/domain_handler/base.py#L31)）。命名/注册 key = `"arx_x5_ee"`（即 meta 的 `robot_type`）。
 
-**视频与数据读取：复用 lerobot 现成接口，不手写 av seek**（已调研 lerobot 0.4.4）：
-- `load_episodes(root)`（`lerobot/datasets/utils.py:377`）：读 episodes 元数据 → 每 episode 的 data/video 文件索引与时间戳
-- `decode_video_frames(video_path, timestamps, tolerance_s, backend="pyav")`（`lerobot/datasets/video_utils.py:127`）：**按时间戳批量解码一整个 episode 的三相机帧**，pyav 自动处理 mp4 内定位——正好解决"一个 mp4 含多个 episode"
-- 数据文件定位：`LeRobotDataset.get_data_file_path(ep_index)` / `get_video_file_path(ep_index, vid_key)`（或直接按 episodes 元数据拼路径）
-- state/action：pyarrow 按 `[dataset_from_index, dataset_to_index)` 行范围切片（对齐现有 `lerobot_agibot.read_parquet` 风格）
+**视频与数据读取：复用 lerobot 现成接口，不手写 av seek / pyarrow 切片**（已调研 lerobot 0.4.4）：
+- 实例化 `LeRobotDataset(repo_id=..., root=data_root, episodes=[...], video_backend="pyav")`（v3.0 兼容，`lerobot/datasets/lerobot_dataset.py:566`）
+- episode 元数据：`dataset.episodes[ep_idx]`（`load_episodes`，`lerobot/datasets/utils.py:377`）→ data/video 文件索引与时间戳
+- **parquet 批量读取**：`dataset.hf_dataset[from:to]`（datasets.Dataset arrow 切片，`from/to = dataset_from_index/dataset_to_index` 全局帧索引）一次取整个 episode 的 state/action/timestamp/task_index —— **lerobot 原生提供，无需自己 pyarrow 切片**
+- 视频：`dataset.get_video_file_path(ep_idx, cam)` + `decode_video_frames(video_path, episode_timestamps, tolerance_s, backend="pyav")`（`lerobot/datasets/video_utils.py:127`）按时间戳批量解码，自动处理"一个 mp4 含多 episode"
 
 **16→20 转换：推荐"提前预处理"，handler 做维度自适应**（问题 2 结论）：
 - organizer 已生成 20 维数据 `lerobot_v30_ee_6d`（转换已验证 = `quat_wxyz→rotate6d(scalar_first=True)` + `1-g`）→ **直接用它，训练零转换开销**
@@ -65,7 +65,11 @@ goai-2026 数据目录（只读引用）：`/Users/isuntaiyang/Documents/competi
     "observation.images.cam_right_wrist"
   ]
   ```
-- handler 按此顺序解码；**顺序即进模型顺序**（第 0 路 `cam_high` 进 BART 主路径，见 [modeling_xvla.py:134](models/modeling_xvla.py#L134)）
+- handler 按此顺序解码并 `torch.stack` 成 `image_input [V,C,H,W]`；**V 维第 0 路 = 主视频进 BART**，代码证据链：
+  1. `forward_vlm`（[modeling_xvla.py:134](models/modeling_xvla.py#L134)）：`image_features[:, 0]` 合并进 BART encoder，`image_features[:, 1:]` 作 aux
+  2. `encode_image`（[processing_xvla.py:139](models/processing_xvla.py#L139)）：图像列表顺序 = `pixel_values` 顺序 = `image_input` 的 V 维
+  3. 训练链路 `train.py:225` 直接透传 `batch["image_input"]`（图像不经 processor），handler 内 stack 顺序即 V 维顺序
+- 因此只要 `camera_keys[0] == "observation.images.cam_high"`，cam_high 即主视频 ✅
 - 与 X-VLA 现有 `meta["observation_key"]` 模式（[base.py:84](datasets/domain_handler/base.py#L84)）一致
 
 **插值**（对齐 [base.py:143](datasets/domain_handler/base.py#L143) 语义，参数按数据实况）：
