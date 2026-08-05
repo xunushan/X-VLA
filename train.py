@@ -163,14 +163,32 @@ def linear_warmup_cosine(step, start, warmup, total, base_lr, min_ratio):
     return base_lr * (min_ratio + (1 - min_ratio) * ratio)
 
 
-def update_group_lrs(optim, step, args):
-    """Group-wise LR scheduler；同时是两阶段冻结机制。
+# 冻结期（step < freeze_steps）禁止更新的参数组，与 build_optimizer 的 4 组划分对齐
+FREEZE_GROUPS = ("vlm", "transformer_core")
 
-    与原始 train.py 一致的冻结方式：通过 optimizer 参数组把 lr 置 0。
-    阶段一（step < freeze_steps）：vlm / transformer_core 参数组 lr=0 → 冻结；
-      soft_prompts / action_heads 以恒定 base lr 训练。
-    阶段二：全组进入 warmup+cosine（或恒定为 base lr）。
+
+def configure_training_step(optim, step, args):
+    """两阶段训练配置：按 optimizer 步更新参数组 LR，并实现真冻结（requires_grad）。
+
+    在原始 update_group_lrs（参数组 lr 调度）基础上融合真冻结：
+      - 阶段一（step < freeze_steps）：vlm / transformer_core 参数组
+        `requires_grad=False`（真冻结：不计算、不分配梯度缓冲），同时保留 lr=0 双保险；
+        soft_prompts / action_heads 以恒定 base lr 训练。
+      - 阶段二：全组解冻（requires_grad=True），进入 warmup+cosine（或恒定为 base lr）。
+
+    冻结组通过 optim.param_groups 的 name 定位（而非硬编码 model.vlm 等属性路径），
+    与 build_optimizer 的参数组划分保持单一数据源。须在 forward/backward 之前调用，
+    冻结参数才真正不计算梯度。
     """
+    warmup = step < args.freeze_steps
+
+    # —— 真冻结：按参数组切换 requires_grad ——
+    for group in optim.param_groups:
+        frozen = warmup and group["name"] in FREEZE_GROUPS
+        for p in group["params"]:
+            p.requires_grad = not frozen
+
+    # —— 参数组 LR 调度（原始 update_group_lrs 逻辑）——
     base = {
         "vlm": args.learning_rate * args.learning_coef,
         "transformer_core": args.learning_rate,
@@ -179,7 +197,7 @@ def update_group_lrs(optim, step, args):
     }
     def schedule(step, base_lr):
         return linear_warmup_cosine(step, args.freeze_steps, args.warmup_steps, args.iters, base_lr, args.min_lr_ratio)
-    if step < args.freeze_steps:
+    if warmup:
         set_group_lr(optim, "vlm", 0.0)
         set_group_lr(optim, "transformer_core", 0.0)
         set_group_lr(optim, "soft_prompts", base["soft_prompts"])
@@ -253,12 +271,18 @@ def main(args):
         f"effective_batch={effective_batch}"
     )
 
+    last_cfg_step = -1
     for batch in train_dataloader:
         # Encode language
         lang = processor.encode_language(batch["language_instruction"])
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
         inputs = {k: v.to(accelerator.device, non_blocking=True) for k, v in inputs.items()}
+        # 每个 optimizer 步在首个 micro-batch 前配置训练状态（参数组 LR + 真冻结 requires_grad）。
+        # 必须在 forward/backward 之前生效，冻结参数（vlm/transformer_core）才不计算梯度。
+        if last_cfg_step != global_step:
+            configure_training_step(optim, global_step, args)
+            last_cfg_step = global_step
 
         # 每次循环 = 一个 micro-batch。accelerator.accumulate(model)：
         #   - 非末个微批 sync_gradients=False，DDP 下进入 no_sync() 跳过梯度 all-reduce；
@@ -275,9 +299,6 @@ def main(args):
                 # —— 一个有效 optimizer step（已累积 accum 个 micro-batch）——
                 if args.max_grad_norm > 0:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                # LR / 冻结按 optimizer 步更新：vlm 与 transformer_core 参数组在
-                # step < freeze_steps 时 lr=0（见 update_group_lrs），无需 requires_grad 切换。
-                update_group_lrs(optim, global_step, args)
                 optim.step()
                 optim.zero_grad()
                 global_step += 1

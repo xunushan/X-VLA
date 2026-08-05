@@ -1,7 +1,7 @@
 # ------------------------------------------------------------------------------
 # train.py 辅助函数测试（无需加载真实模型/GPU）：
-#   update_group_lrs 两阶段冻结（参数组 lr）、linear_warmup_cosine、
-#   Accelerator 梯度累积（loss 自动按 1/accum 缩放）
+#   configure_training_step 两阶段真冻结（requires_grad）+ 参数组 LR 调度、
+#   linear_warmup_cosine、Accelerator 梯度累积（loss 自动按 1/accum 缩放）
 # ------------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -52,24 +52,44 @@ def args():
     return a
 
 
-# ---------------------------------------------------------------- update_group_lrs
-# 冻结 = optimizer 参数组 lr=0（原始 train.py 机制），无 requires_grad 切换。
-def test_lr_zero_in_freeze_phase(args):
-    from train import build_optimizer, update_group_lrs
+# ---------------------------------------------------------------- configure_training_step
+# 真冻结：vlm / transformer_core 参数组 requires_grad=False（不计算不分配梯度），
+# 同时保留原始参数组 lr=0 机制（双保险）。冻结组由 optim.param_groups 的 name 定位。
+def test_freeze_warmup_phase(args):
+    from train import build_optimizer, configure_training_step
     model = FakeXVLA()
     optim = build_optimizer(model, args.learning_rate, 0.0, (0.9, 0.95), args.learning_coef)
-    update_group_lrs(optim, step=0, args=args)
+    configure_training_step(optim, step=0, args=args)
+    # 真冻结：vlm 与 transformer_core 参数组 requires_grad=False
+    assert all(not p.requires_grad for p in model.vlm.parameters())
+    assert not model.transformer.block.weight.requires_grad
+    # soft prompt 与 action 头可训练
+    assert model.transformer.soft_prompt_hub.weight.requires_grad
+    assert model.transformer.action_encoder.weight.requires_grad
+    assert model.transformer.action_decoder.weight.requires_grad
+    # 原始 lr 机制保留：冻结组 lr=0，训练组 base lr
     lrs = {g["name"]: g["lr"] for g in optim.param_groups}
     assert lrs["vlm"] == 0.0 and lrs["transformer_core"] == 0.0
     assert lrs["soft_prompts"] == pytest.approx(1e-4 * 0.1)
     assert lrs["action_heads"] == pytest.approx(1e-4)
 
 
-def test_lr_unfrozen_after_freeze(args):
-    from train import build_optimizer, update_group_lrs
+def test_unfreeze_after_freeze(args):
+    from train import build_optimizer, configure_training_step
     model = FakeXVLA()
     optim = build_optimizer(model, args.learning_rate, 0.0, (0.9, 0.95), args.learning_coef)
-    update_group_lrs(optim, step=100, args=args)
+    configure_training_step(optim, step=0, args=args)   # 冻结
+    assert all(not p.requires_grad for p in model.vlm.parameters())
+    configure_training_step(optim, step=100, args=args)  # freeze_steps=100 → 解冻
+    assert all(p.requires_grad for p in model.vlm.parameters())
+    assert all(p.requires_grad for p in model.transformer.parameters())
+
+
+def test_lr_unfrozen_after_freeze(args):
+    from train import build_optimizer, configure_training_step
+    model = FakeXVLA()
+    optim = build_optimizer(model, args.learning_rate, 0.0, (0.9, 0.95), args.learning_coef)
+    configure_training_step(optim, step=100, args=args)
     lrs = {g["name"]: g["lr"] for g in optim.param_groups}
     # 阶段二 vlm lr = base lr * coef，且启用 warmup（step=100 在 warmup 200 内 → 线性升）
     assert lrs["vlm"] == pytest.approx(1e-4 * 0.1 * (0 / 200), rel=1e-6)
