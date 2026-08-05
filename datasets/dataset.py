@@ -71,6 +71,15 @@ class InfiniteDataReader(IterableDataset):
                     for line in f: meta['datalist'].append(json.loads(line.decode("utf-8")))
                 self.metas[meta['root_path']] = meta
                 print(f"== lerobot dataset {meta['robot_type']} with {meta['total_episodes']} trajs at {meta['root_path']}====")
+            ### Lerobot v3.0 style (parquet + multi-episode mp4, GOAI 2026 ARX dual-arm)
+            elif "codebase_version" in meta.keys() and meta["codebase_version"] == 'v3.0':
+                meta.setdefault('root_path', "/".join(file_path.split("/")[:-1]))
+                meta.setdefault('robot_type', 'arx_x5_ee')
+                Handler = get_handler_cls(meta['robot_type'])
+                meta['datalist'] = Handler.build_datalist(meta)
+                meta.setdefault('dataset_name', meta['root_path'])
+                self.metas[meta['dataset_name']] = meta
+                print(f"== lerobot v3.0 dataset {meta['robot_type']} with {len(meta['datalist'])} trajs at {meta['root_path']}====")
             else: raise NotImplementedError(f"unrecognized meta file format: {file}")
 
         self.image_aug = [

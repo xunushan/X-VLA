@@ -48,6 +48,7 @@ DATA_DOMAIN_ID = {
     "AIR-AGILEX-HQ": 5,
     "robotwin2_abs_ee": 6,
     "robotwin2_clean": 6,
+    "arx_x5_ee": 6,
     "robocasa-human": 7,
     "VLABench": 8,
     "AGIBOT-challenge": 9,

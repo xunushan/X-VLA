@@ -20,6 +20,7 @@ from .base import DomainHandler
 
 # Handlers
 from .lerobot_agibot import AGIBOTLeRobotHandler
+from .lerobot_v3_robodojo import LeRobotV3RoboDojoHandler
 from .agiworld import AGIWolrdHandler
 from .robomind import RobomindHandler
 from .droid import DroidHandler
@@ -40,6 +41,9 @@ _REGISTRY: Dict[str, Type[DomainHandler]] = {
     # LeRobot (parquet)
     "AGIBOT": AGIBOTLeRobotHandler,
     "AGIBOT-challenge": AGIBOTLeRobotHandler,
+
+    # Lerobot v3.0 (parquet + multi-episode mp4) — GOAI 2026 ARX 双臂
+    "arx_x5_ee": LeRobotV3RoboDojoHandler,
 
     # HDF5 (exact)
     "Calvin": CalvinHandler,

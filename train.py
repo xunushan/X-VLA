@@ -30,6 +30,7 @@ from torch.optim import AdamW
 
 from accelerate import Accelerator
 from datasets import create_dataloader
+from models.configuration_xvla import XVLAConfig
 from models.modeling_xvla import XVLA
 from models.processing_xvla import XVLAProcessor
 
@@ -78,6 +79,12 @@ def get_args_parser():
     # Data
     parser.add_argument("--train_metas_path", type=str, required=True, help="Path to training metadata")
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Micro-batches per optimizer step; effective batch = batch_size * world_size * accum")
+
+    # Action space
+    parser.add_argument("--action_mode", type=str, default=None,
+                        help="Override pretrained action_mode (e.g. arx_ee6d); None keeps the pretrained config")
 
     # Optimizer
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -172,6 +179,32 @@ def update_group_lrs(optim, step, args):
             set_group_lr(optim, name, new_lr)
 
 
+def configure_training_step(base_model: XVLA, step: int, freeze_steps: int) -> str:
+    """两阶段完全冻结：按 optimizer 步切换 requires_grad。
+
+    阶段一（step < freeze_steps）：VLM + transformer 核心真 `requires_grad=False`
+      （不计算梯度、不分配 grad buffer），仅 soft_prompt_hub + action_encoder/decoder 训练。
+    阶段二：全量解冻微调。
+
+    必须在 accelerator.prepare 之后、对 `accelerator.unwrap_model(model)` 调用，
+    否则 DDP 包装对象没有 `.vlm` / `.transformer` 属性。
+    """
+    warmup = step < freeze_steps
+    for p in base_model.vlm.parameters():
+        p.requires_grad = not warmup
+    for p in base_model.transformer.parameters():
+        p.requires_grad = not warmup
+    if warmup:
+        for p in base_model.transformer.soft_prompt_hub.parameters():
+            p.requires_grad = True
+        for p in base_model.transformer.action_encoder.parameters():
+            p.requires_grad = True
+        for p in base_model.transformer.action_decoder.parameters():
+            p.requires_grad = True
+        return "prompt_action_warmup"
+    return "joint_finetuning"
+
+
 # ============================================================
 # Main Training
 # ============================================================
@@ -189,8 +222,14 @@ def main(args):
     set_seed(args.seed + accelerator.process_index)
     logger.info(f"Args: {args}")
 
-    # Load model & processor
-    model = XVLA.from_pretrained(args.models)
+    # Load model & processor (action_mode 可选覆盖预训练 config)
+    if args.action_mode is not None:
+        config = XVLAConfig.from_pretrained(args.models)
+        config.action_mode = args.action_mode
+        model = XVLA.from_pretrained(args.models, config=config)
+        logger.info(f"Override action_mode -> {config.action_mode}")
+    else:
+        model = XVLA.from_pretrained(args.models)
     processor = XVLAProcessor.from_pretrained(args.models)
 
     # Iterable dataloader (don't wrap with prepare)
@@ -214,31 +253,48 @@ def main(args):
 
     # Training loop
     model.train()
-    global_step, t0 = 0, time.time()
-    logger.info(f"🚀 Start training for {args.iters} iterations | world_size={accelerator.num_processes}")
-    
+    base_model = accelerator.unwrap_model(model)
+    accum_steps = max(1, args.gradient_accumulation_steps)
+    global_step, micro_step, t0 = 0, 0, time.time()
+    effective_batch = args.batch_size * accelerator.num_processes * accum_steps
+    logger.info(
+        f"🚀 Start training for {args.iters} optimizer steps | "
+        f"world_size={accelerator.num_processes} | accum={accum_steps} | "
+        f"effective_batch={effective_batch}"
+    )
+
     for batch in train_dataloader:
         # Encode language
         lang = processor.encode_language(batch["language_instruction"])
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
         inputs = {k: v.cuda(non_blocking=True) for k, v in inputs.items()}
-        # Update LR per group
+        # 按 optimizer 步更新 LR 与冻结状态（梯度累积期间不变）
         update_group_lrs(optim, global_step, args)
+        configure_training_step(base_model, global_step, args.freeze_steps)
 
-        # Forward & backward
+        # Forward & backward（loss 除以 accum 保证累积平均）
         loss_dict: Dict[str, torch.Tensor] = model(**inputs)
         loss = sum(loss_dict.values())
+        if accum_steps > 1:
+            loss = loss / accum_steps
         accelerator.backward(loss)
+        micro_step += 1
+
+        # 梯度累积：未满 accum 个微批则继续
+        if micro_step % accum_steps != 0:
+            continue
+
         if args.max_grad_norm:
             accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optim.step()
         optim.zero_grad()
+        global_step += 1
 
         # Logging
         if global_step % args.log_interval == 0:
             logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
-            logs["loss_total"] = float(loss.detach().item())
+            logs["loss_total"] = float(loss.detach().item() * accum_steps)  # 还原单微批 loss
             logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
             accelerator.log(logs, step=global_step)
 
@@ -255,9 +311,8 @@ def main(args):
                     f"USED_CPU={cpu_mem:.2e} GB "
                     f"USED_GPU={gpu_mem:.2e} GB "
                 )
-        
+
         # Checkpointing
-        global_step += 1
         if accelerator.is_main_process:
             if global_step == args.iters or global_step % args.save_interval == 0:
                 save_dir = os.path.join(output_dir, f"ckpt-{global_step}")

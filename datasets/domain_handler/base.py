@@ -56,6 +56,14 @@ class DomainHandler(ABC):
         """Yield samples for a single episode."""
         ...
 
+    @staticmethod
+    def build_datalist(meta: dict):
+        """可选：由 meta 构建 episode 索引列表（Lerobot v3 handler 实现）。"""
+        raise NotImplementedError(
+            f"{__name__} does not implement build_datalist; "
+            "only handlers that index meta/episodes parquet need it."
+        )
+
 
 def _open_h5(path: str) -> h5py.File:
     """Open HDF5 from local FS or remote backend via mmengine.fileio."""

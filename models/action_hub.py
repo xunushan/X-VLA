@@ -264,6 +264,58 @@ class AGIBOTEE6DActionSpace(BaseActionSpace):
 
 
 
+@register_action("arx_ee6d")
+class ARXEE6DActionSpace(BaseActionSpace):
+    """GOAI 2026 ARX 双臂 end-effector action space（100:10:10）。
+
+    与 AGIBOTEE6D 差异仅在 XYZ_SCALE=100.0；MSE 全分量、连续 gripper、pre/post no-op。
+    20 维布局：[l_xyz(3), l_rot6d(6), l_g(1), r_xyz(3), r_rot6d(6), r_g(1)]
+    """
+
+    dim_action = 20
+    gripper_idx = (9, 19)
+    GRIPPER_SCALE = 10.0
+    XYZ_SCALE = 100.0
+    ROT_SCALE = 10.0
+    POS_IDX_1 = (0, 1, 2)
+    POS_IDX_2 = (10, 11, 12)
+    ROT_IDX_1 = (3, 4, 5, 6, 7, 8)
+    ROT_IDX_2 = (13, 14, 15, 16, 17, 18)
+
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def compute_loss(self, pred, target):
+        assert pred.shape == target.shape
+        B, T, D = pred.shape
+        _ensure_indices_valid(D, self.gripper_idx, "gripper_idx")
+
+        gripper_loss = self.mse(pred[:, :, self.gripper_idx], target[:, :, self.gripper_idx]) * self.GRIPPER_SCALE
+        pos_loss = (
+            self.mse(pred[:, :, self.POS_IDX_1], target[:, :, self.POS_IDX_1]) +
+            self.mse(pred[:, :, self.POS_IDX_2], target[:, :, self.POS_IDX_2])
+        ) * self.XYZ_SCALE
+        rot_loss = (
+            self.mse(pred[:, :, self.ROT_IDX_1], target[:, :, self.ROT_IDX_1]) +
+            self.mse(pred[:, :, self.ROT_IDX_2], target[:, :, self.ROT_IDX_2])
+        ) * self.ROT_SCALE
+
+        return {
+            "position_loss": pos_loss,
+            "rotate6D_loss": rot_loss,
+            "gripper_loss": gripper_loss,
+        }
+
+    def preprocess(self, proprio, action, mode="train"):
+        """ARX 连续 gripper：无预处理。"""
+        return proprio, action
+
+    def postprocess(self, action: torch.Tensor) -> torch.Tensor:
+        """ARX 不做后处理（gripper 连续值即目标）。"""
+        return action
+
+
 @register_action("auto")
 class AutoActionSpace(BaseActionSpace):
     """
@@ -357,6 +409,7 @@ __all__ = [
     "EE6DActionSpace",
     "JointActionSpace",
     "AGIBOTEE6DActionSpace",
+    "ARXEE6DActionSpace",
     "AutoActionSpace",
     "ACTION_REGISTRY",
 ]

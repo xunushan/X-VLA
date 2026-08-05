@@ -9,7 +9,9 @@
 |----|------|
 | fork `xunushan/X-VLA`（已设为**私人**）+ 推送 main | ✅ `78e1097` |
 | `CLAUDE.md`（提交/推送规范 + conda lerobot） | ✅ 已提交推送 |
-| 改造方案 | ⏳ 本文档，待确认 |
+| 改造方案 | ✅ 用户确认 |
+| 代码实现（§3.1–§3.7） | ✅ 已实现，见下 |
+| 测试 `test/`（pytest，conda lerobot） | ✅ 已建并通过 |
 
 ## 1. 数据事实（Lerobot v3）
 
@@ -72,24 +74,20 @@ goai-2026 数据目录（只读引用）：`/Users/isuntaiyang/Documents/competi
 - 因此只要 `camera_keys[0] == "observation.images.cam_high"`，cam_high 即主视频 ✅
 - 与 X-VLA 现有 `meta["observation_key"]` 模式（[base.py:84](datasets/domain_handler/base.py#L84)）一致
 
-**图像预处理（评估结论：现有 `image_aug` 直接适用，无需改动）**：
+**图像预处理（实测修正：handler 走 PIL 链路，与现有 handler 一致）**：
 - `dataset.py` 构造**统一**的 `image_aug`（[dataset.py:76](datasets/dataset.py#L76)），经 `_iter_one_dataset` 传给**所有 handler**，各 handler 内部自行调用
 - 现有 pipeline：`Resize((224,224),BICUBIC) → ColorJitter(训练) → ToTensor → Normalize(ImageNet mean/std)`
-- **解码格式实测**：pyav 解码 mp4 输出 **[H,W,C] uint8 0-255**（实测 `(480,640,3)` min/max 0/255）；`stats.json` 图像 min/max 0~1 是 **lerobot API 层 `/255` 约定**（视频文件内即 uint8）→ handler 需 `arr.transpose(2,0,1) / 255` 转 **[C,H,W] float 0~1**
+- **解码格式实测**：pyav 解码 mp4 输出 **[H,W,C] uint8 0-255**（实测 `(480,640,3)` min/max 0/255）；`stats.json` 图像 min/max 0~1 是 **lerobot API 层 `/255` 约定**（视频文件内即 uint8）
+- **⚠️ torchvision 0.17.2（conda lerobot）实测**：`Resize` 只接受 **PIL / tensor**，`ToTensor` 只接受 **PIL / ndarray** → **PIL 是唯一能贯穿整个 `image_aug` 链路的输入格式**。此前"handler 直传 `[C,H,W] float 0~1` tensor"的方案在 0.17.2 下 ToTensor 抛 `TypeError`（`pic should be PIL Image or ndarray`），不成立
+- **结论**：handler 解码 HWC uint8 → `Image.fromarray` 转 PIL → `image_aug`（Resize → ColorJitter → ToTensor 做 `/255`+HWC→CHW → Normalize）。与现有 AGIBOT/BaseHDF5 handler 完全一致，零额外依赖
 - **`Normalize` 的 mean/std = ImageNet 标准常量** `(0.485,0.456,0.406)/(0.229,0.224,0.225)`，硬编码 [dataset.py:81](datasets/dataset.py#L81)，**与 Florence2（X-VLA 的 VLM encoder）预训练图像处理器一致，不可改动**（改会破坏预训练权重输入分布；stats.json 图像 mean≈[0.426,0.323,0.283] 佐证其合理性）
-- 对 **[C,H,W] float 0~1** 逐项评估：
-  1. `Resize((224,224))`：支持 [C,H,W] tensor ✅
-  2. `ColorJitter`（训练时）：支持 float tensor ✅
-  3. `ToTensor`：**对 float tensor 不缩放、不 permute**（仅 uint8/PIL 才 `/255` + HWC→CHW）→ 0~1 CHW 原样 ✅（不会二次缩放）
-  4. `Normalize`：(x-mean)/std → [-2.4, 2.4] ✅
-- handler 本地解码 → `[C,H,W] float 0~1` 直接传 `image_aug`，无需转 PIL
 
 **插值**（对齐 [base.py:143](datasets/domain_handler/base.py#L143) 语义，参数按数据实况）：
 - `lt = arange(T)/25.0`（**真实 25Hz**）
 - `q = linspace(cur, cur+1.0, num_actions+1=31)`（`qdur=1.0s`，双臂 EE 平台）
-- `L = interp1d(lt, left, axis=0, bounds_error=False, fill_value=(首,末))`，产出 `abs_trajectory = cat([L(q), R(q)], -1)` → `[31, 20]`
-- **episode 尾部**：`cur+1.0 > episode_end` 的候选帧**排除**（保证完整 1s 窗口；每 episode 末 ~1s 约 5% 数据丢弃）
-- 语言指令按样本 `task_index` 从 `meta/tasks.parquet` 取文本；静态段跳过逻辑保留
+- 20 维数据 `observation.state` 已是**完整双臂布局**（非左右分开），`L = interp1d(lt, state20)` 直接产出 `abs_trajectory = L(q)` → `[31, 20]`（无需左右拼）；16 维数据先转 20 维
+- **episode 尾部**：`cur+1.0 > episode_end` 的候选帧**排除**（保证完整 1s 窗口；每 episode 末 ~1s 约 5% 数据丢弃，ep0 验证：579-25=554 样本）
+- 语言指令从 **episodes 表 `tasks` 列**直接取（每 episode 一条指令，已验证），无需再查 tasks.parquet；`lang_aug_map` 增强逻辑保留；静态段跳过逻辑保留
 
 ### 3.2 注册 handler 与 domain
 
@@ -183,5 +181,35 @@ accelerate launch --mixed_precision bf16 train.py \
 6. **`datasets` 包名冲突**：✅ **已定：不用 lerobot，本地实现**（handler 用 pyav 按时间戳解码 + pyarrow 读 episodes/parquet，无 lerobot 依赖，绕开 huggingface `datasets` 遮蔽）
 
 ---
+
+## 6. 实现与测试记录（2026-08-05）
+
+**已实现代码**（§3 全部）：
+
+| 项 | 文件 |
+|----|------|
+| v3 handler（pyav 解码 + pyarrow，16/20 自适应，camera_keys 配置，插值，尾部排除） | `datasets/domain_handler/lerobot_v3_robodojo.py` |
+| 注册 `arx_x5_ee` | `datasets/domain_handler/registry.py` |
+| `domain_id=6` | `datasets/domain_config.py` |
+| v3.0 meta 分支（`build_datalist` + datalist 构建） | `datasets/dataset.py`、`datasets/domain_handler/base.py`（新增可选 `build_datalist` 接口） |
+| `arx_ee6d` action space（100:10:10, MSE, no-op） | `models/action_hub.py` |
+| 梯度累积 + 完全冻结 + action_mode 覆盖 | `train.py` |
+| 16→20 预处理脚本（服务器用） | `tools/make_goai_20d.py` |
+
+**测试**（`conda activate lerobot && python -m pytest test/ -v`，默认跳过 slow）：
+- `test/test_handler.py`：datalist 过滤、样本形状 `(3,3,224,224)/(31,20)`、20 维=16 维转换交叉验证（含 action 列）、插值一致性（max diff=0.0）、尾部排除（554=T-25）、静止段跳过、16 维自动转换、真实视频解码（slow）
+- `test/test_action_hub.py`：注册、loss 系数 100:10:10、pre/post no-op
+- `test/test_dataset_reader.py`：v3.0 meta 解析 → `domain_id=6` → `proprio(20)/action(30,20)`
+- `test/test_train_helpers.py`：`configure_training_step` 两阶段 requires_grad 切换、LR 调度、累积平均
+- `test/test_make_goai_20d.py`：16→20 转换与 handler 一致、parquet 重写
+- 测试用假视频 monkeypatch 加速；真实 pyav 解码为 `-m slow`
+
+**训练启动 meta.json 示例**：见 [meta_arx.example.json](../meta_arx.example.json)（`root_path` 指向服务器数据根目录）。
+
+**注意（实现中实测修正）**：
+1. 图像链路改为 **PIL**（torchvision 0.17.2 的 ToTensor 不接受 tensor），见 §3.1
+2. 插值直接用 `observation.state`（20 维完整双臂），不做左右分离，见 §3.1
+3. 指令从 episodes 表 `tasks` 列取，不查 tasks.parquet
+4. `peft_train.py`（LoRA 路径）未同步 grad-accumulation/freeze，如需要请告知
 
 以上方案确认后，我将按 §3 顺序实施代码改造。有任何设计点需要调整请指出。
