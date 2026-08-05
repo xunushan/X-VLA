@@ -39,13 +39,14 @@ import os
 import sys
 import psutil
 
+
 # ============================================================
 # logger
 # ============================================================
 def get_logger(name="train", output_dir=None, accelerator=None, level=logging.INFO):
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    logger.propagate = False 
+    logger.propagate = False
     if logger.handlers:
         return logger
     is_main = accelerator is None or accelerator.is_main_process
@@ -73,27 +74,44 @@ def get_args_parser():
     parser = argparse.ArgumentParser("XVLA Training", add_help=False)
 
     # I/O
-    parser.add_argument("--models", type=str, required=True, help="Path or HF repo for pretrained XVLA")
-    parser.add_argument("--output_dir", type=str, default="runnings", help="Directory to save checkpoints")
+    parser.add_argument(
+        "--models", type=str, required=True, help="Path or HF repo for pretrained XVLA"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="runnings",
+        help="Directory to save checkpoints",
+    )
 
     # Data
-    parser.add_argument("--train_metas_path", type=str, required=True, help="Path to training metadata")
+    parser.add_argument(
+        "--train_metas_path", type=str, required=True, help="Path to training metadata"
+    )
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
-                        help="Micro-batches per optimizer step; effective batch = batch_size * world_size * accum")
-
-    # Mixed precision
-    parser.add_argument("--mixed_precision", type=str, default=None,
-                        help="Mixed precision mode (e.g. bf16/fp16). None falls back to the `accelerate launch` setting "
-                             "(ACCELERATE_MIXED_PRECISION). Forward is wrapped in accelerator.autocast() so it takes effect.")
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Micro-batches per optimizer step; effective batch = batch_size * world_size * accum",
+    )
 
     # Action space
-    parser.add_argument("--action_mode", type=str, default=None,
-                        help="Override pretrained action_mode (e.g. arx_ee6d); None keeps the pretrained config")
+    parser.add_argument(
+        "--action_mode",
+        type=str,
+        default=None,
+        help="Override pretrained action_mode (e.g. arx_ee6d); None keeps the pretrained config",
+    )
 
     # Optimizer
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--learning_coef", type=float, default=1.0, help="LR multiplier for soft prompts")
+    parser.add_argument(
+        "--learning_coef",
+        type=float,
+        default=1.0,
+        help="LR multiplier for soft prompts",
+    )
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -125,46 +143,64 @@ def set_seed(seed: int):
     cudnn.benchmark = True
 
 
-def build_optimizer(model: XVLA, lr: float, weight_decay: float, betas=(0.9, 0.95), lr_coef_soft=1.0):
+def build_optimizer(
+    model: XVLA, lr: float, weight_decay: float, betas=(0.9, 0.95), lr_coef_soft=1.0
+):
     """Split param groups by module type with different learning rates."""
     vlm_params = list(model.vlm.parameters())
     soft_prompt_params = list(model.transformer.soft_prompt_hub.parameters())
-    action_params = list(model.transformer.action_decoder.parameters()) + list(model.transformer.action_encoder.parameters())
+    action_params = list(model.transformer.action_decoder.parameters()) + list(
+        model.transformer.action_encoder.parameters()
+    )
     exclude = set(map(id, vlm_params + soft_prompt_params + action_params))
     transformer_core_params = [p for p in model.parameters() if id(p) not in exclude]
     param_groups = [
         {"name": "vlm", "params": vlm_params, "lr": 0.0, "weight_decay": weight_decay},
-        {"name": "transformer_core", "params": transformer_core_params, "lr": 0.0, "weight_decay": weight_decay},
-        {"name": "soft_prompts", "params": soft_prompt_params, "lr": lr * lr_coef_soft, "weight_decay": weight_decay},
-        {"name": "action_heads", "params": action_params, "lr": lr, "weight_decay": weight_decay},
+        {
+            "name": "transformer_core",
+            "params": transformer_core_params,
+            "lr": 0.0,
+            "weight_decay": weight_decay,
+        },
+        {
+            "name": "soft_prompts",
+            "params": soft_prompt_params,
+            "lr": lr * lr_coef_soft,
+            "weight_decay": weight_decay,
+        },
+        {
+            "name": "action_heads",
+            "params": action_params,
+            "lr": lr,
+            "weight_decay": weight_decay,
+        },
     ]
     return AdamW(param_groups, betas=betas)
 
 
 def set_group_lr(optim: torch.optim.Optimizer, name: str, lr: float):
-    for g in optim.param_groups: 
-        if g["name"] == name: g["lr"] = lr
+    for g in optim.param_groups:
+        if g["name"] == name:
+            g["lr"] = lr
 
 
 def get_group_lr(optim: torch.optim.Optimizer, name: str) -> float:
     for g in optim.param_groups:
-        if g["name"] == name: return g["lr"]
+        if g["name"] == name:
+            return g["lr"]
     return 0.0
 
 
 def linear_warmup_cosine(step, start, warmup, total, base_lr, min_ratio):
     """Linear warmup followed by cosine decay."""
-    if step < start: return 0.0
+    if step < start:
+        return 0.0
     progress = step - start
     if progress < warmup:
         return base_lr * (progress / max(1, warmup))
     remain = max(1, total - (start + warmup))
     ratio = 0.5 * (1 + math.cos(math.pi * min(1.0, (progress - warmup) / remain)))
     return base_lr * (min_ratio + (1 - min_ratio) * ratio)
-
-
-# 冻结期（step < freeze_steps）禁止更新的参数组，与 build_optimizer 的 4 组划分对齐
-FREEZE_GROUPS = ("vlm", "transformer_core")
 
 
 def configure_training_step(optim, step, args):
@@ -180,13 +216,16 @@ def configure_training_step(optim, step, args):
     与 build_optimizer 的参数组划分保持单一数据源。须在 forward/backward 之前调用，
     冻结参数才真正不计算梯度。
     """
-    warmup = step < args.freeze_steps
+    frozen = step < args.freeze_steps
 
     # —— 真冻结：按参数组切换 requires_grad ——
+    # 冻结组（vlm / transformer_core）在阶段一 requires_grad=False（不计算不分配梯度缓冲）；
+    # 阶段二必须恢复 True，否则解冻永不生效（vlm/transformer_core 将全程冻结）。
+    # 训练组（soft_prompts / action_heads）恒为 True。
     for group in optim.param_groups:
-        frozen = warmup and group["name"] in FREEZE_GROUPS
+        is_frozen_group = group["name"] in ("vlm", "transformer_core")
         for p in group["params"]:
-            p.requires_grad = not frozen
+            p.requires_grad = not (frozen and is_frozen_group)
 
     # —— 参数组 LR 调度（原始 update_group_lrs 逻辑）——
     base = {
@@ -195,9 +234,18 @@ def configure_training_step(optim, step, args):
         "soft_prompts": args.learning_rate * args.learning_coef,
         "action_heads": args.learning_rate,
     }
+
     def schedule(step, base_lr):
-        return linear_warmup_cosine(step, args.freeze_steps, args.warmup_steps, args.iters, base_lr, args.min_lr_ratio)
-    if warmup:
+        return linear_warmup_cosine(
+            step,
+            args.freeze_steps,
+            args.warmup_steps,
+            args.iters,
+            base_lr,
+            args.min_lr_ratio,
+        )
+
+    if frozen:
         set_group_lr(optim, "vlm", 0.0)
         set_group_lr(optim, "transformer_core", 0.0)
         set_group_lr(optim, "soft_prompts", base["soft_prompts"])
@@ -219,26 +267,25 @@ def main(args):
         # 必须显式传梯度累积步数：`accelerate launch` 没有对应 CLI flag，
         # 不传则默认 1，accumulate()/sync_gradients 不会按累积步数工作。
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        # None 时回落到 accelerate launch 的 --mixed_precision（ACCELERATE_MIXED_PRECISION env）。
-        mixed_precision=args.mixed_precision,
     )
     accelerator.init_trackers("XVLA-Training")
-    
+
     accelerator.wait_for_everyone()
     logger = get_logger(__name__, output_dir=output_dir, accelerator=accelerator)
-    
+
     set_seed(args.seed + accelerator.process_index)
     logger.info(f"Args: {args}")
 
     # Load model & processor
     # action_mode 覆盖属配置层职责：由 XVLAConfig.from_pretrained 的 kwargs 直接完成
     # （PretrainedConfig.from_dict 会把已有属性用 kwargs 覆盖），不再在训练代码里改 config。
+    config = None
     if args.action_mode is not None:
         config = XVLAConfig.from_pretrained(args.models, action_mode=args.action_mode)
-        model = XVLA.from_pretrained(args.models, config=config)
         logger.info(f"Override action_mode -> {config.action_mode}")
-    else:
-        model = XVLA.from_pretrained(args.models)
+
+    # 覆盖后的 config 必须传给模型加载，否则 action_mode 覆盖不生效
+    model = XVLA.from_pretrained(args.models, config=config)
     processor = XVLAProcessor.from_pretrained(args.models)
 
     # Iterable dataloader (don't wrap with prepare)
@@ -249,6 +296,7 @@ def main(args):
         action_mode=model.action_mode,
         training=True,
     )
+    train_iter = iter(train_dataloader)
 
     # Optimizer
     optim = build_optimizer(
@@ -262,87 +310,98 @@ def main(args):
 
     # Training loop
     model.train()
-    accum_steps = max(1, args.gradient_accumulation_steps)
+    base_model = accelerator.unwrap_model(model)
     global_step, t0 = 0, time.time()
-    effective_batch = args.batch_size * accelerator.num_processes * accum_steps
+    effective_batch = (
+        args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    )
     logger.info(
         f"🚀 Start training for {args.iters} optimizer steps | "
-        f"world_size={accelerator.num_processes} | accum={accum_steps} | "
+        f"world_size={accelerator.num_processes} | accum={args.gradient_accumulation_steps} | "
         f"effective_batch={effective_batch}"
     )
 
     last_cfg_step = -1
-    for batch in train_dataloader:
-        # Encode language
-        lang = processor.encode_language(batch["language_instruction"])
-        batch.pop("language_instruction", None)
-        inputs = {**batch, **lang}
-        inputs = {k: v.to(accelerator.device, non_blocking=True) for k, v in inputs.items()}
-        # 每个 optimizer 步在首个 micro-batch 前配置训练状态（参数组 LR + 真冻结 requires_grad）。
-        # 必须在 forward/backward 之前生效，冻结参数（vlm/transformer_core）才不计算梯度。
-        if last_cfg_step != global_step:
-            configure_training_step(optim, global_step, args)
-            last_cfg_step = global_step
-
-        # 每次循环 = 一个 micro-batch。accelerator.accumulate(model)：
-        #   - 非末个微批 sync_gradients=False，DDP 下进入 no_sync() 跳过梯度 all-reduce；
-        #   - AcceleratedOptimizer 在非末微批自动跳过 step/zero_grad；
-        #   - accelerator.backward 自动按 1/gradient_accumulation_steps 缩放 loss（累积平均）。
+    while global_step < args.iters:
         with accelerator.accumulate(model):
-            # 混合精度生效的关键：forward 需在 accelerator.autocast() 内执行
+            # 取一个 micro-batch
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_dataloader)
+                batch = next(train_iter)
+
+            # 统一配置：学习率 + 冻结状态。每个 optimizer 步在首个 micro-batch 的
+            # forward 前配置一次（门控避免累积期间重复遍历 vlm 参数），且须在
+            # backward 之前生效——真冻结参数才不计算梯度。
+            if last_cfg_step != global_step:
+                configure_training_step(optim, global_step, args)
+                last_cfg_step = global_step
+
+            # Encode language
+            lang = processor.encode_language(batch["language_instruction"])
+            batch.pop("language_instruction", None)
+            inputs = {**batch, **lang}
+            inputs = {k: v.to(accelerator.device, non_blocking=True) for k, v in inputs.items()}
+
+            # Forward & backward
             with accelerator.autocast():
                 loss_dict: Dict[str, torch.Tensor] = model(**inputs)
-            loss: torch.Tensor = sum(loss_dict.values())
+            loss = sum(loss_dict.values())
             accelerator.backward(loss)
 
+            # Grad clip
             if accelerator.sync_gradients:
-                # —— 一个有效 optimizer step（已累积 accum 个 micro-batch）——
                 if args.max_grad_norm > 0:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optim.step()
                 optim.zero_grad()
-                global_step += 1
 
-                # Logging
-                if global_step % args.log_interval == 0:
-                    logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
-                    logs["loss_total"] = float(loss.detach().item())  # 末个 micro-batch loss（未缩放）
-                    logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
-                    accelerator.log(logs, step=global_step)
+        # 以下只在真正的 optimizer step 边界执行
+        if accelerator.sync_gradients:
+            global_step += 1
 
-                    if accelerator.is_main_process:
-                        dt = (time.time() - t0) / args.log_interval
-                        t0 = time.time()
-                        cpu_mem = psutil.Process(os.getpid()).memory_info().rss / 1024**3
-                        gpu_mem = torch.cuda.memory_allocated() / 1024**3
-                        logger.info(
-                            f"[{global_step}/{args.iters}] "
-                            f"loss={logs['loss_total']:.4f} "
-                            f"lr_core={logs['lr_transformer_core']:.2e} "
-                            f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
-                            f"USED_CPU={cpu_mem:.2e} GB "
-                            f"USED_GPU={gpu_mem:.2e} GB "
-                        )
+            # Logging
+            if global_step % args.log_interval == 0:
+                logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
+                logs["loss_total"] = float(loss.detach().item())
+                logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
+                accelerator.log(logs, step=global_step)
 
-                # Checkpointing
                 if accelerator.is_main_process:
-                    if global_step == args.iters or global_step % args.save_interval == 0:
-                        save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
-                        accelerator.print(f"💾 Saving model to {save_dir}")
-                        accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
-                        processor.save_pretrained(save_dir)
-                        with open(os.path.join(save_dir, "state.json"), "w") as f:
-                            json.dump({"global_step": global_step}, f)
-                if global_step >= args.iters:
-                    break
+                    dt = (time.time() - t0) / args.log_interval
+                    t0 = time.time()
+                    cpu_mem = psutil.Process(os.getpid()).memory_info().rss / 1024**3
+                    gpu_mem = torch.cuda.memory_allocated() / 1024**3
+                    logger.info(
+                        f"[{global_step}/{args.iters}] "
+                        f"loss={logs['loss_total']:.4f} "
+                        f"lr_core={logs['lr_transformer_core']:.2e} "
+                        f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
+                        f"USED_CPU={cpu_mem:.2e} GB "
+                        f"USED_GPU={gpu_mem:.2e} GB "
+                    )
+
+            # Checkpointing
+            if accelerator.is_main_process:
+                if global_step == args.iters or global_step % args.save_interval == 0:
+                    save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
+                    accelerator.print(f"💾 Saving model to {save_dir}")
+                    base_model.save_pretrained(save_dir, safe_serialization=True)
+                    processor.save_pretrained(save_dir)
+                    with open(os.path.join(save_dir, "state.json"), "w") as f:
+                        json.dump({"global_step": global_step}, f)
 
     accelerator.end_training()
+
 
 # ============================================================
 # Entry
 # ============================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("XVLA training script", parents=[get_args_parser()])
+    parser = argparse.ArgumentParser(
+        "XVLA training script", parents=[get_args_parser()]
+    )
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
