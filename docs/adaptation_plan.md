@@ -72,10 +72,15 @@ goai-2026 数据目录（只读引用）：`/Users/isuntaiyang/Documents/competi
 - 因此只要 `camera_keys[0] == "observation.images.cam_high"`，cam_high 即主视频 ✅
 - 与 X-VLA 现有 `meta["observation_key"]` 模式（[base.py:84](datasets/domain_handler/base.py#L84)）一致
 
-**图像预处理（已实测适配，无需改 image_aug）**：
-- lerobot `decode_video_frames` 返回 **[T, C, H, W] float32，像素值 [0,1]**（torchvision VideoReader → `/255`，无 permute）
-- X-VLA 现有 `image_aug`（[dataset.py:76](datasets/dataset.py#L76)：Resize→ColorJitter→ToTensor→Normalize）对 `[C,H,W] float 0~1` tensor **直接适用**——torchvision `ToTensor` 对 float tensor 不缩放、不 permute
-- handler 把 `frames[idx]`（[C,H,W] 0~1）直接传 `image_aug`，**无需转 PIL**
+**图像预处理（评估结论：现有 `image_aug` 直接适用，无需改动）**：
+- `dataset.py` 构造**统一**的 `image_aug`（[dataset.py:76](datasets/dataset.py#L76)），经 `_iter_one_dataset` 传给**所有 handler**，各 handler 内部自行调用
+- 现有 pipeline：`Resize((224,224),BICUBIC) → ColorJitter(训练) → ToTensor → Normalize(ImageNet mean/std)`
+- 对**我们的图像（[C,H,W] float 0~1）**逐项评估：
+  1. `Resize((224,224))`：torchvision 支持 [C,H,W] tensor ✅
+  2. `ColorJitter`（训练时）：支持 float tensor ✅
+  3. `ToTensor`：**对 float tensor 不缩放、不 permute**（仅 uint8/PIL 才 `/255` 且 HWC→CHW）→ 保持 0~1、CHW 原样 ✅（**关键：不会二次缩放**）
+  4. `Normalize`：(x-mean)/std → [-2.4, 2.4] ✅
+- handler 本地解码输出 **[C,H,W] float 0~1**（对齐 info.json `3×H×W` 约定），直接传 `image_aug`，无需转 PIL
 
 **插值**（对齐 [base.py:143](datasets/domain_handler/base.py#L143) 语义，参数按数据实况）：
 - `lt = arange(T)/25.0`（**真实 25Hz**）
@@ -173,9 +178,7 @@ accelerate launch --mixed_precision bf16 train.py \
 3. **本地数据仅 `file-000`**：本地测试只能跑通前几个 episode；完整 1200 episode 需服务器上生成 meta.json
 4. **视频解码性能**：用 lerobot `decode_video_frames`（pyav）按 episode 批量解码；吞吐待服务器实测，必要时按 chunk 预解码缓存
 5. **相机顺序**：默认 `[cam_high, cam_left_wrist, cam_right_wrist]`（cam_high 第 0 路进 BART）；如需调整直接在 meta.json 改 `camera_keys`
-6. **`datasets` 包名冲突（关键）**：lerobot 内部 `import datasets`（huggingface 库），会被项目根 `datasets/` 包遮蔽（实测 import lerobot → 加载本地包 → `mmengine` 缺失）。解决：
-   - **方案 A（推荐）**：本地 `datasets/` 重命名为 `xvla_data/`，改动仅目录 + [train.py:32](train.py#L32)、[peft_train.py:32](peft_train.py#L32) 两处 `from datasets import create_dataloader`（其余均相对导入）。一劳永逸，lerobot 可直接使用
-   - **方案 B**：handler 不 import lerobot，本地实现 pyav 按时间戳解码（`decode_video_frames` 等价，~30 行）+ pyarrow 读 episodes 定位，完全绕开冲突
+6. **`datasets` 包名冲突**：✅ **已定：不用 lerobot，本地实现**（handler 用 pyav 按时间戳解码 + pyarrow 读 episodes/parquet，无 lerobot 依赖，绕开 huggingface `datasets` 遮蔽）
 
 ---
 
