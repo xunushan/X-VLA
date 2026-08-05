@@ -10,7 +10,6 @@ import itertools
 import numpy as np
 import pytest
 import torch
-from scipy.interpolate import interp1d
 
 from datasets.domain_handler.lerobot_v3_robodojo import (
     DEFAULT_CAMERA_KEYS,
@@ -110,28 +109,25 @@ def test_20d_matches_reference_conversion():
     assert np.allclose(action20, expect, atol=1e-5), "20d action != 16d->20d conversion"
 
 
-def test_interpolation_consistency(fake_video, fast_image_aug):
-    """seq[i] 应精确等于 interp1d(state)(q_i)，q=linspace(cur, cur+qdur, 31)。"""
+def test_action_grid_is_exact_state(fake_video, fast_image_aug):
+    """动作网格 = num_actions/qdur，查询点恰落在帧上 → abs_trajectory 是连续真实帧，
+    不产生合成插值点（与录制帧率解耦）。"""
     ep = fake_video.episodes[0]
     state = fake_video._to_20d(fake_video._read_state(ep))
-    T = min(state.shape[0], int(ep["length"]))
-    lt = np.arange(T, dtype=np.float64) / 25.0
-    L = interp1d(lt, state[:T], axis=0, bounds_error=False, fill_value=(state[0], state[T - 1]))
-
     sample = next(iter(
         fake_video.iter_episode(0, num_actions=30, training=False, image_aug=fast_image_aug)))
-    q = np.linspace(0.0, 1.0, 31, dtype=np.float32)  # 首个样本 cur=0
-    expect = torch.tensor(L(q)).float()
+    # 首个样本 cur=0，q=linspace(0, qdur, 31) 恰为帧 0..30
+    expect = torch.tensor(state[:31]).float()
     assert torch.allclose(sample["abs_trajectory"], expect, atol=1e-5)
 
 
 def test_tail_exclusion_count(fake_video, fast_image_aug):
-    """episode 尾部不足 qdur 完整窗口的帧应排除：样本数 = T - int(qdur*fps)。"""
+    """episode 尾部不足 num_actions 帧完整窗口的帧应排除：样本数 = T - num_actions。"""
     ep = fake_video.episodes[0]
     T = min(int(ep["length"]), fake_video._read_state(ep).shape[0])
     samples = list(
         fake_video.iter_episode(0, num_actions=30, training=False, image_aug=fast_image_aug))
-    assert len(samples) == T - 25
+    assert len(samples) == T - 30
 
 
 def test_static_segment_skipped(fake_video, fast_image_aug):

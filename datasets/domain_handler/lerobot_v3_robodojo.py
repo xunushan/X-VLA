@@ -36,11 +36,17 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
       - gripper 已反转：1=闭合、0=张开（X-VLA-Pt EE6D 约定）
       - 若数据为 16 维（每臂 xyz+quat_wxyz+g，gripper 0=张开），自动转 20 维并反转 gripper
 
+    动作时间轴：网格密度 = num_actions / query_duration，与录制帧率**解耦**。查询点 q 恰好落在
+    帧网格上，interp1d 是恒等操作 → 动作目标为连续真实帧，不产生合成插值点（与 v2.1 handler 同款
+    语义；"freq" 曾误用为录制帧率，见 docs/todo.md）。
+
     meta.json 需提供：
       - codebase_version: "v3.0"
       - root_path: 数据集根目录
       - robot_type: 注册名（默认 "arx_x5_ee"）
       - camera_keys: 相机顺序（可选，默认 cam_high/cam_left_wrist/cam_right_wrist）
+      - fps: 视频帧率，仅用于视频解码时间戳容差（与动作时间轴无关）
+      - query_duration: 动作窗口时长（秒，默认 1.0）
       - episodes: 可选 episode_index 过滤列表
     """
 
@@ -55,6 +61,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         self.camera_keys: List[str] = list(meta.get("camera_keys", DEFAULT_CAMERA_KEYS))
         if not self.camera_keys:
             raise ValueError("camera_keys must contain at least one camera (e.g. observation.images.cam_high)")
+        # fps 仅用于视频解码时间戳容差（真实视频帧率），与动作时间轴无关（见 iter_episode）
         self.fps = float(meta.get("fps", 25.0))
         self.qdur = float(meta.get("query_duration", 1.0))
         # 独立使用（未经过 dataset.py 时）也自动构建 datalist；dataset.py 已设置则不覆盖
@@ -209,8 +216,10 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         if T < 2:
             return
 
-        # 4. 时间轴（真实 25Hz）与插值器
-        lt = np.arange(T, dtype=np.float64) / self.fps
+        # 4. 时间轴（动作网格密度 = num_actions/qdur，与录制帧率无关）与插值器。
+        #    网格步长 = qdur/num_actions，查询点 q 恰好落在帧网格上 → interp1d 恒等返回
+        #    原始 state 值（连续真实帧），不产生合成插值点；fps 仅用于视频解码（见 __init__）。
+        lt = np.arange(T, dtype=np.float64) * (self.qdur / num_actions)
         L = interp1d(lt, state[:T], axis=0, bounds_error=False, fill_value=(state[0], state[T - 1]))
 
         # 5. 候选帧：排除 episode 尾部不足 qdur 完整窗口的样本
