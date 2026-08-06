@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -138,6 +139,16 @@ def test_accumulated_loss_average():
 
 
 # ---------------------------------------------------------------- checkpoint / resume
+def _make_complete_ckpt(base: Path, step: int) -> Path:
+    """构造"完整" checkpoint 目录（state.json + optimizer.pt + model.safetensors）。"""
+    d = base / f"ckpt-{step}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "state.json").write_text(f'{{"global_step": {step}}}')
+    (d / "optimizer.pt").write_bytes(b"opt")
+    (d / "model.safetensors").write_bytes(b"\0" * (1 << 20))  # >= MIN_WEIGHT_SIZE
+    return d
+
+
 def test_resolve_resume_dir_none(tmp_path):
     """未传 --resume → 返回 None。"""
     from train import resolve_resume_dir
@@ -146,12 +157,33 @@ def test_resolve_resume_dir_none(tmp_path):
 
 
 def test_resolve_resume_dir_latest(tmp_path):
-    """--resume latest：取 step 最大的 ckpt-*。"""
+    """--resume latest：从最新到最旧取第一个 *完整* ckpt-*。"""
     from train import resolve_resume_dir
-    for step in (100, 50, 1000):
-        (tmp_path / f"ckpt-{step}").mkdir()
+    _make_complete_ckpt(tmp_path, 100)
+    _make_complete_ckpt(tmp_path, 50)
+    _make_complete_ckpt(tmp_path, 1000)
     args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
     assert resolve_resume_dir(args) == str(tmp_path / "ckpt-1000")
+
+
+def test_resolve_resume_dir_latest_skips_incomplete(tmp_path):
+    """最新 ckpt 是中断的半截保存（缺 state.json，state.json 最后落盘）→ 回退到更早的完整 ckpt。"""
+    from train import resolve_resume_dir
+    broken = _make_complete_ckpt(tmp_path, 30)
+    (broken / "state.json").unlink()
+    good = _make_complete_ckpt(tmp_path, 15)
+    args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
+    assert resolve_resume_dir(args) == str(good)
+
+
+def test_resolve_resume_dir_latest_all_incomplete(tmp_path):
+    """全部 ckpt 都不完整 → 抛错并列出原因。"""
+    from train import resolve_resume_dir
+    d = _make_complete_ckpt(tmp_path, 10)
+    (d / "optimizer.pt").unlink()
+    args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
+    with pytest.raises(ValueError, match="no complete checkpoint"):
+        resolve_resume_dir(args)
 
 
 def test_resolve_resume_dir_explicit_incomplete(tmp_path):
@@ -162,6 +194,22 @@ def test_resolve_resume_dir_explicit_incomplete(tmp_path):
     (d / "state.json").write_text('{"global_step": 10}')
     args = argparse.Namespace(output_dir=str(tmp_path), resume=str(d))
     with pytest.raises(ValueError, match="optimizer.pt"):
+        resolve_resume_dir(args)
+
+
+def test_resolve_resume_dir_explicit_missing_weights(tmp_path):
+    """显式路径缺 model.safetensors / 权重空 → 判为不可恢复，抛错。"""
+    from train import resolve_resume_dir
+    d = tmp_path / "ckpt-10"
+    d.mkdir()
+    (d / "state.json").write_text('{"global_step": 10}')
+    (d / "optimizer.pt").write_bytes(b"opt")
+    args = argparse.Namespace(output_dir=str(tmp_path), resume=str(d))
+    with pytest.raises(ValueError, match="model.safetensors"):
+        resolve_resume_dir(args)
+    # 空/半截权重同样拦截（截断写入场景）
+    (d / "model.safetensors").write_bytes(b"")
+    with pytest.raises(ValueError, match="too small"):
         resolve_resume_dir(args)
 
 

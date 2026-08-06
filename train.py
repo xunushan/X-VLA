@@ -20,6 +20,7 @@ import time
 import json
 import random
 import argparse
+import sys
 from pathlib import Path
 from typing import Dict
 
@@ -154,11 +155,34 @@ def set_seed(seed: int):
     cudnn.benchmark = True
 
 
+MIN_WEIGHT_SIZE = 1 << 20  # 1 MB：model.safetensors 最小合理体积（挡掉中断/半截写入）
+
+
+def checkpoint_is_complete(ckpt_dir: Path) -> list[str]:
+    """校验 checkpoint 目录完整性，返回问题列表（空列表 = 完整可恢复）。
+
+    保存序列：权重 → processor/ → optimizer.pt → state.json（train.py 保存顺序），
+    state.json 最后落盘，充当"保存已完成"提交标记——中断的保存必然缺它。
+    model.safetensors 单独校验存在且非空：safetensors `save_file` 直写目标文件
+    （无 temp+rename），进程被杀会留下截断文件，此处拦截而非拖到 from_pretrained 才报错；
+    完整解析仍由 XVLA.from_pretrained 兜底。
+    """
+    problems = []
+    for f in ("state.json", "optimizer.pt", "model.safetensors"):
+        if not (ckpt_dir / f).exists():
+            problems.append(f"missing {f}")
+    ws = ckpt_dir / "model.safetensors"
+    if ws.exists() and ws.stat().st_size < MIN_WEIGHT_SIZE:
+        problems.append(f"model.safetensors too small ({ws.stat().st_size} bytes)")
+    return problems
+
+
 def resolve_resume_dir(args) -> str | None:
     """解析 `--resume` 为具体 checkpoint 目录（未 resume 时返回 None）。
 
-    - `<path>`：显式 checkpoint 目录，必须含 state.json + optimizer.pt（完整可恢复）；
-    - `latest` / `auto`：取 --output_dir 下 step 最大的 ckpt-*。
+    - `<path>`：显式 checkpoint 目录，须为完整 checkpoint（state.json + optimizer.pt +
+      model.safetensors，见 checkpoint_is_complete）；
+    - `latest` / `auto`：从最新到最旧取第一个 *完整* ckpt-*，自动跳过中断/半截保存的目录。
     """
     if not args.resume:
         return None
@@ -166,18 +190,33 @@ def resolve_resume_dir(args) -> str | None:
         ckpts = sorted(
             (d for d in Path(args.output_dir).glob("ckpt-*") if d.is_dir()),
             key=lambda d: int(d.name.split("-")[-1]),
+            reverse=True,
         )
         if not ckpts:
             raise ValueError(
                 f"--resume={args.resume} but no ckpt-* dir found under {args.output_dir}"
             )
-        return str(ckpts[-1])
-    resume_dir = Path(args.resume)
-    for required in ("state.json", "optimizer.pt"):
-        if not (resume_dir / required).exists():
-            raise ValueError(
-                f"--resume dir {resume_dir} missing {required}: not a complete checkpoint"
+        for ck in ckpts:
+            problems = checkpoint_is_complete(ck)
+            if not problems:
+                return str(ck)
+            print(
+                f"[train] WARN: skip incomplete checkpoint {ck}: {', '.join(problems)}",
+                file=sys.stderr,
             )
+        incomplete = "; ".join(
+            f"{c} ({', '.join(checkpoint_is_complete(c))})" for c in ckpts
+        )
+        raise ValueError(
+            f"--resume={args.resume} but no complete checkpoint under {args.output_dir}: "
+            f"{incomplete}"
+        )
+    resume_dir = Path(args.resume)
+    problems = checkpoint_is_complete(resume_dir)
+    if problems:
+        raise ValueError(
+            f"--resume dir {resume_dir} not a complete checkpoint: {', '.join(problems)}"
+        )
     return str(resume_dir)
 
 
