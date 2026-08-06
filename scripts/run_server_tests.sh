@@ -16,7 +16,8 @@
 #   bash scripts/run_server_tests.sh --only 5         # 只跑 resume 阶段
 #   SKIP=3 bash scripts/run_server_tests.sh           # 跳过 pytest
 #
-# 磁盘注意：每 ckpt ≈ 权重 3.5G + AdamW 状态 7G ≈ 11G；阶段 5 峰值 2 ckpt ≈ 22G。
+# 磁盘注意（新布局，2026-08-06）：权重 3.4G/份（pretrained/ckpt-N，全保留）+ optimizer 6.6G/份
+#   （model_state/ckpt-N，scripts/prune_checkpoints.py 只留最近 3 个）；阶段 5/6 各阶段清理前序 ckpt。
 #   服务器 / 盘只剩 ~22G 时，先清理 /data 或用 XVLA_OUT_BASE 指到更大磁盘。
 set -uo pipefail
 
@@ -106,7 +107,7 @@ run_phase "0-env" <<'PHASE0'
   echo "=== disk (/data) ==="
   df -h /data | tail -1
   FREE_GB=$(df -BG --output=avail /data | tail -1 | tr -d 'G')
-  echo "  [INFO] /data free: ${FREE_GB}G (每 ckpt 约 11G；阶段 5 峰值需 ~22G)"
+  echo "  [INFO] /data free: ${FREE_GB}G (权重 3.4G/份 + optimizer 6.6G/份；model_state 只留最近 3 个)"
   if [ "${FREE_GB}" -lt 26 ] 2>/dev/null; then
     echo "  [WARN] 剩余磁盘 < 26G，阶段 5/6 可能因磁盘不足失败。请先清理 /data 或用 XVLA_OUT_BASE 指到更大磁盘。"
   fi
@@ -238,16 +239,20 @@ run_phase "4-train-smoke" <<'PHASE4'
     echo "  [FAIL] 冻结/解冻 lr 异常 (before='${before}' after='${after}')"
     touch "${CHECK_MARKER}"
   fi
-  echo "--- 模型文件大小 ---"
-  for ck in "${SMOKE_OUT}"/ckpt-*; do
-    [ -d "$ck" ] || continue
-    echo "  $(basename "$ck"): $(du -sh "$ck" | cut -f1) total, $(ls -lh "$ck/model.safetensors" | awk '{print $5}') safetensors"
+  echo "--- 模型文件大小（新布局：pretrained=权重 / model_state=optimizer） ---"
+  for w in "${SMOKE_OUT}"/pretrained/ckpt-*; do
+    [ -d "$w" ] || continue
+    echo "  $(basename "$w"): $(du -sh "$w" | cut -f1) weights"
+  done
+  for ms in "${SMOKE_OUT}"/model_state/ckpt-*; do
+    [ -d "$ms" ] || continue
+    echo "  $(basename "$ms"): $(du -sh "$ms" | cut -f1) model_state(optimizer+rng)"
   done
   pretrain_mb=$(du -m "${MODEL_DIR}/model.safetensors" | cut -f1)
-  last_ck=$(ls -d "${SMOKE_OUT}"/ckpt-* | sort -V | tail -1)
-  ck_mb=$(du -m "${last_ck}/model.safetensors" | cut -f1)
+  last_w=$(ls -d "${SMOKE_OUT}"/pretrained/ckpt-* 2>/dev/null | sort -V | tail -1)
+  ck_mb=$(du -m "${last_w}/model.safetensors" | cut -f1)
   ratio=$(python -c "print(f'{$ck_mb/$pretrain_mb:.2f}')")
-  echo "  [INFO] ckpt/preTrain size ratio=${ratio} (ck=${ck_mb}MB pre=${pretrain_mb}MB)"
+  echo "  [INFO] weights/preTrain size ratio=${ratio} (weights=${ck_mb}MB pre=${pretrain_mb}MB)"
   python - <<PY
 ok = 0.8 <= ${ratio} <= 1.2
 print(f"  [{'PASS' if ok else 'FAIL'}] 模型文件大小与预训练同量级 ratio=${ratio}")
@@ -261,7 +266,7 @@ fi
 if ! skip_phase 5; then
 run_phase "5-resume" <<'PHASE5'
   set -uo pipefail
-  rm -rf "${OUT_BASE}"/smoke/ckpt-*   # 释放阶段 4 的 ckpt（~11G），保留 train.log/timing 供 review；本阶段峰值 2 ckpt ≈ 22G
+  rm -rf "${OUT_BASE}"/smoke/pretrained "${OUT_BASE}"/smoke/model_state   # 释放阶段 4 ckpt（权重 3.4G + optimizer 6.6G），保留 train.log/timing
   RES_OUT="${OUT_BASE}/resume"
   rm -rf "${RES_OUT}"
   TRAIN_OUTPUT_DIR="${RES_OUT}" TRAIN_ITERS=60 TRAIN_SAVE_INTERVAL=60 \
@@ -280,13 +285,20 @@ run_phase "5-resume" <<'PHASE5'
   echo "--- resume 关键日志 ---"
   grep -E "Resume|continue from global_step|Restored" "${LOG}" | tail -5
   check_log_line "${LOG}" "Resume: continue from global_step=60" "resume 从 global_step=60 续跑"
-  LAST_CK=$(ls -d "${RES_OUT}"/ckpt-* | sort -V | tail -1)
-  gs=$(python -c "import json;print(json.load(open('$LAST_CK/state.json'))['global_step'])")
-  if [ -f "${LAST_CK}/optimizer.pt" ] && [ "${gs}" = "120" ]; then
-    echo "  [PASS] final ckpt ${LAST_CK} global_step=${gs}, optimizer.pt 存在"
-    log "  CHECK PASS: final ckpt global_step=${gs} + optimizer.pt"
+  LAST_MS=$(ls -d "${RES_OUT}"/model_state/ckpt-* 2>/dev/null | sort -V | tail -1)
+  LAST_W=$(ls -d "${RES_OUT}"/pretrained/ckpt-* 2>/dev/null | sort -V | tail -1)
+  gs=$(python -c "import json;print(json.load(open('$LAST_MS/state.json'))['global_step'])")
+  if [ -f "${LAST_MS}/optimizer.pt" ] && [ "${gs}" = "120" ]; then
+    echo "  [PASS] final model_state ${LAST_MS} global_step=${gs}, optimizer.pt 存在"
+    log "  CHECK PASS: final model_state global_step=${gs} + optimizer.pt"
   else
-    echo "  [FAIL] final ckpt global_step=${gs} / optimizer.pt 缺失"
+    echo "  [FAIL] final model_state global_step=${gs} / optimizer.pt 缺失"
+    touch "${CHECK_MARKER}"
+  fi
+  if [ -f "${LAST_W}/model.safetensors" ]; then
+    echo "  [PASS] final weights ${LAST_W} 存在"
+  else
+    echo "  [FAIL] final weights 缺失 (LAST_W='${LAST_W}')"
     touch "${CHECK_MARKER}"
   fi
   L1=$(grep -oE "loss=[0-9.]+" "${RES_OUT}.run1.log" | tail -1 | cut -d= -f2)
@@ -309,7 +321,8 @@ fi
 if ! skip_phase 6; then
 run_phase "6-freeze-resume" <<'PHASE6'
   set -uo pipefail
-  rm -rf "${OUT_BASE}"/smoke/ckpt-* "${OUT_BASE}"/resume/ckpt-*   # 释放前序阶段 ckpt（保留日志），峰值 2 ckpt ≈ 22G
+  rm -rf "${OUT_BASE}"/smoke/pretrained "${OUT_BASE}"/smoke/model_state \
+         "${OUT_BASE}"/resume/pretrained "${OUT_BASE}"/resume/model_state   # 释放前序阶段 ckpt（保留日志）
   FR_OUT="${OUT_BASE}/freeze_resume"
   rm -rf "${FR_OUT}"
   # run1：20 步全冻结期保存 ckpt-20（vlm/core 无梯度 → optimizer 状态小，省磁盘）；

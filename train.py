@@ -164,15 +164,21 @@ def set_seed(seed: int):
 
 MIN_WEIGHT_SIZE = 1 << 20  # 1 MB：model.safetensors 最小合理体积（挡掉中断/半截写入）
 
+# ---- checkpoint 布局 ----
+# 新布局（2026-08-06 起，配合磁盘瘦身，见 docs/todo.md）：
+#   output_dir/pretrained/ckpt-{N}/   模型权重（model.safetensors + config + processor + state.json）
+#                                     每个 save_interval 存一份并保留（上传/回退用）
+#   output_dir/model_state/ckpt-{N}/  optimizer.pt + rng_state_rank{k}.pt + state.json
+#                                     仅保留最近 K 个（scripts/prune_checkpoints.py 每小时轮询清理）
+# 旧布局（兼容）：output_dir/ckpt-{N}/  权重 + optimizer 同目录。
+
 
 def checkpoint_is_complete(ckpt_dir: Path) -> list[str]:
-    """校验 checkpoint 目录完整性，返回问题列表（空列表 = 完整可恢复）。
+    """校验旧版单目录 checkpoint 完整性（权重 + optimizer 同目录），返回问题列表。
 
-    保存序列：权重 → processor/ → optimizer.pt → state.json（train.py 保存顺序），
-    state.json 最后落盘，充当"保存已完成"提交标记——中断的保存必然缺它。
-    model.safetensors 单独校验存在且非空：safetensors `save_file` 直写目标文件
-    （无 temp+rename），进程被杀会留下截断文件，此处拦截而非拖到 from_pretrained 才报错；
-    完整解析仍由 XVLA.from_pretrained 兜底。
+    保存序列：optimizer → state.json → 权重 → state.json；state.json 充当"保存完成"标记，
+    中断的保存必然缺它。model.safetensors 单独校验存在且非空（safetensors 直写目标文件、
+    无 temp+rename，进程被杀会留截断文件）。
     """
     problems = []
     for f in ("state.json", "optimizer.pt", "model.safetensors"):
@@ -184,47 +190,136 @@ def checkpoint_is_complete(ckpt_dir: Path) -> list[str]:
     return problems
 
 
-def resolve_resume_dir(args) -> str | None:
-    """解析 `--resume` 为具体 checkpoint 目录（未 resume 时返回 None）。
+def weights_dir_complete(ckpt_dir: Path) -> list[str]:
+    """新布局权重目录完整性：pretrained/ckpt-{N}/ 需 model.safetensors + state.json。"""
+    problems = []
+    if not (ckpt_dir / "model.safetensors").exists():
+        problems.append("missing model.safetensors")
+    ws = ckpt_dir / "model.safetensors"
+    if ws.exists() and ws.stat().st_size < MIN_WEIGHT_SIZE:
+        problems.append("model.safetensors too small")
+    if not (ckpt_dir / "state.json").exists():
+        problems.append("missing state.json")
+    return problems
 
-    - `<path>`：显式 checkpoint 目录，须为完整 checkpoint（state.json + optimizer.pt +
-      model.safetensors，见 checkpoint_is_complete）；
-    - `latest` / `auto`：从最新到最旧取第一个 *完整* ckpt-*，自动跳过中断/半截保存的目录。
+
+def model_state_dir_complete(ckpt_dir: Path) -> list[str]:
+    """新布局训练状态目录完整性：model_state/ckpt-{N}/ 需 state.json + optimizer.pt。
+
+    注意：冻结阶段 optimizer.pt 也可能很小（仅训练参数有动量状态），但文件必然存在；
+    完整性只要求文件存在，不校验大小。
+    """
+    problems = []
+    for f in ("state.json", "optimizer.pt"):
+        if not (ckpt_dir / f).exists():
+            problems.append(f"missing {f}")
+    return problems
+
+
+def read_global_step(ckpt_dir: Path) -> int | None:
+    try:
+        with open(ckpt_dir / "state.json") as f:
+            return int(json.load(f)["global_step"])
+    except Exception:
+        return None
+
+
+def _resolve_latest(out: Path) -> dict | None:
+    """在 output_dir=out 下解析最新完整 checkpoint（新布局优先，旧布局兜底）。
+
+    新布局以权重为锚：找最新完整 pretrained/ckpt-{N}，再配对同 step 的
+    model_state/ckpt-{N}（可能已按 keep_last_k 清理 → model_state_dir=None，
+    此时 resume 从权重重开优化器）。返回
+    {"weights_dir", "model_state_dir"|None, "global_step"}。
+    """
+    weights = sorted(
+        (d for d in (out / "pretrained").glob("ckpt-*") if d.is_dir()),
+        key=lambda d: int(d.name.split("-")[-1]),
+        reverse=True,
+    )
+    model_state = sorted(
+        (d for d in (out / "model_state").glob("ckpt-*") if d.is_dir()),
+        key=lambda d: int(d.name.split("-")[-1]),
+        reverse=True,
+    )
+    for wd in weights:
+        problems = weights_dir_complete(wd)
+        if problems:
+            print(f"[train] WARN skip incomplete weights {wd}: {', '.join(problems)}", file=sys.stderr)
+            continue
+        step = read_global_step(wd)
+        msd = next(
+            (
+                m
+                for m in model_state
+                if read_global_step(m) == step and not model_state_dir_complete(m)
+            ),
+            None,
+        )
+        return {
+            "weights_dir": str(wd),
+            "model_state_dir": str(msd) if msd else None,
+            "global_step": step,
+        }
+    # 旧布局兜底：output_dir/ckpt-*
+    legacy = sorted(
+        (d for d in out.glob("ckpt-*") if d.is_dir()),
+        key=lambda d: int(d.name.split("-")[-1]),
+        reverse=True,
+    )
+    for ck in legacy:
+        problems = checkpoint_is_complete(ck)
+        if not problems:
+            return {"weights_dir": str(ck), "model_state_dir": str(ck), "global_step": read_global_step(ck)}
+    return None
+
+
+def resolve_resume(args) -> dict | None:
+    """解析 `--resume` 为 resume 信息 dict（未 resume 时返回 None）。
+
+    支持：
+      - `latest` / `auto`：output_dir 下最新完整 checkpoint（新布局 pretrained/+model_state/，
+        旧布局 ckpt-* 兜底，见 _resolve_latest）；
+      - output_dir 根目录：等同 latest；
+      - `pretrained/ckpt-{N}` 或 `model_state/ckpt-{N}`：新布局显式目录（自动配对对方，
+        缺失的一方降级为 None/权重重开优化器）；
+      - 旧版完整 ckpt 目录（内含 model.safetensors + optimizer.pt）。
+    返回 {"weights_dir", "model_state_dir"|None, "global_step"}。
     """
     if not args.resume:
         return None
     if args.resume in ("latest", "auto"):
-        ckpts = sorted(
-            (d for d in Path(args.output_dir).glob("ckpt-*") if d.is_dir()),
-            key=lambda d: int(d.name.split("-")[-1]),
-            reverse=True,
-        )
-        if not ckpts:
+        info = _resolve_latest(Path(args.output_dir))
+    else:
+        p = Path(args.resume)
+        if (p / "pretrained").is_dir() or (p / "model_state").is_dir():
+            info = _resolve_latest(p)  # 显式给 output_dir 根
+        elif p.parent.name == "pretrained":
+            info = {"weights_dir": str(p), "model_state_dir": None, "global_step": read_global_step(p)}
+            ms = p.parent.parent / "model_state" / p.name
+            if ms.is_dir() and not model_state_dir_complete(ms):
+                info["model_state_dir"] = str(ms)
+        elif p.parent.name == "model_state":
+            wd = p.parent.parent / "pretrained" / p.name
+            info = {"weights_dir": str(wd), "model_state_dir": str(p), "global_step": read_global_step(p)}
+        elif p.is_dir():
+            # 旧版单目录 ckpt（权重 + optimizer 同目录）：校验完整性，报出具体缺失文件
+            problems = checkpoint_is_complete(p)
+            if problems:
+                raise ValueError(
+                    f"--resume dir {p} not a complete checkpoint: {', '.join(problems)}"
+                )
+            info = {"weights_dir": str(p), "model_state_dir": str(p), "global_step": read_global_step(p)}
+        else:
             raise ValueError(
-                f"--resume={args.resume} but no ckpt-* dir found under {args.output_dir}"
+                f"--resume path {p} not found (expect output_dir root, pretrained/ckpt-N, "
+                f"model_state/ckpt-N, or a full ckpt dir)"
             )
-        for ck in ckpts:
-            problems = checkpoint_is_complete(ck)
-            if not problems:
-                return str(ck)
-            print(
-                f"[train] WARN: skip incomplete checkpoint {ck}: {', '.join(problems)}",
-                file=sys.stderr,
-            )
-        incomplete = "; ".join(
-            f"{c} ({', '.join(checkpoint_is_complete(c))})" for c in ckpts
-        )
-        raise ValueError(
-            f"--resume={args.resume} but no complete checkpoint under {args.output_dir}: "
-            f"{incomplete}"
-        )
-    resume_dir = Path(args.resume)
-    problems = checkpoint_is_complete(resume_dir)
-    if problems:
-        raise ValueError(
-            f"--resume dir {resume_dir} not a complete checkpoint: {', '.join(problems)}"
-        )
-    return str(resume_dir)
+    if info is None:
+        raise ValueError(f"--resume={args.resume} but no complete checkpoint under {args.output_dir}")
+    if not Path(info["weights_dir"]).is_dir():
+        raise ValueError(f"--resume={args.resume}: weights dir missing: {info['weights_dir']}")
+    return info
 
 
 def save_rng_state(path):
@@ -397,42 +492,45 @@ def main(args):
     # logger 名固定为 "train"（文档/测试正则约定）；__name__ 以脚本运行时是 "__main__"
     logger = get_logger("train", output_dir=output_dir, accelerator=accelerator)
 
-    # ---- Resume 解析：None 或具体 ckpt 目录 ----
-    resume_dir = resolve_resume_dir(args)
+    # ---- Resume 解析：None 或 {weights_dir, model_state_dir, global_step} ----
+    resume_info = resolve_resume(args)
 
     set_seed(args.seed + accelerator.process_index)
-    if resume_dir is not None:
+    if resume_info is not None:
         # 按 rank 恢复各自 RNG：避免多进程 resume 后所有进程随机序列同步（削弱多样性）
-        rng_path = resolve_rng_path(resume_dir, accelerator.process_index)
+        # RNG 在 model_state/ckpt-{N}（旧布局则在权重同目录）
+        rng_dir = resume_info["model_state_dir"] or resume_info["weights_dir"]
+        rng_path = resolve_rng_path(rng_dir, accelerator.process_index)
         if rng_path is not None:
             load_rng_state(rng_path)
         else:
-            logger.warning(f"No per-rank RNG state in {resume_dir}; skip RNG restore")
+            logger.warning(f"No per-rank RNG state in {rng_dir}; skip RNG restore")
     logger.info(f"Args: {args}")
 
     # Load model & processor
     # 正常训练：预训练权重 + action_mode 覆盖（覆盖属配置层职责，由 XVLAConfig 完成）。
     # Resume：以 checkpoint 自身 config.json 为准（即训练时真实结构/action_mode），权重从
-    # checkpoint 加载，避免手传 --action_mode 与 checkpoint 不一致导致形状错配。
-    if resume_dir is not None:
-        config = XVLAConfig.from_pretrained(resume_dir)
+    # weights_dir 加载，避免手传 --action_mode 与 checkpoint 不一致导致形状错配。
+    if resume_info is not None:
+        weights_dir = resume_info["weights_dir"]
+        config = XVLAConfig.from_pretrained(weights_dir)
         if args.action_mode is not None and config.action_mode != args.action_mode:
             logger.warning(
                 f"--action_mode {args.action_mode} != checkpoint action_mode "
                 f"{config.action_mode}; using checkpoint config"
             )
-        logger.info(f"Resume from {resume_dir} (action_mode={config.action_mode})")
-        model = XVLA.from_pretrained(resume_dir, config=config)
+        logger.info(f"Resume from {weights_dir} (action_mode={config.action_mode})")
+        model = XVLA.from_pretrained(weights_dir, config=config)
     else:
         config = XVLAConfig.from_pretrained(args.models)
         if args.action_mode is not None:
             config.action_mode = args.action_mode
             logger.info(f"Override action_mode -> {config.action_mode}")
         model = XVLA.from_pretrained(args.models, config=config)
-    # resume 时 processor 也从 checkpoint 目录加载（即训练时实际使用的配置），保持一致
+    # resume 时 processor 也从权重目录加载（即训练时实际使用的配置），保持一致
     processor = (
-        XVLAProcessor.from_pretrained(resume_dir)
-        if resume_dir is not None
+        XVLAProcessor.from_pretrained(resume_info["weights_dir"])
+        if resume_info is not None
         else XVLAProcessor.from_pretrained(args.models)
     )
 
@@ -465,24 +563,30 @@ def main(args):
         betas=tuple(args.betas),
         lr_coef_soft=args.learning_coef,
     )
-    if resume_dir is not None:
+    if resume_info is not None and resume_info["model_state_dir"] is not None:
         optim.load_state_dict(
             torch.load(
-                os.path.join(resume_dir, "optimizer.pt"),
+                os.path.join(resume_info["model_state_dir"], "optimizer.pt"),
                 map_location="cpu",
                 weights_only=True,
             )
         )
-        logger.info(f"Optimizer state restored from {resume_dir}")
+        logger.info(f"Optimizer state restored from {resume_info['model_state_dir']}")
+    elif resume_info is not None:
+        # 权重重开：model_state 已被 keep_last_k 清理或用户显式指权重目录 —— 动量/步数丢失，
+        # 从当前权重重启优化器（文档化行为，见 docs/todo.md checkpoint 布局）
+        logger.warning(
+            "No optimizer state for resume; starting fresh optimizer "
+            "(model_state pruned or weights-only resume)"
+        )
     model, optim = accelerator.prepare(model, optim)
 
     # Training loop
     model.train()
     base_model = accelerator.unwrap_model(model)
     global_step = 0
-    if resume_dir is not None:
-        with open(os.path.join(resume_dir, "state.json")) as f:
-            global_step = int(json.load(f)["global_step"])
+    if resume_info is not None:
+        global_step = resume_info["global_step"]
         logger.info(f"Resume: continue from global_step={global_step}")
     t0 = time.time()
     effective_batch = (
@@ -496,6 +600,7 @@ def main(args):
 
     # InfiniteDataReader 是无限流，不会抛 StopIteration，无需重启处理
     data_s = 0.0  # 累计本 log 间隔内 next(train_iter) 墙钟耗时（数据预处理+解码+IPC），算 DATA_PCT
+    grad_norm = 0.0  # 本 optimizer step 的梯度 L2 范数（grad clip 前/后），供日志
     while global_step < args.iters:
         # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
         # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
@@ -525,10 +630,16 @@ def main(args):
             loss = sum(loss_dict.values())
             accelerator.backward(loss)
 
-            # Grad clip
+            # Grad clip（记录梯度 L2 范数供日志/监控；冻结参数 requires_grad=False，
+            # 其 grad 为 None，clip_grad_norm_ 自动忽略）
             if accelerator.sync_gradients:
                 if args.max_grad_norm:
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    gn = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    grad_norm = float(gn) if gn is not None else 0.0
+                else:
+                    grad_norm = float(
+                        sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+                    )
 
                 optim.step()
                 optim.zero_grad()
@@ -541,6 +652,8 @@ def main(args):
             if global_step % args.log_interval == 0:
                 logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
                 logs["loss_total"] = float(loss.detach().item())
+                logs["grad_norm"] = grad_norm
+                logs["step"] = global_step
                 logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
                 accelerator.log(logs, step=global_step)
 
@@ -555,6 +668,7 @@ def main(args):
                     logger.info(
                         f"[{global_step}/{args.iters}] "
                         f"loss={logs['loss_total']:.4f} "
+                        f"grad_norm={logs['grad_norm']:.4f} "
                         f"lr_core={logs['lr_transformer_core']:.2e} "
                         f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
                         f"DATA_PCT={data_pct:.0f}% "
@@ -564,21 +678,33 @@ def main(args):
 
             # Checkpointing
             if global_step == args.iters or global_step % args.save_interval == 0:
-                save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
+                # 新布局：权重存 pretrained/ckpt-{N}（每 save_interval 一份，保留/上传用），
+                # 训练状态存 model_state/ckpt-{N}（optimizer + RNG，仅保留最近 K 个，由
+                # scripts/prune_checkpoints.py 每小时轮询清理）。
+                # 保存顺序（崩溃安全）：先 optimizer 并写 state.json 提交 model_state，
+                # 再写权重并提交 pretrained —— 中断时二者保持在同一 step，不会错配。
+                weights_dir = os.path.join(output_dir, "pretrained", f"ckpt-{global_step}")
+                model_state_dir = os.path.join(output_dir, "model_state", f"ckpt-{global_step}")
                 if accelerator.is_main_process:
-                    accelerator.print(f"💾 Saving model to {save_dir}")
-                    base_model.save_pretrained(save_dir, safe_serialization=True)
-                    processor.save_pretrained(save_dir)
+                    accelerator.print(f"💾 Saving model to {weights_dir} + state to {model_state_dir}")
                     # Resume 必需状态：optimizer 动量/步数 + global_step
                     # 注意：optim.state_dict() 仅在普通 DDP（accelerate launch 默认）下完整。
                     # 若切 DeepSpeed / FSDP，优化器状态是分片的，state_dict() 不完整——需改用
                     # accelerator.save_state()/load_state()（内部对 FSDP/DeepSpeed 有专门处理，
                     # 且 random_states_{rank}.pkl 自动 per-rank）。
-                    torch.save(optim.state_dict(), os.path.join(save_dir, "optimizer.pt"))
-                    with open(os.path.join(save_dir, "state.json"), "w") as f:
+                    os.makedirs(model_state_dir, exist_ok=True)
+                    torch.save(optim.state_dict(), os.path.join(model_state_dir, "optimizer.pt"))
+                    with open(os.path.join(model_state_dir, "state.json"), "w") as f:
                         json.dump({"global_step": global_step}, f)
-                # 所有进程各自保存自己的 RNG（per-rank 文件），resume 后各 rank 随机性独立
-                save_rng_state(os.path.join(save_dir, f"rng_state_rank{accelerator.process_index}.pt"))
+                    base_model.save_pretrained(weights_dir, safe_serialization=True)
+                    processor.save_pretrained(weights_dir)
+                    with open(os.path.join(weights_dir, "state.json"), "w") as f:
+                        json.dump({"global_step": global_step}, f)
+                # 所有进程各自保存自己的 RNG（per-rank 文件，在 model_state 目录），
+                # resume 后各 rank 随机性独立
+                save_rng_state(
+                    os.path.join(model_state_dir, f"rng_state_rank{accelerator.process_index}.pt")
+                )
                 accelerator.wait_for_everyone()
 
     accelerator.wait_for_everyone()

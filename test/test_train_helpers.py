@@ -140,7 +140,7 @@ def test_accumulated_loss_average():
 
 # ---------------------------------------------------------------- checkpoint / resume
 def _make_complete_ckpt(base: Path, step: int) -> Path:
-    """构造"完整" checkpoint 目录（state.json + optimizer.pt + model.safetensors）。"""
+    """构造旧布局"完整" checkpoint（state.json + optimizer.pt + model.safetensors 同目录）。"""
     d = base / f"ckpt-{step}"
     d.mkdir(parents=True, exist_ok=True)
     (d / "state.json").write_text(f'{{"global_step": {step}}}')
@@ -149,68 +149,117 @@ def _make_complete_ckpt(base: Path, step: int) -> Path:
     return d
 
 
-def test_resolve_resume_dir_none(tmp_path):
+def _make_new_ckpt(base: Path, step: int, weights: bool = True, opt: bool = True) -> tuple[Path, Path]:
+    """构造新布局 checkpoint（pretrained/ckpt-N + model_state/ckpt-N），返回 (weights_dir, model_state_dir)。"""
+    w = base / "pretrained" / f"ckpt-{step}"
+    m = base / "model_state" / f"ckpt-{step}"
+    if weights:
+        w.mkdir(parents=True, exist_ok=True)
+        (w / "state.json").write_text(f'{{"global_step": {step}}}')
+        (w / "model.safetensors").write_bytes(b"\0" * (1 << 20))
+    if opt:
+        m.mkdir(parents=True, exist_ok=True)
+        (m / "state.json").write_text(f'{{"global_step": {step}}}')
+        (m / "optimizer.pt").write_bytes(b"opt")
+    return w, m
+
+
+def test_resolve_resume_none(tmp_path):
     """未传 --resume → 返回 None。"""
-    from train import resolve_resume_dir
+    from train import resolve_resume
     args = argparse.Namespace(output_dir=str(tmp_path), resume=None)
-    assert resolve_resume_dir(args) is None
+    assert resolve_resume(args) is None
 
 
-def test_resolve_resume_dir_latest(tmp_path):
-    """--resume latest：从最新到最旧取第一个 *完整* ckpt-*。"""
-    from train import resolve_resume_dir
-    _make_complete_ckpt(tmp_path, 100)
-    _make_complete_ckpt(tmp_path, 50)
-    _make_complete_ckpt(tmp_path, 1000)
+def test_resolve_resume_latest_new_layout(tmp_path):
+    """新布局 --resume latest：以最新完整 pretrained/ckpt-N 为锚，配对同 step 的 model_state。"""
+    from train import resolve_resume
+    _make_new_ckpt(tmp_path, 50)
+    w200, m200 = _make_new_ckpt(tmp_path, 200)
+    _make_new_ckpt(tmp_path, 100)
     args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
-    assert resolve_resume_dir(args) == str(tmp_path / "ckpt-1000")
+    info = resolve_resume(args)
+    assert info["weights_dir"] == str(w200)
+    assert info["model_state_dir"] == str(m200)
+    assert info["global_step"] == 200
 
 
-def test_resolve_resume_dir_latest_skips_incomplete(tmp_path):
-    """最新 ckpt 是中断的半截保存（缺 state.json，state.json 最后落盘）→ 回退到更早的完整 ckpt。"""
-    from train import resolve_resume_dir
-    broken = _make_complete_ckpt(tmp_path, 30)
-    (broken / "state.json").unlink()
-    good = _make_complete_ckpt(tmp_path, 15)
+def test_resolve_resume_latest_model_state_pruned(tmp_path):
+    """optimizer 被 keep_last_k 清理（model_state/ckpt-N 缺失）→ 权重锚 + model_state_dir=None。"""
+    from train import resolve_resume
+    _make_new_ckpt(tmp_path, 100, opt=True)
+    w200, _ = _make_new_ckpt(tmp_path, 200, opt=False)  # 仅权重，无 optimizer
     args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
-    assert resolve_resume_dir(args) == str(good)
+    info = resolve_resume(args)
+    assert info["weights_dir"] == str(w200) and info["global_step"] == 200
+    assert info["model_state_dir"] is None
 
 
-def test_resolve_resume_dir_latest_all_incomplete(tmp_path):
-    """全部 ckpt 都不完整 → 抛错并列出原因。"""
-    from train import resolve_resume_dir
+def test_resolve_resume_latest_skips_incomplete_weights(tmp_path):
+    """最新权重是中断的半截保存（缺 model.safetensors）→ 回退到更早完整权重。"""
+    from train import resolve_resume
+    _make_new_ckpt(tmp_path, 300, weights=False, opt=True)  # 权重缺失（model_state 残留）
+    _make_new_ckpt(tmp_path, 100)
+    args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
+    info = resolve_resume(args)
+    assert info["global_step"] == 100
+
+
+def test_resolve_resume_latest_all_incomplete(tmp_path):
+    """全部 ckpt 都不完整 → 抛错。"""
+    from train import resolve_resume
     d = _make_complete_ckpt(tmp_path, 10)
     (d / "optimizer.pt").unlink()
     args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
     with pytest.raises(ValueError, match="no complete checkpoint"):
-        resolve_resume_dir(args)
+        resolve_resume(args)
 
 
-def test_resolve_resume_dir_explicit_incomplete(tmp_path):
-    """显式路径缺 optimizer.pt → 判为不可恢复，抛错。"""
-    from train import resolve_resume_dir
+def test_resolve_resume_legacy_latest(tmp_path):
+    """旧布局（单目录 ckpt-*）--resume latest 兜底可用。"""
+    from train import resolve_resume
+    _make_complete_ckpt(tmp_path, 1000)
+    args = argparse.Namespace(output_dir=str(tmp_path), resume="latest")
+    info = resolve_resume(args)
+    assert info["weights_dir"] == str(tmp_path / "ckpt-1000")
+    assert info["model_state_dir"] == str(tmp_path / "ckpt-1000")
+    assert info["global_step"] == 1000
+
+
+def test_resolve_resume_explicit_incomplete(tmp_path):
+    """显式旧版 ckpt 路径缺 optimizer.pt → 判为不可恢复，抛错。"""
+    from train import resolve_resume
     d = tmp_path / "ckpt-10"
     d.mkdir()
     (d / "state.json").write_text('{"global_step": 10}')
+    (d / "model.safetensors").write_bytes(b"\0" * (1 << 20))
     args = argparse.Namespace(output_dir=str(tmp_path), resume=str(d))
     with pytest.raises(ValueError, match="optimizer.pt"):
-        resolve_resume_dir(args)
+        resolve_resume(args)
 
 
-def test_resolve_resume_dir_explicit_missing_weights(tmp_path):
+def test_resolve_resume_explicit_missing_weights(tmp_path):
     """显式路径缺 model.safetensors / 权重空 → 判为不可恢复，抛错。"""
-    from train import resolve_resume_dir
+    from train import resolve_resume
     d = tmp_path / "ckpt-10"
     d.mkdir()
     (d / "state.json").write_text('{"global_step": 10}')
     (d / "optimizer.pt").write_bytes(b"opt")
     args = argparse.Namespace(output_dir=str(tmp_path), resume=str(d))
     with pytest.raises(ValueError, match="model.safetensors"):
-        resolve_resume_dir(args)
+        resolve_resume(args)
     # 空/半截权重同样拦截（截断写入场景）
     (d / "model.safetensors").write_bytes(b"")
     with pytest.raises(ValueError, match="too small"):
-        resolve_resume_dir(args)
+        resolve_resume(args)
+
+
+def test_resolve_resume_explicit_not_recognized(tmp_path):
+    """显式路径不存在 → 报错。"""
+    from train import resolve_resume
+    args = argparse.Namespace(output_dir=str(tmp_path), resume=str(tmp_path / "nope"))
+    with pytest.raises(ValueError, match="not found"):
+        resolve_resume(args)
 
 
 def test_optimizer_state_roundtrip(tmp_path):

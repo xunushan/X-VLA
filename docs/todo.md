@@ -41,7 +41,30 @@
 - [x] macOS 无法可靠验证多进程 DataLoader，需在服务器跑训练冒烟。
       → **2026-08-06** 服务器 train 单卡验证完成（见上）。
 
-## Checkpoint / Resume（已实现，服务器已验证 2026-08-06）
+## Checkpoint 布局（pretrained / model_state 拆分，2026-08-06 拍板）
+
+> 起因：每 ckpt ≈ 11G（权重 3.3G + optimizer.pt 6.6G），长训磁盘不够；且上传其它服务器只需
+> 模型权重。方案：权重与训练状态分开存，optimizer 只留最近 3 个，轮询脚本每小时清理。
+
+```
+output_dir/
+  pretrained/ckpt-{N}/     模型权重（model.safetensors + config + processor + state.json）
+                           每 save_interval 存一份并保留；上传/迁移只 rsync 此目录（≈3.4G）
+  model_state/ckpt-{N}/    optimizer.pt + rng_state_rank{k}.pt + state.json
+                           仅保留最近 3 个（scripts/prune_checkpoints.py 每小时轮询清理）
+```
+
+- [x] train.py 保存逻辑拆分（2026-08-06）：权重→pretrained/ckpt-N，optimizer/RNG→model_state/ckpt-N；
+      保存顺序 optimizer 先、权重后（崩溃安全，二者不跨 step 错配）
+- [x] `--resume latest` 自动配对：以最新完整 `pretrained/ckpt-N` 为锚，配同 step 的
+      `model_state/ckpt-N`；model_state 已被清理时降级为**权重重开优化器**（打 warning）
+- [x] 旧版单目录 ckpt-* 兼容（checkpoint_is_complete 保留兜底）
+- [x] `scripts/prune_checkpoints.py` + `scripts/prune_loop.sh`（默认 1 小时轮询）：
+      model_state 只留最近 3 个；清理不完整/孤儿目录；`--keep_weights N` 可选裁剪权重
+- [x] 日志新增 `grad_norm`/`step`（#2 需求）：`grad_norm` 每 optimizer step 计算并打印/写入 tensorboard
+- [ ] 服务器回归：新布局下重跑阶段 4-6（验证保存/清理/`--resume latest` 配对）→ 2026-08-06 待跑
+
+## Checkpoint / Resume（旧单目录布局，服务器已验证 2026-08-06）
 - [x] 服务器验证 resume：训练 N 步 → 中断 → `--resume latest` → 确认 global_step / optimizer
       状态恢复、loss 曲线连续。
       → 阶段 5：60 步 ckpt-60 → resume latest → 120 步；`Resume: continue from global_step=60`、
