@@ -225,10 +225,10 @@ run_phase "4-train-smoke" <<'PHASE4'
   check_log_line "${LOG}" "effective_batch=32" "effective_batch=4×1×8=32（batch×world×accum）"
   check_log_line "${LOG}" "DATA_PCT=[0-9]+%" "每 step 数据预处理时间占比 DATA_PCT"
   check_log_line "${LOG}" "DECODE timing:.*ms/sample" "视频解码计时聚合（decode ms/样本 + fps + %）"
-  check_log_line "${LOG}" "USED_CPU=[0-9.e-]+ .*USED_GPU=[0-9.e-]+" "资源监控 USED_CPU/USED_GPU"
+  check_log_line "${LOG}" "USED_CPU=[0-9.e+-]+ .*USED_GPU=[0-9.e+-]+" "资源监控 USED_CPU/USED_GPU"
   echo "--- 冻结/解冻 lr 校验（前 30 步 lr_vlm=0，之后 >0） ---"
-  before=$(grep -E "\[(10|20|30)/120\]" "${LOG}" | grep -oE "lr_vlm=[0-9.e-]+" | head -1)
-  after=$(grep -E "\[(40|60|90|120)/120\]" "${LOG}" | grep -oE "lr_vlm=[0-9.e-]+" | head -1)
+  before=$(grep -E "\[(10|20|30)/120\]" "${LOG}" | grep -oE "lr_vlm=[0-9.e+-]+" | head -1)
+  after=$(grep -E "\[(40|60|90|120)/120\]" "${LOG}" | grep -oE "lr_vlm=[0-9.e+-]+" | head -1)
   echo "  before(step<30) lr_vlm=${before}  after(step>=30) lr_vlm=${after}"
   if echo "${before}" | grep -qE "lr_vlm=0.00e\+00$" && echo "${after}" | grep -qE "lr_vlm=[^0]\.[0-9]+e"; then
     echo "  [PASS] 冻结边界正确：step<30 lr_vlm=0，step>=30 全参数 lr_vlm>0（lr 恒定）"
@@ -260,6 +260,7 @@ fi
 if ! skip_phase 5; then
 run_phase "5-resume" <<'PHASE5'
   set -uo pipefail
+  rm -rf "${OUT_BASE}/smoke"   # 释放阶段 4 的 ckpt（~11G），本阶段峰值 2 ckpt ≈ 22G
   RES_OUT="${OUT_BASE}/resume"
   rm -rf "${RES_OUT}"
   TRAIN_OUTPUT_DIR="${RES_OUT}" TRAIN_ITERS=60 TRAIN_SAVE_INTERVAL=60 \
@@ -307,6 +308,7 @@ fi
 if ! skip_phase 6; then
 run_phase "6-freeze-resume" <<'PHASE6'
   set -uo pipefail
+  rm -rf "${OUT_BASE}/smoke" "${OUT_BASE}/resume"   # 释放前序阶段 ckpt，峰值 2 ckpt ≈ 22G
   FR_OUT="${OUT_BASE}/freeze_resume"
   rm -rf "${FR_OUT}"
   # run1：20 步全冻结期保存 ckpt-20（vlm/core 无梯度 → optimizer 状态小，省磁盘）；
@@ -327,8 +329,8 @@ run_phase "6-freeze-resume" <<'PHASE6'
   echo "--- resume 后 lr_vlm 变化（应 0 -> 非 0）---"
   grep -oE "\[[0-9]+/120\] .*lr_vlm=[0-9.e-]+" "${LOG}" | tail -12
   # run1 段（iters=20）全冻结：lr_vlm=0；run2 段 step>=30 解冻：lr_vlm>0
-  before=$(grep -E "\[(10|20)/20\]" "${LOG}" | grep -oE "lr_vlm=[0-9.e-]+" | head -1)
-  after=$(grep -E "\[(40|60|90|120)/120\]" "${LOG}" | grep -oE "lr_vlm=[0-9.e-]+" | head -1)
+  before=$(grep -E "\[(10|20)/20\]" "${LOG}" | grep -oE "lr_vlm=[0-9.e+-]+" | head -1)
+  after=$(grep -E "\[(40|60|90|120)/120\]" "${LOG}" | grep -oE "lr_vlm=[0-9.e+-]+" | head -1)
   echo "  before(step<30) lr_vlm=${before}  after(step>=30) lr_vlm=${after}"
   if echo "${before}" | grep -qE "lr_vlm=0.00e\+00$" && echo "${after}" | grep -qE "lr_vlm=[^0]\.[0-9]+e"; then
     echo "  [PASS] resume 跨冻结边界：阶段一 lr_vlm=0，阶段二解冻 lr_vlm>0"

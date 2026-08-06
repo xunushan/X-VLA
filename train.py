@@ -394,7 +394,8 @@ def main(args):
     accelerator.init_trackers("XVLA-Training")
 
     accelerator.wait_for_everyone()
-    logger = get_logger(__name__, output_dir=output_dir, accelerator=accelerator)
+    # logger 名固定为 "train"（文档/测试正则约定）；__name__ 以脚本运行时是 "__main__"
+    logger = get_logger("train", output_dir=output_dir, accelerator=accelerator)
 
     # ---- Resume 解析：None 或具体 ckpt 目录 ----
     resume_dir = resolve_resume_dir(args)
