@@ -6,8 +6,10 @@
 #      camera_keys/fps 从数据集 meta/info.json 读取，写 v3.0 格式评估 meta.json
 #   2. evaluation/evaluate.py：加载模型（HF repo 或本地权重）→ EvalDataReader 遍历 val
 #      episodes → generate_actions 批量预测 20d 动作 chunk → xvla20_to_ee16 → tools/metric.py
-#      计算 16 维物理 MAE → 输出 metrics.json / predictions.parquet / 时序图 + 柱状图
-#   3. 打印 metrics.json
+#      计算 16 维物理 MAE → 输出 metrics.json / predictions.parquet（含 task_index 列）/
+#      时序图 + 柱状图，并按 task_index 分组输出 metrics_by_task.json + mae_by_task.png
+#      （episode_index 回溯 task_index：episodes 表 tasks 列 + meta/tasks.parquet）
+#   3. 打印 metrics.json 与 metrics_by_task.json
 #
 # 默认值针对服务器（/data 下数据 + HF 私有 repo 002000），可用环境变量覆盖：
 #   XVLA_CONDA_ENV   conda 环境（服务器默认 xvla；本地默认 lerobot，见下）
@@ -71,7 +73,11 @@ PYTHONPATH="${PROJECT_ROOT}" python "${PROJECT_ROOT}/evaluation/evaluate.py" \
   --frame-stride "${EVAL_STRIDE}" \
   --convert-20d-to-16d
 
-# 3. 打印指标
+# 3. 打印指标（含按任务拆分）
 echo "[eval_non_sim] ============ metrics.json ============"
 cat "${OUT_DIR}/metrics.json"
+if [ -f "${OUT_DIR}/metrics_by_task.json" ]; then
+  echo "[eval_non_sim] ============ metrics_by_task.json ============"
+  cat "${OUT_DIR}/metrics_by_task.json"
+fi
 echo "[eval_non_sim] done. outputs -> ${OUT_DIR}"

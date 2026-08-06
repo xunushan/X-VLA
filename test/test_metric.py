@@ -7,7 +7,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tools.metric import ACTION_GROUPS, ACTION_NAMES, compute_metrics, save_metrics_plots
+from tools.metric import (
+    ACTION_GROUPS,
+    ACTION_NAMES,
+    compute_metrics,
+    compute_metrics_by_task,
+    save_metrics_by_task_plots,
+    save_metrics_plots,
+)
 
 
 def make_row(ep, frame, expert, predicted):
@@ -126,3 +133,50 @@ def test_save_metrics_plots(tmp_path):
     assert set(pngs) == expected
     for p in tmp_path.iterdir():
         assert p.stat().st_size > 0
+
+
+def make_df_with_task(n=4, chunk=30):
+    """构造含 task_index 列的 df：episode 0/1/2 -> task 0，episode 3 -> task 1。"""
+    df = make_df(chunk=chunk, n=n)
+    df["task_index"] = [0, 0, 0, 1]
+    return df
+
+
+def test_compute_metrics_by_task_groups_and_counts():
+    """按 task_index 分组：误差集中在 task 1 → 分组指标反映出来，计数正确。"""
+    n, chunk = 4, 30
+    expert = np.zeros((n, chunk, 16))
+    predicted = np.zeros((n, chunk, 16))
+    predicted[3] = 2.0  # 仅 episode 3（task 1）有误差
+    df = make_df_with_task(n=n, chunk=chunk)
+    df["expert_action_chunk"] = [r.tolist() for r in expert.reshape(n, -1)]
+    df["predicted_action_chunk"] = [r.tolist() for r in predicted.reshape(n, -1)]
+
+    out = compute_metrics_by_task(df, chunk_size=chunk)
+    assert set(out) == {0, 1}
+    assert out[0]["num_episodes"] == 3 and out[0]["num_frames"] == 3
+    assert out[1]["num_episodes"] == 1 and out[1]["num_frames"] == 1
+    assert out[0]["physical_mae"]["full_chunk"] == pytest.approx(0.0)
+    assert out[1]["physical_mae"]["full_chunk"] == pytest.approx(2.0)
+
+
+def test_compute_metrics_by_task_missing_column_raises():
+    """缺 task_index 列时抛 ValueError。"""
+    df = make_df(n=2, chunk=8)
+    with pytest.raises(ValueError):
+        compute_metrics_by_task(df)
+
+
+def test_save_metrics_by_task_plots(tmp_path):
+    """生成 mae_by_task.png，非空且可叠加任务描述标签。"""
+    n, chunk = 4, 30
+    rng = np.random.default_rng(1)
+    expert = rng.standard_normal((n, chunk, 16))
+    predicted = expert + rng.standard_normal((n, chunk, 16)) * 0.1
+    df = make_df_with_task(n=n, chunk=chunk)
+    df["expert_action_chunk"] = [r.tolist() for r in expert.reshape(n, -1)]
+    df["predicted_action_chunk"] = [r.tolist() for r in predicted.reshape(n, -1)]
+    out = compute_metrics_by_task(df, chunk_size=chunk)
+    save_metrics_by_task_plots(tmp_path, out, task_names={0: "task-A", 1: "task-B"})
+    png = tmp_path / "mae_by_task.png"
+    assert png.is_file() and png.stat().st_size > 0

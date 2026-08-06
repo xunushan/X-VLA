@@ -209,6 +209,31 @@ def compute_metrics(
     }
 
 
+def compute_metrics_by_task(
+    df: pd.DataFrame,
+    chunk_size: int | None = None,
+    execution_steps: int | None = None,
+) -> dict:
+    """按 task_index 分组计算指标，返回 {task_index: metrics}。
+
+    df 必须含 task_index 列（评估由 episode_index 回溯生成，见 evaluate.py
+    build_episode_task_index）。每个分组额外带 num_episodes / num_frames，
+    便于按任务对比误差的同时对齐样本量。
+    """
+    if "task_index" not in df.columns:
+        raise ValueError("df must contain a 'task_index' column for per-task metrics")
+    out: dict = {}
+    for ti, sub in df.groupby("task_index", sort=True):
+        m = compute_metrics(sub, chunk_size=chunk_size, execution_steps=execution_steps)
+        out[int(ti)] = {
+            "task_index": int(ti),
+            "num_episodes": int(sub["episode_index"].nunique()),
+            "num_frames": int(len(sub)),
+            **m,
+        }
+    return out
+
+
 # =============================================================================
 # 可视化
 # =============================================================================
@@ -306,4 +331,56 @@ def save_metrics_plots(
         ax.text(i, v, f"{v:.4f}", ha="center", va="bottom", fontsize=8)
     fig.tight_layout()
     fig.savefig(output_dir / "grouped_mae.png", dpi=150)
+    plt.close(fig)
+
+
+def save_metrics_by_task_plots(
+    output_dir: Path,
+    metrics_by_task: dict,
+    task_names: dict | None = None,
+) -> None:
+    """生成按任务对比的柱状图 mae_by_task.png（first_step / execution_window / full_chunk）。
+
+    Args:
+        output_dir: 图表输出目录
+        metrics_by_task: compute_metrics_by_task() 输出，{task_index: metrics}
+        task_names: task_index -> 任务描述（可选；用作 x 轴标签，超出截断）
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    items = sorted(metrics_by_task.items())
+    if not items:
+        return
+    # x 轴标签：task_index，有描述时附描述（截断，避免长任务名挤爆横轴）
+    labels = []
+    for ti, _ in items:
+        base = str(int(ti))
+        if task_names and int(ti) in task_names:
+            base = f"{int(ti)}: {task_names[int(ti)]}"
+        labels.append(base if len(base) <= 24 else base[:21] + "...")
+
+    first = [m["physical_mae"]["first_step"] for _, m in items]
+    execv = [m["physical_mae"]["execution_window"] for _, m in items]
+    full = [m["physical_mae"]["full_chunk"] for _, m in items]
+
+    fig, ax = plt.subplots(figsize=(max(9, 1.3 * len(labels)), 5))
+    x = np.arange(len(labels))
+    w = 0.27
+    ax.bar(x - w, first, w, label="first_step", color="#4C72B0")
+    ax.bar(x, execv, w, label="execution_window", color="#55A868")
+    ax.bar(x + w, full, w, label="full_chunk", color="#DD8452")
+    ax.set_ylabel("MAE (physical units)")
+    ax.set_title("Per-Task MAE")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30, ha="right")
+    ax.legend()
+    for i, v in enumerate(full):
+        ax.text(i + w, v, f"{v:.3f}", ha="center", va="bottom", fontsize=7)
+    fig.tight_layout()
+    fig.savefig(output_dir / "mae_by_task.png", dpi=150)
     plt.close(fig)

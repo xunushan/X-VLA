@@ -3,11 +3,13 @@
 
 流程（单一入口，sh 脚本 scripts/eval_non_sim.sh 串起）：
   1. 生成评估 meta.json（--make-meta-only，或 --metas 缺失时自动生成）：
-     v3.0 格式 + episodes=val 索引（camera_keys/fps 从数据集 meta/info.json 读取）；
+     v3.0 格式 + episodes=val 索引（camera_keys/fps 从数据集 meta/info.json 读取），
+     并附带 episode_task_index / task_names（episode_index 回溯 task_index 的映射）；
   2. 加载 X-VLA 模型/processor（HF repo 或本地权重目录）；
   3. EvalDataReader 确定性遍历 val episodes → 批量 generate_actions 预测 20d 动作 chunk；
   4. 默认把 expert/predicted 20d → 16d（xvla20_to_ee16）后，用 tools/metric.py 计算指标；
-  5. 输出 metrics.json / predictions.parquet / 时序图与 MAE 柱状图到 --output-dir。
+  5. 按 task_index 分组计算指标 → metrics_by_task.json + mae_by_task.png（按任务对比）；
+  6. 输出 metrics.json / predictions.parquet（含 task_index 列）/ 时序图与 MAE 柱状图到 --output-dir。
 
 用法示例：
   python evaluation/evaluate.py --make-meta-only \
@@ -29,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import DataLoader
 
@@ -37,7 +40,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tools.metric import compute_metrics, save_metrics_plots  # noqa: E402
+from tools.metric import (  # noqa: E402
+    compute_metrics,
+    compute_metrics_by_task,
+    save_metrics_by_task_plots,
+    save_metrics_plots,
+)
 from xvla_datasets.eval_data import EvalDataReader, eval_collate  # noqa: E402
 from xvla_datasets.utils import load_episode_indices, xvla20_to_ee16  # noqa: E402
 
@@ -46,6 +54,56 @@ DEFAULT_CAMERA_KEYS = [
     "observation.images.cam_left_wrist",
     "observation.images.cam_right_wrist",
 ]
+
+
+def build_episode_task_index(dataset_root: str | Path) -> tuple[dict[int, int], dict[int, str]]:
+    """从数据集表回溯 episode_index -> task_index 与 task_index -> 任务描述。
+
+    路径（不动 domain_handler，纯评估层只读数据表）：
+      - meta/episodes/**/file-*.parquet 的 tasks 列给出每个 episode 的任务描述；
+      - meta/tasks.parquet 给出 task_index <-> 任务描述 的权威映射（数据组织同表）。
+    无 tasks.parquet 时按任务描述排序生成稳定索引（仅分析用，非训练同款 task_index）。
+    无 episodes 表时返回空映射，评估侧据此跳过按任务分析。
+    """
+    root = Path(dataset_root)
+    ep_files = sorted(root.glob("meta/episodes/**/file-*.parquet"))
+    ep_task_desc: dict[int, str] = {}
+    for p in ep_files:
+        t = pq.read_table(str(p))
+        for ei, tasks in zip(t.column("episode_index").to_pylist(), t.column("tasks").to_pylist()):
+            desc = (tasks or [""])[0]
+            ep_task_desc[int(ei)] = str(desc)
+    if not ep_task_desc:
+        return {}, {}
+
+    desc_to_index: dict[str, int] = {}
+    tasks_path = root / "meta" / "tasks.parquet"
+    if tasks_path.is_file():
+        t = pq.read_table(str(tasks_path)).to_pydict()
+        for ti, desc in zip(t.get("task_index", []), t.get("__index_level_0__", [])):
+            desc_to_index[str(desc)] = int(ti)
+    for i, desc in enumerate(sorted({d for d in ep_task_desc.values() if d})):
+        desc_to_index.setdefault(desc, i)
+
+    episode_task_index: dict[int, int] = {}
+    for ei, desc in ep_task_desc.items():
+        ti = desc_to_index.get(desc)
+        if ti is not None:
+            episode_task_index[ei] = ti
+    task_names = {ti: desc for desc, ti in desc_to_index.items()}
+    return episode_task_index, task_names
+
+
+def get_task_index_map(meta: dict) -> tuple[dict[int, int], dict[int, str]]:
+    """取评估 meta 中的 episode->task_index 映射；旧 meta 缺该键时从数据集表回溯。"""
+    if meta.get("episode_task_index"):
+        episode_task_index = {int(k): int(v) for k, v in meta["episode_task_index"].items()}
+        task_names = {int(k): str(v) for k, v in (meta.get("task_names") or {}).items()}
+        return episode_task_index, task_names
+    root = meta.get("root_path")
+    if not root:
+        return {}, {}
+    return build_episode_task_index(root)
 
 
 # =============================================================================
@@ -63,6 +121,7 @@ def build_eval_meta(
     """从 split 文件生成 v3.0 格式评估 meta.json（episodes = 指定分集的 episode 索引）。
 
     camera_keys/fps 从数据集 meta/info.json 读取（缺失时用默认值），与 prepare_data.sh 一致。
+    附带 episode_task_index / task_names（episode_index 回溯 task_index 的映射，供按任务分析）。
     """
     root = Path(dataset_root)
     info: dict = {}
@@ -75,6 +134,7 @@ def build_eval_meta(
     fps = info.get("fps", 25)
 
     episodes = load_episode_indices(split_path, split)
+    episode_task_index, task_names = build_episode_task_index(root)
     meta = {
         "codebase_version": "v3.0",
         "dataset_name": dataset_name,
@@ -84,6 +144,8 @@ def build_eval_meta(
         "fps": fps,
         "query_duration": 1.0,
         "episodes": episodes,
+        "episode_task_index": {str(k): v for k, v in episode_task_index.items()},
+        "task_names": {str(k): v for k, v in task_names.items()},
     }
     out = Path(output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -128,23 +190,33 @@ def predict_batch(model, processor, batch: dict, device: torch.device, dtype: to
     return model.generate_actions(**inputs, steps=steps)
 
 
-def collect_rows(batch: dict, pred: torch.Tensor, convert_20d_to_16d: bool) -> list[dict]:
-    """把一批预测结果转成 metric.py 所需的行（episode/frame + 展平后的 16d chunk）。"""
+def collect_rows(
+    batch: dict,
+    pred: torch.Tensor,
+    convert_20d_to_16d: bool,
+    episode_task_index: dict[int, int] | None = None,
+) -> list[dict]:
+    """把一批预测结果转成 metric.py 所需的行（episode/frame + 展平后的 16d chunk）。
+
+    episode_task_index 提供时，行级附带 task_index（episode 回溯，未映射取 -1）。
+    """
     rows: list[dict] = []
     for i in range(len(batch["episode_index"])):
+        ep = int(batch["episode_index"][i])
         expert = batch["expert_action_chunk"][i].float().cpu().numpy()
         predicted = pred[i].float().cpu().numpy()
         if convert_20d_to_16d:
             expert = xvla20_to_ee16(expert)
             predicted = xvla20_to_ee16(predicted)
-        rows.append(
-            {
-                "episode_index": int(batch["episode_index"][i]),
-                "frame_index": int(batch["frame_index"][i]),
-                "expert_action_chunk": expert.reshape(-1).tolist(),
-                "predicted_action_chunk": predicted.reshape(-1).tolist(),
-            }
-        )
+        row: dict = {
+            "episode_index": ep,
+            "frame_index": int(batch["frame_index"][i]),
+            "expert_action_chunk": expert.reshape(-1).tolist(),
+            "predicted_action_chunk": predicted.reshape(-1).tolist(),
+        }
+        if episode_task_index is not None:
+            row["task_index"] = int(episode_task_index.get(ep, -1))
+        rows.append(row)
     return rows
 
 
@@ -157,8 +229,12 @@ def run_evaluation(
     dtype: torch.dtype,
     steps: int = 10,
     convert_20d_to_16d: bool = True,
+    episode_task_index: dict[int, int] | None = None,
 ) -> pd.DataFrame:
-    """确定性批量预测，返回含 episode_index/frame_index/expert/predicted chunk 的 DataFrame。"""
+    """确定性批量预测，返回含 episode_index/frame_index/expert/predicted chunk 的 DataFrame。
+
+    episode_task_index 提供时，结果含 task_index 列（供按任务分析）。
+    """
     loader = DataLoader(
         reader,
         batch_size=batch_size,
@@ -169,7 +245,7 @@ def run_evaluation(
     rows: list[dict] = []
     for i, batch in enumerate(loader):
         pred = predict_batch(model, processor, batch, device, dtype, steps=steps)
-        rows.extend(collect_rows(batch, pred, convert_20d_to_16d))
+        rows.extend(collect_rows(batch, pred, convert_20d_to_16d, episode_task_index=episode_task_index))
         if (i + 1) % 50 == 0:
             print(f"[evaluate] {i + 1} batches done, {len(rows)} frames", flush=True)
     return pd.DataFrame(rows)
@@ -252,6 +328,9 @@ def main() -> None:
         action_mode=model.action_mode,
         frame_stride=args.frame_stride,
     )
+    # episode_index -> task_index 回溯（优先用 meta 内置映射；旧 meta 缺键时读数据表）
+    meta = next(iter(reader.metas.values()))
+    episode_task_index, task_names = get_task_index_map(meta)
 
     print("[evaluate] running batch prediction...")
     df = run_evaluation(
@@ -263,6 +342,7 @@ def main() -> None:
         dtype=dtype,
         steps=args.steps,
         convert_20d_to_16d=args.convert_20d_to_16d,
+        episode_task_index=episode_task_index,
     )
     if df.empty:
         raise RuntimeError("evaluation produced no frames")
@@ -283,6 +363,25 @@ def main() -> None:
         "frame_stride": reader.frame_stride,
         **metrics,
     }
+
+    # ---- 按任务拆分指标（metrics_by_task.json + mae_by_task.png）----
+    metrics_by_task = (
+        compute_metrics_by_task(df, chunk_size=chunk_size, execution_steps=args.execution_steps)
+        if "task_index" in df.columns
+        else {}
+    )
+    for ti, m in metrics_by_task.items():
+        m["task_description"] = task_names.get(int(ti), "")
+    result["num_tasks"] = len(metrics_by_task)
+    if metrics_by_task:
+        (output_dir / "metrics_by_task.json").write_text(
+            json.dumps(metrics_by_task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        save_metrics_by_task_plots(output_dir, metrics_by_task, task_names)
+        print(f"[evaluate] per-task metrics -> {output_dir / 'metrics_by_task.json'}")
+    else:
+        print("[evaluate] no episode->task_index mapping, skip per-task analysis")
+
     (output_dir / "metrics.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )

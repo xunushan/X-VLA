@@ -187,6 +187,23 @@ def test_collect_rows_converts_16d():
     )
 
 
+def test_collect_rows_adds_task_index():
+    """提供 episode_task_index 时行级附带 task_index；未映射 episode 取 -1。"""
+    rng = np.random.default_rng(0)
+    expert = rng.standard_normal((3, 30, 20)).astype(np.float32)
+    pred = rng.standard_normal((3, 30, 20)).astype(np.float32)
+    batch = {
+        "episode_index": [0, 5, 9],
+        "frame_index": [1, 2, 3],
+        "expert_action_chunk": torch.from_numpy(expert),
+    }
+    rows = collect_rows(
+        batch, torch.from_numpy(pred), convert_20d_to_16d=True,
+        episode_task_index={0: 2, 9: 1},  # ep 5 未映射
+    )
+    assert [r["task_index"] for r in rows] == [2, -1, 1]
+
+
 # =============================================================================
 # run_evaluation（Fake 模型 + 假 reader）
 # =============================================================================
@@ -292,14 +309,23 @@ def test_main_end_to_end(tmp_path, monkeypatch):
     )
     assert m["convert_20d_to_16d"] is True
 
-    # predictions.parquet 可读且与 metrics 行数一致
+    # predictions.parquet 可读且与 metrics 行数一致，含 task_index 列
     df = pd.read_parquet(tmp_path / "predictions.parquet")
     assert len(df) == m["val_frames"]
     assert len(df.iloc[0]["predicted_action_chunk"]) == 30 * 16
+    assert "task_index" in df.columns
 
-    # 6 时序图 + 2 柱状图
+    # 按任务拆分：metrics_by_task.json 存在且与 df 分组一致（DATA_ROOT 真实表回溯 task）
+    bt = json.loads((tmp_path / "metrics_by_task.json").read_text())
+    assert int(list(bt)[0]) == df.iloc[0]["task_index"]
+    assert bt[list(bt)[0]]["num_frames"] == m["val_frames"]
+    assert "task_description" in bt[list(bt)[0]]
+    assert m["num_tasks"] == len(bt)
+
+    # 6 时序图 + 2 柱状图 + 1 按任务柱状图
     pngs = [p.name for p in tmp_path.iterdir() if p.suffix == ".png"]
-    assert len(pngs) == 8
+    assert len(pngs) == 9
+    assert (tmp_path / "mae_by_task.png").is_file()
 
 
 def test_main_make_meta_only(tmp_path, monkeypatch):
