@@ -142,8 +142,12 @@ def main() -> int:
     ap.add_argument("--min_age", type=float, default=DEFAULT_MIN_AGE,
                     help=f"不完整/孤儿目录清理宽限期（秒，默认 {DEFAULT_MIN_AGE}；目录最近被改动则跳过）")
     args = ap.parse_args()
-    return prune(Path(args.output_dir), args.keep_model_state, args.keep_weights,
-                 args.min_age, args.dry_run)
+    prune(Path(args.output_dir), args.keep_model_state, args.keep_weights,
+          args.min_age, args.dry_run)
+    # 成功一律退出 0（prune 的返回值是删除目录数，不能当退出码——
+    # 否则实际删了东西时会以非零退出，被 prune_loop.sh 误报 "prune failed"）。
+    # 真实错误（参数错、路径不可达等）会抛异常，由 traceback 产生非零退出码。
+    return 0
 
 
 if __name__ == "__main__":
