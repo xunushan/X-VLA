@@ -3,14 +3,20 @@
 # ------------------------------------------------------------------------------
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 import torch
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-# GOAI 2026 本地数据（只读引用，勿修改 goai-2026 空间）
-DATA_ROOT = "/Users/isuntaiyang/Documents/competition/goai_2026/data/lerobot_v30_ee_6d"
+# GOAI 2026 本地数据（只读引用，勿修改 goai-2026 空间）。
+# 服务器上可用环境变量 XVLA_DATA_ROOT 覆盖（如 /data/lerobot_v30_ee_6d）。
+DATA_ROOT = os.environ.get(
+    "XVLA_DATA_ROOT",
+    "/Users/isuntaiyang/Documents/competition/goai_2026/data/lerobot_v30_ee_6d",
+)
 IMAGE_SIZE = (224, 224)
 
 
