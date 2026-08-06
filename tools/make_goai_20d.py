@@ -13,7 +13,9 @@
 
 说明：
     - 视频文件不重新编码，dst 用符号链接指向 src（视频内容不变）
-    - episodes/meta 的 stats 列丢弃（X-VLA 训练不使用，避免错误统计）
+    - episodes 的 stats 列丢弃（X-VLA 训练不使用，避免错误统计）
+    - meta/stats.json 的 observation.state/action 按 20 维重算（rot6d 是四元数非线性函数，
+      无法从 16 维统计解析推导），图像/标量特征统计原样保留
     - info.json 的 features 更新为 20 维 names
 """
 from __future__ import annotations
@@ -56,16 +58,24 @@ def convert_16_to_20(arr: np.ndarray) -> np.ndarray:
     return np.concatenate([l, r], -1).astype(np.float32)
 
 
-def rewrite_parquet(src: Path, dst: Path) -> None:
-    """重写主表：observation.state / action 16->20，其余列原样。"""
+def rewrite_parquet(src: Path, dst: Path) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """重写主表：observation.state / action 16->20，其余列原样。
+
+    返回转换后的 state/action 数组（供重算 stats.json），避免二次读表。
+    """
     table = pq.read_table(src)
     pydict = table.to_pydict()
     new_cols = []
+    state20 = action20 = None
     for field in table.schema:
         name = field.name
         if name in ("observation.state", "action"):
             rows = np.stack([np.asarray(r, dtype=np.float32) for r in pydict[name]])
             rows = convert_16_to_20(rows)
+            if name == "observation.state":
+                state20 = rows
+            else:
+                action20 = rows
             arr = pa.FixedSizeListArray.from_arrays(pa.array(rows.reshape(-1), type=pa.float32()), 20)
         else:
             arr = pa.array(pydict[name])
@@ -73,6 +83,44 @@ def rewrite_parquet(src: Path, dst: Path) -> None:
     new_table = pa.Table.from_arrays([a for _, a in new_cols], names=[c for c, _ in new_cols])
     dst.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(new_table, dst)
+    return state20, action20
+
+
+def compute_vector_stats(parts: list[np.ndarray]) -> dict:
+    """对转换后的 [N,20] 向量特征重算 lerobot 风格 stats（min/max/mean/std/count/q01..q99）。"""
+    data = np.concatenate(parts, axis=0).astype(np.float64)  # float64 避免大 N 求和精度损失
+    return {
+        "min": np.min(data, axis=0).tolist(),
+        "max": np.max(data, axis=0).tolist(),
+        "mean": np.mean(data, axis=0).tolist(),
+        "std": np.std(data, axis=0).tolist(),
+        "count": [int(data.shape[0])],
+        "q01": np.quantile(data, 0.01, axis=0).tolist(),
+        "q10": np.quantile(data, 0.10, axis=0).tolist(),
+        "q50": np.quantile(data, 0.50, axis=0).tolist(),
+        "q90": np.quantile(data, 0.90, axis=0).tolist(),
+        "q99": np.quantile(data, 0.99, axis=0).tolist(),
+    }
+
+
+def update_stats_json(
+    src_root: Path, dst_root: Path, state_parts: list[np.ndarray], action_parts: list[np.ndarray]
+) -> None:
+    """重算 meta/stats.json：observation.state/action 换成 20 维统计，其余特征原样保留。
+
+    src 无 stats.json 时跳过（与 episodes stats 列同一处理原则：X-VLA 训练不使用）。
+    """
+    src_p = src_root / "meta" / "stats.json"
+    if not src_p.exists():
+        return
+    with open(src_p, encoding="utf-8") as f:
+        stats = json.load(f)
+    if "observation.state" in stats and state_parts:
+        stats["observation.state"] = compute_vector_stats(state_parts)
+    if "action" in stats and action_parts:
+        stats["action"] = compute_vector_stats(action_parts)
+    with open(dst_root / "meta" / "stats.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
 
 
 def update_info_json(src: Path, dst: Path) -> None:
@@ -91,15 +139,20 @@ def main() -> None:
         sys.exit(1)
     src_root, dst_root = Path(sys.argv[1]), Path(sys.argv[2])
 
-    # 主表
+    # 主表（同时积累转换后的 state/action，供重算 stats.json）
+    state_parts, action_parts = [], []
     for src in sorted(src_root.glob("data/**/file-*.parquet")):
         dst = dst_root / src.relative_to(src_root)
         print(f"rewrite {src} -> {dst}")
-        rewrite_parquet(src, dst)
+        s, a = rewrite_parquet(src, dst)
+        if s is not None:
+            state_parts.append(s)
+            action_parts.append(a)
 
-    # meta：info.json 更新，episodes/tasks 原样复制
+    # meta：info.json 更新、stats.json 重算，episodes/tasks 原样复制
     (dst_root / "meta").mkdir(parents=True, exist_ok=True)
     update_info_json(src_root / "meta" / "info.json", dst_root / "meta" / "info.json")
+    update_stats_json(src_root, dst_root, state_parts, action_parts)
     for src in sorted(src_root.glob("meta/episodes/**/file-*.parquet")):
         dst = dst_root / src.relative_to(src_root)
         dst.parent.mkdir(parents=True, exist_ok=True)
