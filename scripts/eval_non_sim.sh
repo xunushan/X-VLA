@@ -40,6 +40,9 @@ EVAL_STRIDE="${XVLA_EVAL_STRIDE:-1}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 
+# python stdout 无缓冲：日志重定向到文件时逐行落盘，否则块缓冲会吞掉中间日志
+export PYTHONUNBUFFERED=1
+
 if [ ! -d "${DATA_ROOT}" ]; then
   echo "[eval_non_sim] ERROR: dataset root ${DATA_ROOT} not found" >&2
   exit 1

@@ -24,9 +24,11 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +41,10 @@ from torch.utils.data import DataLoader
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+# stdout 重定向到日志文件时逐行刷盘：默认块缓冲会攒 8KB 或进程退出才落盘，
+# 导致 `tail -f` 看不到 loading model / model ready 等中间日志（误以为卡死）。
+print = functools.partial(print, flush=True)  # noqa: A001
 
 from tools.metric import (  # noqa: E402
     compute_metrics,
@@ -315,9 +321,10 @@ def main() -> None:
         raise ValueError(f"unsupported --dtype {args.dtype}")
 
     print(f"[evaluate] loading model {args.model} -> {device} ({args.dtype})")
+    t0 = time.time()
     model, processor = load_model(args.model, device, dtype)
     print(
-        f"[evaluate] model ready: action_mode={model.action_mode} "
+        f"[evaluate] model ready in {time.time() - t0:.1f}s: action_mode={model.action_mode} "
         f"num_actions={model.num_actions} dim_action={model.action_space.dim_action}"
     )
 
