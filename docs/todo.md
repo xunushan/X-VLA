@@ -11,12 +11,16 @@
 > 字符串保留，分片互不相交 → effective_batch = batch_size × world_size × accum 公式成立。
 
 ### 待验证（服务器 Linux + 真实多 GPU）
-- [ ] **`num_workers=4` 下多进程分片正确性**：`create_dataloader` 实际配置 `num_workers=4,
+- [x] **`num_workers=4` 下多进程分片正确性**：`create_dataloader` 实际配置 `num_workers=4,
       persistent_workers=True`。本机 gloo 测试用的是 `num_workers=0`；macOS 的 torch DataLoader
       多进程本身不稳定（裸 DataLoader 也会挂），该组合只能上服务器验证。
-- [ ] **effective_batch 验证**：真实 N 卡上确认每 optimizer 步处理样本数 =
+      → **2026-08-06 服务器 train 验证通过**：训练冒烟全程 num_workers=4 无崩溃、batch 内字符串字段正常、
+      IterableDatasetShard 无限流持续推进（阶段 4/5/6 均以 4 worker 跑 120 步）。
+- [x] **effective_batch 验证**：真实 N 卡上确认每 optimizer 步处理样本数 =
       `batch_size × world_size × gradient_accumulation_steps`。
-- [ ] **训练冒烟**：`accelerate launch --num_processes=N --mixed_precision bf16 train.py --iters 小步数` 通过。
+      → **2026-08-06**：单卡 batch=4 × accum=8 → 日志确认 `effective_batch=32`。
+- [x] **训练冒烟**：`accelerate launch --num_processes=N --mixed_precision bf16 train.py --iters 小步数` 通过。
+      → **2026-08-06**：120 步冒烟完成，loss 有限、无 OOM（batch=4 显存峰值 9.9G / 24G）。
 
 ### 已知副作用（先记录，未修复）
 - [ ] **进程内 worker 冗余**：`num_workers=4` 时 4 个 worker 各自独立流式同一 rank 的分片子集，
@@ -34,13 +38,18 @@
       需改用 `accelerator.save_state()/load_state()`。
 
 ### 环境限制
-- [ ] macOS 无法可靠验证多进程 DataLoader，需在服务器跑训练冒烟。
+- [x] macOS 无法可靠验证多进程 DataLoader，需在服务器跑训练冒烟。
+      → **2026-08-06** 服务器 train 单卡验证完成（见上）。
 
-## Checkpoint / Resume（已实现，待服务器验证）
-- [ ] 服务器验证 resume：训练 N 步 → 中断 → `--resume latest` → 确认 global_step / optimizer
+## Checkpoint / Resume（已实现，服务器已验证 2026-08-06）
+- [x] 服务器验证 resume：训练 N 步 → 中断 → `--resume latest` → 确认 global_step / optimizer
       状态恢复、loss 曲线连续。
-- [ ] resume 与冻结阶段交错：`freeze_steps` 前后各 resume 一次（阶段一冻结组 requires_grad
+      → 阶段 5：60 步 ckpt-60 → resume latest → 120 步；`Resume: continue from global_step=60`、
+      optimizer.pt 恢复、loss 连续性 ratio=1.424 ∈ (0.1,10)。
+- [x] resume 与冻结阶段交错：`freeze_steps` 前后各 resume 一次（阶段一冻结组 requires_grad
       恢复、阶段二全量解冻）。
+      → 阶段 6：冻结期 ckpt-20（3.4G，optimizer 状态小）内 resume，续至 120 步；
+      step 30 仍 `lr_vlm=0`、step 40 `lr_vlm=1e-4`（解冻生效）。
 
 ## 训练/推理图像预处理对齐（部分确认）
 > 训练侧 `dataset.image_aug`（datasets/dataset.py）用 Resize(224, BICUBIC) → ToTensor(/255) →
@@ -58,6 +67,15 @@
 - [ ] 确认 DaViT 输入必须为 ImageNet 标准化后的 [C,H,W] float；任何一侧省掉 Normalize 都会破坏对齐。
 
 ## 视频解码策略（记录，当前不改）
+> **服务器量化实测（2026-08-06，train 单卡，AV1 640×480）**：
+> `DECODE timing: 131.8 ms/样本 | 40 fps/帧 | decode 占 worker 处理墙钟 34%`
+> （样本数 30720，帧数 160701；冒烟 120 步/32 effective batch）。
+> 单步 `DATA_PCT`（数据预处理占 step 墙钟比例）多为 0%、偶发 30–84%（踩到需解码的新 episode 时），
+> 说明短训数据加载非瓶颈；真正的解码吞吐由 `decode_fps≈40`（单 worker）量化。
+> 数据帧率 25fps×3 相机 = 75 帧/s 需求；单 worker 40fps 低于此，但 4 worker 合计 ≈160fps 已覆盖；
+> 且每 episode 跨访问重解码 + 进程内 4× 冗余会放大真实解码量。**长训是否瓶颈需按完整训练期
+> 整段解码次数外推后确认**（todo 方案 A/B 判断依据：重复访问/冗余 vs 解码吞吐）。
+
 > 背景：训练时每访问一个 episode，三路相机各**整段重解码**一次
 > （`datasets/domain_handler/lerobot_v3_robodojo.py` `_decode_episode_video`；`lerobotv21.py` 的
 > `read_video_to_frames` 同理）。episode 被无限重采样（`datasets/dataset.py:117`）→ 跨访问重复解码；

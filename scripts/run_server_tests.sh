@@ -38,6 +38,7 @@ export TRAIN_BATCH_SIZE="${XVLA_TRAIN_BATCH_SIZE:-4}"
 export TRAIN_ACCUM="${XVLA_TRAIN_ACCUM:-8}"
 export TRAIN_WORKERS="${XVLA_TRAIN_WORKERS:-4}"
 
+PHASE_FAILS=()   # run_phase 追加失败阶段名；set -u 下必须先初始化再 +=
 SUMMARY_LOG="${OUT_BASE}/summary.log"
 mkdir -p "${OUT_BASE}"
 : > "${SUMMARY_LOG}"
@@ -260,7 +261,7 @@ fi
 if ! skip_phase 5; then
 run_phase "5-resume" <<'PHASE5'
   set -uo pipefail
-  rm -rf "${OUT_BASE}/smoke"   # 释放阶段 4 的 ckpt（~11G），本阶段峰值 2 ckpt ≈ 22G
+  rm -rf "${OUT_BASE}"/smoke/ckpt-*   # 释放阶段 4 的 ckpt（~11G），保留 train.log/timing 供 review；本阶段峰值 2 ckpt ≈ 22G
   RES_OUT="${OUT_BASE}/resume"
   rm -rf "${RES_OUT}"
   TRAIN_OUTPUT_DIR="${RES_OUT}" TRAIN_ITERS=60 TRAIN_SAVE_INTERVAL=60 \
@@ -308,7 +309,7 @@ fi
 if ! skip_phase 6; then
 run_phase "6-freeze-resume" <<'PHASE6'
   set -uo pipefail
-  rm -rf "${OUT_BASE}/smoke" "${OUT_BASE}/resume"   # 释放前序阶段 ckpt，峰值 2 ckpt ≈ 22G
+  rm -rf "${OUT_BASE}"/smoke/ckpt-* "${OUT_BASE}"/resume/ckpt-*   # 释放前序阶段 ckpt（保留日志），峰值 2 ckpt ≈ 22G
   FR_OUT="${OUT_BASE}/freeze_resume"
   rm -rf "${FR_OUT}"
   # run1：20 步全冻结期保存 ckpt-20（vlm/core 无梯度 → optimizer 状态小，省磁盘）；
