@@ -55,5 +55,17 @@ def fake_frames(length: int, h: int = 480, w: int = 640) -> np.ndarray:
     return rng.integers(0, 256, size=(length, h, w, 3), dtype=np.uint8)
 
 
+def fake_state(length: int, seed: int = 0, dim: int = 20) -> np.ndarray:
+    """构造与真实 20d state 同形状的假绝对状态 [T, dim]（随机游走，相邻帧必不同）。
+
+    用途：绕过读取真实 data/chunk-*.parquet（单文件含全部 episode 状态，一次读取约 20s+），
+    让评估类测试专注迭代/形状/确定性逻辑；种子按 episode_index 传入保证跨 episode 不同。
+    """
+    rng = np.random.default_rng(seed)
+    base = rng.standard_normal(dim).astype(np.float32)
+    drift = rng.standard_normal((length, dim)).astype(np.float32) * 0.01
+    return (base[None, :] + np.cumsum(drift, axis=0)).astype(np.float32)
+
+
 def assert_equal_shape(x: torch.Tensor, shape) -> None:
     assert tuple(x.shape) == tuple(shape), f"got {tuple(x.shape)}, expected {shape}"

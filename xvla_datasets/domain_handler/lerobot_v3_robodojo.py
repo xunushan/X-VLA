@@ -14,7 +14,7 @@ from PIL import Image
 from scipy.interpolate import interp1d
 
 from .. import timing
-from ..utils import quat_to_rotate6d
+from ..utils import ee16_to_xvla20
 from .base import DomainHandler
 
 # 默认相机顺序（第 0 路 = cam_high 为主视频，进入 BART 主路径，见 modeling_xvla.forward_vlm）
@@ -125,20 +125,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
 
     @staticmethod
     def _to_20d(arr: np.ndarray) -> np.ndarray:
-        """16 维 → 20 维：每臂 [xyz, quat_wxyz, g] → [xyz, rot6d, 1-g]。"""
-        D = arr.shape[1]
-        if D == 20:
-            return arr
-        if D != 16:
-            raise ValueError(f"unsupported state dim {D}; expected 16 or 20")
-        left, right = arr[:, :8], arr[:, 8:]
-        l = np.concatenate(
-            [left[:, :3], quat_to_rotate6d(left[:, 3:7], scalar_first=True), 1.0 - left[:, 7:8]], -1
-        )
-        r = np.concatenate(
-            [right[:, :3], quat_to_rotate6d(right[:, 3:7], scalar_first=True), 1.0 - right[:, 7:8]], -1
-        )
-        return np.concatenate([l, r], -1).astype(np.float32)
+        """16 维 → 20 维：每臂 [xyz, quat_wxyz, g] → [xyz, rot6d, 1-g]（委托 utils.ee16_to_xvla20）。"""
+        return ee16_to_xvla20(arr, invert_gripper=True)
 
     def _decode_episode_video(self, cam_key: str, ep: dict) -> np.ndarray:
         """解码单个 episode 的视频段，返回 [T, H, W, C] uint8。
@@ -204,6 +192,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         training: bool,
         image_aug,
         lang_aug_map: dict | None = None,
+        frame_info: bool = False,
         **kwargs,
     ) -> Iterable[dict]:
         ep_idx = self.meta["datalist"][traj_idx]
@@ -260,9 +249,14 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                 imgs.append(torch.zeros_like(imgs[0]))
 
             timing.record_sample()  # 解码计时 flush 触发点（配合 _decode_episode_video 的 record_decode）
-            yield {
+            sample = {
                 "language_instruction": ins_sample,
                 "image_input": torch.stack(imgs, dim=0),
                 "image_mask": image_mask,
                 "abs_trajectory": seq,
             }
+            # frame_info 为评估用 opt-in：训练路径不传（默认 False）→ 样本 dict 不变
+            if frame_info:
+                sample["episode_index"] = ep_idx
+                sample["frame_index"] = idx
+            yield sample

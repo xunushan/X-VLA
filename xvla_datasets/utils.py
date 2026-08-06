@@ -134,6 +134,61 @@ def rotate6d_to_quat(v6: np.ndarray, scalar_first = False) -> np.ndarray:
     return R.from_matrix(rot_mats).as_quat(scalar_first = scalar_first)
 
 
+def ee16_to_xvla20(value: np.ndarray, *, invert_gripper: bool = True) -> np.ndarray:
+    """16 维 end-effector 布局 -> 20 维 X-VLA 布局（每臂 [xyz, quat_wxyz, g] -> [xyz, rot6d, g']）。
+
+    gripper 默认反转（1-g，X-VLA EE6D 约定 1=闭合）；20 维输入原样返回。
+    （自 LeRobotV3RoboDojoHandler._to_20d 上移，供 handler 与评估共用。）
+    """
+    value = np.asarray(value, dtype=np.float32)
+    if value.shape[-1] == 20:
+        return value
+    if value.shape[-1] != 16:
+        raise ValueError(f"unsupported last dim {value.shape[-1]}; expected 16 or 20")
+    left, right = value[..., :8], value[..., 8:]
+    l = np.concatenate(
+        [left[..., :3],
+         quat_to_rotate6d(left[..., 3:7], scalar_first=True),
+         1.0 - left[..., 7:8] if invert_gripper else left[..., 7:8]], -1
+    )
+    r = np.concatenate(
+        [right[..., :3],
+         quat_to_rotate6d(right[..., 3:7], scalar_first=True),
+         1.0 - right[..., 7:8] if invert_gripper else right[..., 7:8]], -1
+    )
+    return np.concatenate([l, r], -1).astype(np.float32)
+
+
+def xvla20_to_ee16(value: np.ndarray, *, invert_gripper: bool = False, clip_gripper: bool = True) -> np.ndarray:
+    """20 维 X-VLA 动作/状态 -> 16 维 end-effector 布局（评估指标用）。
+
+    每臂 [xyz, rot6d, g] -> [xyz, quat_wxyz, g]；gripper 默认保留 20 维值并 clip 到 [0,1]，
+    与先前评估（eval_results/*/metrics.json 的 convert_20d_to_16d=true）语义一致。
+    """
+    value = np.asarray(value, dtype=np.float32)
+    if value.shape[-1] != 20:
+        raise ValueError(f"unsupported last dim {value.shape[-1]}; expected 20")
+    left_gripper = value[..., 9:10]
+    right_gripper = value[..., 19:20]
+    if clip_gripper:
+        left_gripper = np.clip(left_gripper, 0.0, 1.0)
+        right_gripper = np.clip(right_gripper, 0.0, 1.0)
+    if invert_gripper:
+        left_gripper = 1.0 - left_gripper
+        right_gripper = 1.0 - right_gripper
+    return np.concatenate(
+        (
+            value[..., 0:3],
+            rotate6d_to_quat(value[..., 3:9], scalar_first=True),
+            left_gripper,
+            value[..., 10:13],
+            rotate6d_to_quat(value[..., 13:19], scalar_first=True),
+            right_gripper,
+        ),
+        axis=-1,
+    ).astype(np.float32)
+
+
 def action_slice(abs_traj: torch.Tensor, 
                  idx_for_delta: Sequence[int] = (),
                  idx_for_mask_proprio: Sequence[int] = ()
