@@ -217,3 +217,6 @@ runnings/*
 logs/
 metas/
 demo.ipynb
+
+# 本地训练日志与图表（tools/plot_train_loss.py 产出）
+outputs/
