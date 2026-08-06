@@ -9,10 +9,11 @@
     conda activate lerobot
     python tools/plot_train_loss.py                                   # 默认读 outputs/xvla_formal_run.log
     python tools/plot_train_loss.py /path/to/train.log -o out.png     # 指定日志与输出
-    python tools/plot_train_loss.py --smooth 0.9 --freeze-steps 1000  # 自定义 EMA 与解冻线
+    python tools/plot_train_loss.py --smooth 0.9 --window 10 \
+        --freeze-steps 1000                                           # 自定义 EMA / 窗口均值 / 解冻线
 
 产出：
-    - PNG 图（默认 outputs/train_loss.png）：上图为 loss（原始 + EMA 平滑），
+    - PNG 图（默认 outputs/train_loss.png）：上图为 loss（原始 + EMA 平滑 + 滑窗均值），
       下图 grad_norm；解冻边界画竖虚线
     - 终端打印训练统计（起始/当前/最低 loss、EMA 趋势、解冻步）
 """
@@ -70,8 +71,18 @@ def ema(values: np.ndarray, alpha: float) -> np.ndarray:
     return out
 
 
+def rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
+    """滑窗均值：前 window-1 个点为 NaN（窗口不满）。"""
+    if window <= 1:
+        return values.copy()
+    out = np.full_like(values, np.nan)
+    c = np.cumsum(np.insert(values, 0, 0))
+    out[window - 1:] = (c[window:] - c[:-window]) / window
+    return out
+
+
 def plot(data: dict[str, np.ndarray], out_png: Path, smooth: float,
-         freeze_steps: int | None) -> None:
+         window: int, freeze_steps: int | None) -> None:
     step = data["step"]
 
     # 解冻边界：lr_core 从 0 跳变的第一个日志点；可被 --freeze-steps 覆盖
@@ -86,11 +97,16 @@ def plot(data: dict[str, np.ndarray], out_png: Path, smooth: float,
         gridspec_kw={"height_ratios": [2.2, 1], "hspace": 0.08},
     )
 
-    # —— loss（原始 + EMA）——
+    # —— loss（原始 + EMA + 窗口均值）——
     ax1.plot(step, data["loss"], alpha=0.25, lw=0.8, color="C0",
              label="loss (raw)")
     ax1.plot(step, ema(data["loss"], smooth), lw=1.6, color="C0",
              label=f"loss (EMA α={smooth:g})")
+    if window > 1:
+        step_delta = int(np.median(np.diff(step))) if len(step) > 1 else 20
+        wm = rolling_mean(data["loss"], window)
+        ax1.plot(step, wm, lw=2.2, color="C2",
+                 label=f"loss (window mean, ≈{window * step_delta} steps)")
     ax1.set_ylabel("loss")
     ax1.set_yscale("log")
     ax1.legend(loc="upper right", fontsize=9)
@@ -147,13 +163,15 @@ def main() -> None:
                     help="输出 PNG 路径（默认 outputs/train_loss.png）")
     ap.add_argument("--smooth", type=float, default=0.95,
                     help="EMA 平滑系数 0–1（默认 0.95，越大越平滑）")
+    ap.add_argument("--window", type=int, default=10,
+                    help="窗口均值宽度（单位：日志点数；默认 10 个 ≈200 步；1 关闭）")
     ap.add_argument("--freeze-steps", type=int, default=None,
                     help="手动指定解冻边界（默认从 lr_core 跳变检测）")
     args = ap.parse_args()
 
     data = parse_log(args.log)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    plot(data, args.output, args.smooth, args.freeze_steps)
+    plot(data, args.output, args.smooth, args.window, args.freeze_steps)
     summarize(data, args.smooth)
     print(f"已保存图表  : {args.output}")
 
