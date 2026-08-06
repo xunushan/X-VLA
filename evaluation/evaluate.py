@@ -252,7 +252,7 @@ def run_evaluation(
     for i, batch in enumerate(loader):
         pred = predict_batch(model, processor, batch, device, dtype, steps=steps)
         rows.extend(collect_rows(batch, pred, convert_20d_to_16d, episode_task_index=episode_task_index))
-        if (i + 1) % 50 == 0:
+        if (i + 1) % 10 == 0:
             print(f"[evaluate] {i + 1} batches done, {len(rows)} frames", flush=True)
     return pd.DataFrame(rows)
 
