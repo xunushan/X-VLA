@@ -50,7 +50,7 @@ def _write_temp_meta(meta: dict, data_root: Path) -> Path:
 
 
 def main() -> int:
-    data_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/data/lerobot_v30_ee_6d")
+    data_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/data/data/lerobot_v30_ee_6d")
     meta_json = Path(sys.argv[2]) if len(sys.argv) > 2 else data_root / "meta.json"
 
     print(f"== data_root: {data_root}")
@@ -135,6 +135,18 @@ def main() -> int:
         print("  (warn) meta.json 不存在，用默认 meta 构造 handler")
     handler = LeRobotV3RoboDojoHandler(meta=meta, num_views=3)
     check("handler episodes 加载", len(handler.episodes) > 0, f"{len(handler.episodes)} episodes")
+
+    # 训练集过滤：meta.json 的 episodes 列表应过滤 handler 的 datalist（train90 划分 = 1080）
+    eps_filter = meta.get("episodes")
+    if eps_filter is not None:
+        check("meta.episodes 训练集过滤生效",
+              len(handler.meta["datalist"]) == len(eps_filter) == len(set(eps_filter)),
+              f"datalist={len(handler.meta['datalist'])} filter={len(eps_filter)}")
+        check("meta.episodes 索引合法",
+              all(isinstance(i, int) and 0 <= i < len(handler.episodes) for i in eps_filter),
+              f"range=[{min(eps_filter)},{max(eps_filter)}] eps_total={len(handler.episodes)}")
+    else:
+        print("  (info) meta.episodes=None：未按训练集过滤（检查 prepare_data.sh 的 splits 读取）")
 
     # 走训练同款管道（InfiniteDataReader.training=False 单趟）：样本含 domain_id + proprio/action
     from xvla_datasets.dataset import InfiniteDataReader

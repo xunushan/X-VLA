@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import random
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List
 
@@ -12,6 +13,7 @@ import torch
 from PIL import Image
 from scipy.interpolate import interp1d
 
+from .. import timing
 from ..utils import quat_to_rotate6d
 from .base import DomainHandler
 
@@ -158,10 +160,11 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             container = av.open(io.BytesIO(fileio.get(str(path))))
 
         tol = 0.5 / self.fps
+        _t0 = time.time()
+        frames: List[np.ndarray] = []
         try:
             stream = container.streams.video[0]
             container.seek(int(from_ts / stream.time_base), stream=stream)
-            frames: List[np.ndarray] = []
             for packet in container.demux(stream):
                 for frame in packet.decode():
                     if frame.pts is None:
@@ -176,6 +179,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                         break
         finally:
             container.close()
+        # 视频解码耗时插桩（仅设了 XVLA_TIMING_DIR 时才有 IO 开销，见 xvla_datasets/timing.py）
+        timing.record_decode(time.time() - _t0, len(frames))
 
         if not frames:
             raise RuntimeError(
@@ -254,6 +259,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             while len(imgs) < self.num_views:
                 imgs.append(torch.zeros_like(imgs[0]))
 
+            timing.record_sample()  # 解码计时 flush 触发点（配合 _decode_episode_video 的 record_decode）
             yield {
                 "language_instruction": ins_sample,
                 "image_input": torch.stack(imgs, dim=0),

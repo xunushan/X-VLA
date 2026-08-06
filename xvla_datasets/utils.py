@@ -15,13 +15,60 @@
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
-import io, numpy as np, pyarrow.parquet as pq, av, cv2
+import io, json, numpy as np, pyarrow.parquet as pq, av, cv2
 from mmengine import fileio
 from PIL import Image
 from scipy.spatial.transform import Rotation as R
 import h5py
 from typing import Sequence, Dict
 import torch
+
+def load_episode_indices(path, split: str = "train") -> list[int]:
+    """从 splits 索引文件读取指定划分（train/val）的 episode 索引列表。
+
+    兼容常见格式：
+      - JSON dict：取 `split` 键（如 {"train": [...], "val": [...]}，RoboDojo splits 格式）；
+      - JSON 数组：直接作为索引列表（忽略 split）；
+      - JSONL / 每行一个整数：行内为含 `episode_index` 的 dict 或单个整数。
+    返回排序后的去重整数列表。缺 split 键 / 空列表时抛 ValueError。
+    """
+    from pathlib import Path
+    p = Path(path)
+    raw = p.read_text(encoding="utf-8")
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        obj = None
+    if isinstance(obj, dict):
+        idxs = obj.get(split)
+        if idxs is None:
+            raise ValueError(f"splits file {p} has no '{split}' key (keys: {list(obj)[:10]})")
+        idxs = list(idxs)
+    elif isinstance(obj, list):
+        idxs = obj
+    else:
+        idxs = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                entry = line
+            if isinstance(entry, dict):
+                idxs.append(entry["episode_index"])
+            elif isinstance(entry, (int, float)):
+                idxs.append(int(entry))
+            elif isinstance(entry, str):
+                idxs.append(int(entry))
+            else:
+                raise ValueError(f"unrecognized splits line: {line!r}")
+    result = sorted({int(i) for i in idxs})
+    if not result:
+        raise ValueError(f"splits file {p} yielded empty '{split}' index list")
+    return result
+
 
 def read_bytes(path: str) -> bytes:
     return fileio.get(path)

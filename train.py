@@ -90,6 +90,13 @@ def get_args_parser():
         default=None,
         help="Resume from a checkpoint dir; 'latest'/'auto' picks the newest ckpt-* in --output_dir",
     )
+    parser.add_argument(
+        "--timing_dir",
+        type=str,
+        default=None,
+        help="Optional dir to collect DataLoader worker-side video decode timing (smoke/瓶颈量化用). "
+             "Enables XVLA_TIMING_DIR for workers; train.py aggregates decode_*.jsonl at exit.",
+    )
 
     # Data
     parser.add_argument(
@@ -433,6 +440,10 @@ def main(args):
     # 数据集）。必须 device_placement=[False]：否则走 DataLoaderDispatcher，对 batch 内
     # language_instruction 字符串字段无法 concatenate 而崩溃；batch 由下方
     # inputs.to(accelerator.device) 搬运，不影响设备放置。
+    # 视频解码计时：仅在 --timing_dir 开启时生效，必须在 create_dataloader 之前设 env
+    # （DataLoader worker 由 fork 继承环境变量，见 xvla_datasets/timing.py）。
+    if args.timing_dir:
+        os.environ["XVLA_TIMING_DIR"] = os.path.join(args.timing_dir, str(accelerator.process_index))
     train_dataloader = create_dataloader(
         batch_size=args.batch_size,
         metas_path=args.train_metas_path,
@@ -483,6 +494,7 @@ def main(args):
     )
 
     # InfiniteDataReader 是无限流，不会抛 StopIteration，无需重启处理
+    data_s = 0.0  # 累计本 log 间隔内 next(train_iter) 墙钟耗时（数据预处理+解码+IPC），算 DATA_PCT
     while global_step < args.iters:
         # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
         # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
@@ -490,8 +502,10 @@ def main(args):
         configure_training_step(optim, global_step, args)
 
         with accelerator.accumulate(model):
-            # 取一个 micro-batch
+            # 取一个 micro-batch（计时：数据预处理时间占比，见 docs/服务器测试计划.md 2.1）
+            _t = time.time()
             batch = next(train_iter)
+            data_s += time.time() - _t
 
             # Encode language
             lang = processor.encode_language(batch["language_instruction"])
@@ -530,7 +544,10 @@ def main(args):
                 accelerator.log(logs, step=global_step)
 
                 if accelerator.is_main_process:
-                    dt = (time.time() - t0) / args.log_interval
+                    wall = time.time() - t0
+                    dt = wall / args.log_interval
+                    data_pct = 100.0 * data_s / max(wall, 1e-9)
+                    data_s = 0.0
                     t0 = time.time()
                     cpu_mem = psutil.Process(os.getpid()).memory_info().rss / 1024**3
                     gpu_mem = torch.cuda.memory_allocated() / 1024**3
@@ -539,6 +556,7 @@ def main(args):
                         f"loss={logs['loss_total']:.4f} "
                         f"lr_core={logs['lr_transformer_core']:.2e} "
                         f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
+                        f"DATA_PCT={data_pct:.0f}% "
                         f"USED_CPU={cpu_mem:.2e} GB "
                         f"USED_GPU={gpu_mem:.2e} GB "
                     )
@@ -562,7 +580,54 @@ def main(args):
                 save_rng_state(os.path.join(save_dir, f"rng_state_rank{accelerator.process_index}.pt"))
                 accelerator.wait_for_everyone()
 
+    accelerator.wait_for_everyone()
+    if args.timing_dir:
+        aggregate_decode_timing(args.timing_dir, logger, accelerator.is_main_process)
     accelerator.end_training()
+
+
+def aggregate_decode_timing(timing_dir: str, logger, is_main_process: bool) -> None:
+    """聚合 DataLoader worker 侧视频解码计时（xvla_datasets/timing.py 的 decode_*.jsonl）。
+
+    主进程读取全部 rank 子目录的 jsonl，汇总后写 summary.json 并打日志：
+      - decode_ms/样本：每个训练样本平摊的解码毫秒
+      - decode_fps：解码帧率
+      - decode_pct：解码占 worker 处理墙钟比例（近似数据预处理中解码占比）
+    """
+    import glob
+
+    samples = decode_s = frames = wall_s = 0
+    for p in glob.glob(os.path.join(timing_dir, "**", "decode_*.jsonl"), recursive=True):
+        with open(p) as f:
+            for line in f:
+                r = json.loads(line)
+                samples += r["samples"]
+                decode_s += r["decode_s"]
+                frames += r["frames"]
+                wall_s += r["wall_s"]
+    if samples == 0:
+        logger.warning(f"No decode timing collected under {timing_dir}")
+        return
+    ms_per_sample = 1000.0 * decode_s / samples
+    decode_fps = frames / max(decode_s, 1e-9)
+    decode_pct = 100.0 * decode_s / max(wall_s, 1e-9)
+    summary = {
+        "samples": samples,
+        "decode_s": round(decode_s, 3),
+        "frames": frames,
+        "decode_ms_per_sample": round(ms_per_sample, 3),
+        "decode_fps": round(decode_fps, 1),
+        "decode_pct_of_worker_wall": round(decode_pct, 1),
+        "worker_wall_s": round(wall_s, 3),
+    }
+    os.makedirs(timing_dir, exist_ok=True)
+    with open(os.path.join(timing_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    if is_main_process:
+        logger.info(
+            f"DECODE timing: {ms_per_sample:.1f} ms/sample | {decode_fps:.0f} fps/frame "
+            f"| decode {decode_pct:.0f}% of worker wall (samples={samples}, frames={frames})"
+        )
 
 
 # ============================================================
