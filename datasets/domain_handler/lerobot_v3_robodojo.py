@@ -219,8 +219,9 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         # 4. 时间轴（动作网格密度 = num_actions/qdur，与录制帧率无关）与插值器。
         #    网格步长 = qdur/num_actions，查询点 q 恰好落在帧网格上 → interp1d 恒等返回
         #    原始 state 值（连续真实帧），不产生合成插值点；fps 仅用于视频解码（见 __init__）。
+        state_T = state[:T]  # 截断到公共长度；fill_value 首/尾都取自截断段，避免引用截断外行
         lt = np.arange(T, dtype=np.float64) * (self.qdur / num_actions)
-        L = interp1d(lt, state[:T], axis=0, bounds_error=False, fill_value=(state[0], state[T - 1]))
+        L = interp1d(lt, state_T, axis=0, bounds_error=False, fill_value=(state_T[0], state_T[-1]))
 
         # 5. 候选帧：排除 episode 尾部不足 qdur 完整窗口的样本
         last_start = lt[-1] - self.qdur
