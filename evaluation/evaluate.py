@@ -100,6 +100,40 @@ def build_episode_task_index(dataset_root: str | Path) -> tuple[dict[int, int], 
     return episode_task_index, task_names
 
 
+def read_episode_lengths(dataset_root: str | Path) -> dict[int, int]:
+    """读 meta/episodes 表：episode_index -> length（帧数），供总样本估算。"""
+    root = Path(dataset_root)
+    out: dict[int, int] = {}
+    for p in sorted(root.glob("meta/episodes/**/file-*.parquet")):
+        t = pq.read_table(str(p))
+        if "length" not in t.column_names:
+            continue
+        for ei, ln in zip(t.column("episode_index").to_pylist(), t.column("length").to_pylist()):
+            out[int(ei)] = int(ln)
+    return out
+
+
+def estimate_total_batches(meta: dict, num_actions: int, frame_stride: int, batch_size: int) -> int:
+    """按 episode 长度估算总 batch 数（供进度百分比显示，无需解码视频）。
+
+    候选 start index 数 = T - num_actions（lt[i] <= lt[-1]-qdur ⇔ i < T-num_actions），
+    再经 stride（idx % stride == 0）过滤后求和 / batch_size 取整。
+    不含完全静止段的剔除（需读 state 才能判定），故为真实总数的上限近似；
+    无 episode_lengths（旧 meta）时返回 0，调用方退化为无百分比进度。
+    """
+    lengths = {int(k): int(v) for k, v in (meta.get("episode_lengths") or {}).items()}
+    if not lengths:
+        return 0
+    n_samples = 0
+    for ei in meta.get("datalist", []):
+        t = int(lengths.get(int(ei), 0))
+        if t <= num_actions:
+            continue
+        n_cand = t - num_actions
+        n_samples += (n_cand + frame_stride - 1) // frame_stride
+    return (n_samples + batch_size - 1) // batch_size
+
+
 def get_task_index_map(meta: dict) -> tuple[dict[int, int], dict[int, str]]:
     """取评估 meta 中的 episode->task_index 映射；旧 meta 缺该键时从数据集表回溯。"""
     if meta.get("episode_task_index"):
@@ -127,7 +161,8 @@ def build_eval_meta(
     """从 split 文件生成 v3.0 格式评估 meta.json（episodes = 指定分集的 episode 索引）。
 
     camera_keys/fps 从数据集 meta/info.json 读取（缺失时用默认值），与 prepare_data.sh 一致。
-    附带 episode_task_index / task_names（episode_index 回溯 task_index 的映射，供按任务分析）。
+    附带 episode_task_index / task_names（episode_index 回溯 task_index 的映射，供按任务分析）
+    与 episode_lengths（供总样本/进度估算）。
     """
     root = Path(dataset_root)
     info: dict = {}
@@ -141,6 +176,7 @@ def build_eval_meta(
 
     episodes = load_episode_indices(split_path, split)
     episode_task_index, task_names = build_episode_task_index(root)
+    episode_lengths = read_episode_lengths(root)
     meta = {
         "codebase_version": "v3.0",
         "dataset_name": dataset_name,
@@ -152,6 +188,7 @@ def build_eval_meta(
         "episodes": episodes,
         "episode_task_index": {str(k): v for k, v in episode_task_index.items()},
         "task_names": {str(k): v for k, v in task_names.items()},
+        "episode_lengths": {str(k): v for k, v in episode_lengths.items()},
     }
     out = Path(output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -248,12 +285,33 @@ def run_evaluation(
         collate_fn=eval_collate,
         num_workers=0,  # IterableDataset 多进程会重复迭代，评估单进程即可
     )
+    # 用 episode 长度估算总 batch 数，给出进度百分比（不读 state；不含静止段剔除，实际略少）
+    meta = next(iter(getattr(reader, "metas", {}).values())) if getattr(reader, "metas", None) else {}
+    total_batches_est = 0
+    if meta:
+        _n_actions = int(getattr(reader, "num_actions", 0))
+        if _n_actions > 0:
+            total_batches_est = estimate_total_batches(
+                meta, _n_actions, int(getattr(reader, "frame_stride", 1)), batch_size
+            )
+    if total_batches_est:
+        print(
+            f"[evaluate] estimated {total_batches_est} batches "
+            f"(num_actions={reader.num_actions}, stride={reader.frame_stride}, batch={batch_size})"
+        )
+    # ~1% 粒度但最多每 10 batch 一行；小评估逐 batch；旧 meta 无估算时退化为每 10 batch
+    interval = max(1, min(total_batches_est // 100, 10)) if total_batches_est else 10
     rows: list[dict] = []
     for i, batch in enumerate(loader):
         pred = predict_batch(model, processor, batch, device, dtype, steps=steps)
         rows.extend(collect_rows(batch, pred, convert_20d_to_16d, episode_task_index=episode_task_index))
-        if (i + 1) % 10 == 0:
-            print(f"[evaluate] {i + 1} batches done, {len(rows)} frames", flush=True)
+        done = i + 1
+        if done % interval == 0 or (total_batches_est and done == total_batches_est):
+            if total_batches_est:
+                pct = 100.0 * done / total_batches_est
+                print(f"[evaluate] batch {done}/{total_batches_est} ({pct:.0f}%) done, {len(rows)} frames")
+            else:
+                print(f"[evaluate] {done} batches done, {len(rows)} frames")
     return pd.DataFrame(rows)
 
 

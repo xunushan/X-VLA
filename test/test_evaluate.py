@@ -14,7 +14,13 @@ import torch
 from torch.utils.data import IterableDataset
 
 from evaluation import evaluate as ev
-from evaluation.evaluate import collect_rows, eval_collate, run_evaluation, xvla20_to_ee16
+from evaluation.evaluate import (
+    collect_rows,
+    estimate_total_batches,
+    eval_collate,
+    run_evaluation,
+    xvla20_to_ee16,
+)
 from xvla_datasets.domain_handler.lerobot_v3_robodojo import LeRobotV3RoboDojoHandler
 from xvla_datasets.utils import ee16_to_xvla20, quat_to_rotate6d
 
@@ -185,6 +191,21 @@ def test_collect_rows_converts_16d():
         xvla20_to_ee16(expert[0]).reshape(-1),
         atol=1e-4,
     )
+
+
+def test_estimate_total_batches():
+    """按 episode 长度估算：候选 = T-num_actions，经 stride 过滤后 / batch_size 取整。"""
+    meta = {
+        "datalist": [0, 1, 2],
+        "episode_lengths": {"0": 100, "1": 100, "2": 100},
+        "query_duration": 1.0,
+    }
+    # num_actions=30, stride=1：每集 70 候选 → 210 样本 → ceil(210/8)=27
+    assert estimate_total_batches(meta, num_actions=30, frame_stride=1, batch_size=8) == 27
+    # stride=25：每集 ceil(70/25)=3 → 9 样本 → ceil(9/8)=2
+    assert estimate_total_batches(meta, num_actions=30, frame_stride=25, batch_size=8) == 2
+    # 无 episode_lengths（旧 meta）→ 0，调用方退化为无百分比进度
+    assert estimate_total_batches({"datalist": [0]}, num_actions=30, frame_stride=1, batch_size=8) == 0
 
 
 def test_collect_rows_adds_task_index():

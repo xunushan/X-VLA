@@ -72,12 +72,13 @@ def test_build_eval_meta_missing_split_key(tmp_path):
         build_eval_meta(root, split_path, "val", tmp_path / "m.json")
 
 
-def _write_episodes_tables(root, ep_tasks: dict[int, str]):
-    """写 meta/episodes 表（episode_index + tasks 列）。"""
+def _write_episodes_tables(root, ep_tasks: dict[int, str], length: int = 100):
+    """写 meta/episodes 表（episode_index + length + tasks 列）。"""
     ep_dir = root / "meta" / "episodes" / "chunk-000"
     ep_dir.mkdir(parents=True, exist_ok=True)
     table = pa.table({
         "episode_index": pa.array(list(ep_tasks), type=pa.int64()),
+        "length": pa.array([length] * len(ep_tasks), type=pa.int64()),
         "tasks": pa.array([[d] for d in ep_tasks.values()], type=pa.list_(pa.string())),
     })
     pq.write_table(table, ep_dir / "file-000.parquet")
@@ -104,6 +105,8 @@ def test_build_eval_meta_episode_task_index(tmp_path):
     # 映射覆盖 episodes 表中全部 episode（meta 持久化整个映射，供按任务分析复用）
     assert meta["episode_task_index"] == {"0": 0, "2": 0, "5": 1, "9": 0}
     assert meta["task_names"] == {"0": "fold clothes", "1": "pour liquid"}
+    # episode_lengths 持久化每集帧数，供总样本/进度百分比估算
+    assert meta["episode_lengths"] == {"0": 100, "2": 100, "5": 100, "9": 100}
 
 
 def test_build_eval_meta_task_index_fallback_without_tasks_parquet(tmp_path):
@@ -116,3 +119,4 @@ def test_build_eval_meta_task_index_fallback_without_tasks_parquet(tmp_path):
     # 描述排序：fold clothes(0) / pour liquid(1)
     assert meta["episode_task_index"] == {"0": 1, "1": 0}
     assert meta["task_names"] == {"0": "fold clothes", "1": "pour liquid"}
+    assert meta["episode_lengths"] == {"0": 100, "1": 100}
