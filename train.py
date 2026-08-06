@@ -600,7 +600,7 @@ def main(args):
 
     # InfiniteDataReader 是无限流，不会抛 StopIteration，无需重启处理
     data_s = 0.0  # 累计本 log 间隔内 next(train_iter) 墙钟耗时（数据预处理+解码+IPC），算 DATA_PCT
-    grad_norm = 0.0  # 本 optimizer step 的梯度 L2 范数（grad clip 前/后），供日志
+    grad_norm = 0.0  # 本 optimizer step 的梯度 L2 范数（剪裁前），供日志
     while global_step < args.iters:
         # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
         # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
@@ -630,16 +630,15 @@ def main(args):
             loss = sum(loss_dict.values())
             accelerator.backward(loss)
 
-            # Grad clip（记录梯度 L2 范数供日志/监控；冻结参数 requires_grad=False，
-            # 其 grad 为 None，clip_grad_norm_ 自动忽略）
+            # 剪裁前的梯度 L2 范数（显式先算范数再做 clip，语义明确为“剪裁前”；
+            # clip_grad_norm_ 的返回值约定同为剪裁前，但依赖返回约定不直观）。
+            # 冻结参数 requires_grad=False，其 grad 为 None，两类计算均自动忽略。
             if accelerator.sync_gradients:
+                grad_norm = float(
+                    sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+                )
                 if args.max_grad_norm:
-                    gn = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    grad_norm = float(gn) if gn is not None else 0.0
-                else:
-                    grad_norm = float(
-                        sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-                    )
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                 optim.step()
                 optim.zero_grad()
