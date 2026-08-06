@@ -29,7 +29,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from datasets.utils import quat_to_rotate6d
+from xvla_datasets.utils import quat_to_rotate6d
 
 # 20 维 names（info.json features 用）
 ARM_NAMES_20 = [
@@ -64,13 +64,12 @@ def rewrite_parquet(src: Path, dst: Path) -> tuple[np.ndarray | None, np.ndarray
     返回转换后的 state/action 数组（供重算 stats.json），避免二次读表。
     """
     table = pq.read_table(src)
-    pydict = table.to_pydict()
-    new_cols = []
+    new_cols, new_names = [], []
     state20 = action20 = None
     for field in table.schema:
         name = field.name
         if name in ("observation.state", "action"):
-            rows = np.stack([np.asarray(r, dtype=np.float32) for r in pydict[name]])
+            rows = np.stack([np.asarray(r, dtype=np.float32) for r in table.column(name).to_pylist()])
             rows = convert_16_to_20(rows)
             if name == "observation.state":
                 state20 = rows
@@ -78,9 +77,11 @@ def rewrite_parquet(src: Path, dst: Path) -> tuple[np.ndarray | None, np.ndarray
                 action20 = rows
             arr = pa.FixedSizeListArray.from_arrays(pa.array(rows.reshape(-1), type=pa.float32()), 20)
         else:
-            arr = pa.array(pydict[name])
-        new_cols.append((name, arr))
-    new_table = pa.Table.from_arrays([a for _, a in new_cols], names=[c for c, _ in new_cols])
+            # 原列 ChunkedArray 零拷贝保留，避免 pa.array(pydict) 自动推断改变类型（如 float32->float64）
+            arr = table.column(name)
+        new_cols.append(arr)
+        new_names.append(name)
+    new_table = pa.Table.from_arrays(new_cols, names=new_names)
     dst.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(new_table, dst)
     return state20, action20
@@ -156,8 +157,11 @@ def main() -> None:
     for src in sorted(src_root.glob("meta/episodes/**/file-*.parquet")):
         dst = dst_root / src.relative_to(src_root)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        # 丢弃 stats 列
-        table = pq.read_table(src).drop([c for c in pq.read_table(src).column_names if c.startswith("stats/")])
+        # 丢弃 stats 列（只读一次，避免二次读表）
+        table = pq.read_table(src)
+        drop_cols = [c for c in table.column_names if c.startswith("stats/")]
+        if drop_cols:
+            table = table.drop(drop_cols)
         pq.write_table(table, dst)
     tasks_src = src_root / "meta" / "tasks.parquet"
     if tasks_src.exists():

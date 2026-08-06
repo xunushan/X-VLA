@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 import torch
 
-from datasets.dataset import InfiniteDataReader
-from datasets.domain_handler.lerobot_v3_robodojo import LeRobotV3RoboDojoHandler
+from xvla_datasets.dataset import InfiniteDataReader
+from xvla_datasets.domain_handler.lerobot_v3_robodojo import LeRobotV3RoboDojoHandler
 
 from conftest import DATA_ROOT, fake_frames
 
@@ -58,10 +58,10 @@ def test_reader_sample_pipeline(meta_file, monkeypatch):
 
 
 def test_domain_id_config():
-    from datasets.domain_config import DATA_DOMAIN_ID
+    from xvla_datasets.domain_config import DATA_DOMAIN_ID
     assert DATA_DOMAIN_ID["arx_x5_ee"] == 6
 
 
 def test_handler_registered():
-    from datasets.domain_handler.registry import get_handler_cls
+    from xvla_datasets.domain_handler.registry import get_handler_cls
     assert get_handler_cls("arx_x5_ee") is LeRobotV3RoboDojoHandler

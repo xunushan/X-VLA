@@ -29,7 +29,7 @@ import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
 
 from accelerate import Accelerator
-from datasets import create_dataloader
+from xvla_datasets import create_dataloader
 from models.configuration_xvla import XVLAConfig
 from models.modeling_xvla import XVLA
 from models.processing_xvla import XVLAProcessor

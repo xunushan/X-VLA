@@ -8,7 +8,7 @@ import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from datasets.domain_handler.lerobot_v3_robodojo import LeRobotV3RoboDojoHandler
+from xvla_datasets.domain_handler.lerobot_v3_robodojo import LeRobotV3RoboDojoHandler
 from tools.make_goai_20d import convert_16_to_20, rewrite_parquet
 
 

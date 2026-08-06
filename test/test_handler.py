@@ -11,11 +11,11 @@ import numpy as np
 import pytest
 import torch
 
-from datasets.domain_handler.lerobot_v3_robodojo import (
+from xvla_datasets.domain_handler.lerobot_v3_robodojo import (
     DEFAULT_CAMERA_KEYS,
     LeRobotV3RoboDojoHandler,
 )
-from datasets.utils import quat_to_rotate6d
+from xvla_datasets.utils import quat_to_rotate6d
 
 from conftest import DATA_ROOT, fake_frames
 
