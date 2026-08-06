@@ -223,7 +223,7 @@ run_phase "4-train-smoke" <<'PHASE4'
   tail -25 "${LOG}"
   echo "--- 日志格式检查 ---"
   check_log_line "${LOG}" "^[0-9]{2}:[0-9]{2}:[0-9]{2} \| [A-Z]+ \| train \| " "日志行格式 asctime|level|name|message"
-  check_log_line "${LOG}" "\[[0-9]+/120\] loss=[0-9.]+ grad_norm=[0-9.e+-]+ lr_core=[0-9.e-]+ lr_vlm=[0-9.e-]+" "step 日志含 loss/grad_norm/lr_core/lr_vlm（/120）"
+  check_log_line "${LOG}" "\[[0-9]+/120\] loss=[0-9.]+ grad_norm=[0-9.e+-]+ lr_core=[0-9.e+-]+ lr_vlm=[0-9.e+-]+" "step 日志含 loss/grad_norm/lr_core/lr_vlm（/120）"
   check_log_line "${LOG}" "effective_batch=32" "effective_batch=4×1×8=32（batch×world×accum）"
   check_log_line "${LOG}" "DATA_PCT=[0-9]+%" "每 step 数据预处理时间占比 DATA_PCT"
   check_log_line "${LOG}" "DECODE timing:.*ms/sample" "视频解码计时聚合（decode ms/样本 + fps + %）"

@@ -62,7 +62,12 @@ output_dir/
 - [x] `scripts/prune_checkpoints.py` + `scripts/prune_loop.sh`（默认 1 小时轮询）：
       model_state 只留最近 3 个；清理不完整/孤儿目录；`--keep_weights N` 可选裁剪权重
 - [x] 日志新增 `grad_norm`/`step`（#2 需求）：`grad_norm` 每 optimizer step 计算并打印/写入 tensorboard
-- [ ] 服务器回归：新布局下重跑阶段 4-6（验证保存/清理/`--resume latest` 配对）→ 2026-08-06 待跑
+- [x] 服务器回归：新布局下重跑阶段 4-6（验证保存/清理/`--resume latest` 配对）
+      → **2026-08-06 通过**：阶段 3 pytest 20 passed、阶段 5 resume（global_step 60→120、
+      optimizer 恢复、loss 连续 ratio=1.356）、阶段 6 跨冻结边界 resume 全 OK；
+      阶段 4 训练冒烟功能全过（3.3G 权重 / 6.6G optimizer、ratio=1.00、冻结边界、
+      effective_batch），唯一 FAIL 是测试脚本日志正则过时（已修 21b30c0 + 补 `+` 号，
+      `[0-9.e+-]+` 覆盖 0.00e+00 冻结态），修复后 12/12 行匹配
 
 ## Checkpoint / Resume（旧单目录布局，服务器已验证 2026-08-06）
 - [x] 服务器验证 resume：训练 N 步 → 中断 → `--resume latest` → 确认 global_step / optimizer
