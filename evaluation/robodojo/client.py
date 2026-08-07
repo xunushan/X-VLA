@@ -231,9 +231,11 @@ class RoboDojoPolicyClient:
             return t if not t.is_floating_point() else t.to(self.dtype)
 
         inputs = {
+            # generate_actions 期望 batch 维：input_ids [B,L]，image_input [B,V,C,H,W]，
+            # image_mask [B,V]（image_input/image_mask 由 _encode_observation 按 [V,C,H,W] 构造）。
             "input_ids": to_model(encoded["input_ids"]),
-            "image_input": to_model(encoded["image_input"]),
-            "image_mask": to_model(encoded["image_mask"]),
+            "image_input": to_model(encoded["image_input"].unsqueeze(0)),
+            "image_mask": to_model(encoded["image_mask"].unsqueeze(0)),
             "domain_id": to_model(torch.tensor([self.domain_id], dtype=torch.long)),
             "proprio": to_model(torch.from_numpy(encoded["state20"])[None]),
         }
