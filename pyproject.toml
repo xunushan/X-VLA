@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xvla"
+version = "0.1.0"
+description = "X-VLA：基于视觉语言模型的动作生成（action_mode=arx_ee6d，20d 动作）。"
+readme = "README.md"
+requires-python = ">=3.10"
+# 注意：torch / torchvision 由 conda 环境（environment.yml）提供，不在此声明，
+# 避免 pip 在 server 上拉取不匹配的 CUDA 版本。其余依赖与 requirements.txt 对齐。
+dependencies = [
+    "numpy==1.26.3",
+    "scipy==1.15.0",
+    "transformers<=4.51.3",
+    "einops==0.8.1",
+    "timm==1.0.12",
+    "mmengine==0.10.5",
+    "pyarrow==20.0.0",
+    "h5py==3.12.1",
+    "av==15.0.0",
+    "opencv-python>=4.8.0",
+    "Pillow>=9.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn==0.34.3",
+    "json_numpy==2.1.0",
+    "safetensors==0.4.5",
+    "accelerate==1.2.1",
+    "peft==0.17.1",
+    "mediapy==1.2.4",
+    "tensorboard>=2.14.0",
+]
+
+[tool.setuptools]
+# flat 顶层包布局（与仓库现有导入方式一致，零重构）。
+# evaluation.libero 等无 __init__.py 的子目录不入包。
+packages = [
+    "models",
+    "xvla_datasets",
+    "xvla_datasets.domain_handler",
+    "evaluation",
+    "evaluation.robodojo",
+]
