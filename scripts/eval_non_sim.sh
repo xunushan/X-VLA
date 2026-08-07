@@ -18,6 +18,9 @@
 #   XVLA_DATA_ROOT   20 维数据集根目录（转换后的 6d 数据）
 #   XVLA_OUTPUT_DIR  评估输出目录（默认 /data/outputs/<模型名>_eval）
 #   XVLA_EVAL_STRIDE 帧采样步长（默认 1=全部帧）
+#   XVLA_NUM_VIEWS   输入模型视角数（默认 3；1=只用第 0 路相机，其余视角不用）
+#   XVLA_DOMAIN_ID   覆盖 domain_id（默认空=按 robot_type 查 DATA_DOMAIN_ID）
+#   XVLA_INVERT_GRIPPER  true/1 时 20d->16d 转换反转预测 gripper（模型 gripper 约定与数据相反时用；默认 false）
 #
 # 用法：
 #   服务器：bash scripts/eval_non_sim.sh
@@ -38,6 +41,21 @@ OUT_DIR="${XVLA_OUTPUT_DIR:-/data/outputs/${MODEL_NAME}_eval}"
 EVAL_STRIDE="${XVLA_EVAL_STRIDE:-1}"
 EVAL_BATCH_SIZE="${XVLA_BATCH_SIZE:-8}"
 EVAL_NUM_WORKERS="${XVLA_NUM_WORKERS:-0}"
+NUM_VIEWS="${XVLA_NUM_VIEWS:-3}"
+DOMAIN_ID="${XVLA_DOMAIN_ID:-}"
+INVERT_GRIPPER="${XVLA_INVERT_GRIPPER:-false}"
+
+# 可选参数（空值不传，保持默认）。用字符串拼接而非数组，兼容 bash 3.2（macOS 默认）下
+# set -u + 空数组展开报 unbound variable 的问题；值均为数字/开关，无空白字符。
+DOMAIN_ID_ARG=""
+if [ -n "${DOMAIN_ID}" ]; then
+  DOMAIN_ID_ARG="--domain-id ${DOMAIN_ID}"
+fi
+if [ "${INVERT_GRIPPER}" = "true" ] || [ "${INVERT_GRIPPER}" = "1" ]; then
+  GRIPPER_ARG="--invert-gripper"
+else
+  GRIPPER_ARG="--no-invert-gripper"
+fi
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
@@ -60,6 +78,7 @@ echo "[eval_non_sim] model    : ${MODEL}"
 echo "[eval_non_sim] dataset  : ${DATA_ROOT}"
 echo "[eval_non_sim] split    : ${SPLIT_FILE} (val)"
 echo "[eval_non_sim] output   : ${OUT_DIR}"
+echo "[eval_non_sim] num_views: ${NUM_VIEWS} | domain_id: ${DOMAIN_ID:-<auto>} | invert_gripper: ${INVERT_GRIPPER}"
 
 # 1. 提前创建评估 meta.json（val episodes）
 PYTHONPATH="${PROJECT_ROOT}" python "${PROJECT_ROOT}/evaluation/evaluate.py" \
@@ -78,6 +97,9 @@ PYTHONPATH="${PROJECT_ROOT}" python "${PROJECT_ROOT}/evaluation/evaluate.py" \
   --frame-stride "${EVAL_STRIDE}" \
   --batch-size "${EVAL_BATCH_SIZE}" \
   --num-workers "${EVAL_NUM_WORKERS}" \
+  --num-views "${NUM_VIEWS}" \
+  $DOMAIN_ID_ARG \
+  "${GRIPPER_ARG}" \
   --convert-20d-to-16d
 
 # 3. 打印指标（含按任务拆分）

@@ -239,10 +239,13 @@ def collect_rows(
     pred: torch.Tensor,
     convert_20d_to_16d: bool,
     episode_task_index: dict[int, int] | None = None,
+    invert_gripper: bool = False,
 ) -> list[dict]:
     """把一批预测结果转成 metric.py 所需的行（episode/frame + 展平后的 16d chunk）。
 
     episode_task_index 提供时，行级附带 task_index（episode 回溯，未映射取 -1）。
+    invert_gripper=True 时仅对预测 gripper 做 1-g（模型 gripper 约定与数据相反的场景，
+    expert 保持数据原约定，metric 才能在统一约定下比较）。
     """
     rows: list[dict] = []
     for i in range(len(batch["episode_index"])):
@@ -251,7 +254,7 @@ def collect_rows(
         predicted = pred[i].float().cpu().numpy()
         if convert_20d_to_16d:
             expert = xvla20_to_ee16(expert)
-            predicted = xvla20_to_ee16(predicted)
+            predicted = xvla20_to_ee16(predicted, invert_gripper=invert_gripper)
         row: dict = {
             "episode_index": ep,
             "frame_index": int(batch["frame_index"][i]),
@@ -275,6 +278,7 @@ def run_evaluation(
     convert_20d_to_16d: bool = True,
     episode_task_index: dict[int, int] | None = None,
     num_workers: int = 0,
+    invert_gripper: bool = False,
 ) -> pd.DataFrame:
     """确定性批量预测，返回含 episode_index/frame_index/expert/predicted chunk 的 DataFrame。
 
@@ -306,7 +310,15 @@ def run_evaluation(
     rows: list[dict] = []
     for i, batch in enumerate(loader):
         pred = predict_batch(model, processor, batch, device, dtype, steps=steps)
-        rows.extend(collect_rows(batch, pred, convert_20d_to_16d, episode_task_index=episode_task_index))
+        rows.extend(
+            collect_rows(
+                batch,
+                pred,
+                convert_20d_to_16d,
+                episode_task_index=episode_task_index,
+                invert_gripper=invert_gripper,
+            )
+        )
         done = i + 1
         if done % interval == 0 or (total_batches_est and done == total_batches_est):
             if total_batches_est:
@@ -350,6 +362,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-stride", type=int, default=1, help="帧采样步长（1=全部帧；25 与先前评估一致）")
     parser.add_argument("--execution-steps", type=int, default=None, help="execution_window 步数（默认=num_actions）")
     parser.add_argument("--plot-stride", type=int, default=25, help="时序图降采样步长")
+    parser.add_argument("--num-views", type=int, default=3, help="输入模型视角数（1=只用第 0 路相机，其余视角 mask 为 0）")
+    parser.add_argument("--domain-id", type=int, default=None, help="覆盖 domain_id（缺省按 robot_type 查 DATA_DOMAIN_ID）")
+    parser.add_argument("--invert-gripper", action=argparse.BooleanOptionalAction, default=False, help="20d->16d 转换时反转预测 gripper（模型 gripper 约定与数据相反时用）")
     parser.add_argument("--convert-20d-to-16d", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--make-meta-only", action="store_true", help="只生成评估 meta.json 后退出")
@@ -403,9 +418,10 @@ def main() -> None:
     reader = EvalDataReader(
         metas,
         num_actions=model.num_actions,
-        num_views=3,
+        num_views=args.num_views,
         action_mode=model.action_mode,
         frame_stride=args.frame_stride,
+        domain_id=args.domain_id,
     )
     # episode_index -> task_index 回溯（优先用 meta 内置映射；旧 meta 缺键时读数据表）
     meta = next(iter(reader.metas.values()))
@@ -423,6 +439,7 @@ def main() -> None:
         convert_20d_to_16d=args.convert_20d_to_16d,
         episode_task_index=episode_task_index,
         num_workers=args.num_workers,
+        invert_gripper=args.invert_gripper,
     )
     if df.empty:
         raise RuntimeError("evaluation produced no frames")
@@ -441,6 +458,9 @@ def main() -> None:
         "dtype": args.dtype,
         "convert_20d_to_16d": bool(args.convert_20d_to_16d),
         "frame_stride": reader.frame_stride,
+        "num_views": reader.num_views,
+        "domain_id": args.domain_id,
+        "invert_gripper": bool(args.invert_gripper),
         **metrics,
     }
 
