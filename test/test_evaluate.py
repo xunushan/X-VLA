@@ -13,6 +13,8 @@ import pytest
 import torch
 from torch.utils.data import IterableDataset
 
+from xvla_datasets.eval_data import _shard_indices
+
 from evaluation import evaluate as ev
 from evaluation.evaluate import (
     collect_rows,
@@ -190,6 +192,18 @@ def test_collect_rows_converts_16d():
         np.array(rows[0]["expert_action_chunk"]),
         xvla20_to_ee16(expert[0]).reshape(-1),
         atol=1e-4,
+    )
+
+
+def test_shard_indices():
+    """多 worker 下 episode 索引互不重叠、并集完整；单 worker 返回全量。"""
+    assert list(_shard_indices(10, 1, 0)) == list(range(10))
+    assert list(_shard_indices(10, 3, 0)) == [0, 3, 6, 9]
+    assert list(_shard_indices(10, 3, 1)) == [1, 4, 7]
+    assert list(_shard_indices(10, 3, 2)) == [2, 5, 8]
+    assert (
+        set(_shard_indices(10, 3, 0)) | set(_shard_indices(10, 3, 1)) | set(_shard_indices(10, 3, 2))
+        == set(range(10))
     )
 
 

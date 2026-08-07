@@ -45,6 +45,18 @@ def eval_collate(batch: list[dict]) -> dict:
     return out
 
 
+def _shard_indices(n: int, n_workers: int, worker_id: int) -> range:
+    """把 [0, n) 均匀切分给各 DataLoader worker（互不重叠，stride=n_workers）。
+
+    IterableDataset 在 num_workers>0 时每个 worker 都会独立迭代整个 __iter__，
+    不做切分会导致每个 episode 被所有 worker 重复解码/重复预测。评估按 episode
+    均分即可：各 worker 解码互不重叠的子集，多核并行 + 与主进程预测重叠。
+    """
+    if n_workers <= 1:
+        return range(n)
+    return range(worker_id, n, n_workers)
+
+
 class EvalDataReader(IterableDataset):
     """非仿真评估数据读取器：确定性遍历 val episodes，产出模型输入 + expert 动作 chunk。
 
@@ -88,13 +100,19 @@ class EvalDataReader(IterableDataset):
         self.frame_stride = max(1, int(frame_stride))
 
     def __iter__(self):
+        # num_workers>0 时每个 worker 独立运行 __iter__：按 worker id 切分 episode，
+        # 各 worker 解码互不重叠的子集，多核并行解码并与主进程预测重叠
+        w = torch.utils.data.get_worker_info()
+        n_workers = w.num_workers if w else 1
+        worker_id = w.id if w else 0
+
         for dataset_name, meta in self.metas.items():
             robot_type = meta.get("robot_type", dataset_name)
             Handler = get_handler_cls(robot_type)
             handler = Handler(meta=meta, num_views=self.num_views)
             domain_id = torch.tensor(DATA_DOMAIN_ID.get(robot_type, 0))
 
-            for traj_idx in range(len(meta["datalist"])):
+            for traj_idx in _shard_indices(len(meta["datalist"]), n_workers, worker_id):
                 for sample in handler.iter_episode(
                     traj_idx,
                     num_actions=self.num_actions,

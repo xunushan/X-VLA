@@ -274,6 +274,7 @@ def run_evaluation(
     steps: int = 10,
     convert_20d_to_16d: bool = True,
     episode_task_index: dict[int, int] | None = None,
+    num_workers: int = 0,
 ) -> pd.DataFrame:
     """确定性批量预测，返回含 episode_index/frame_index/expert/predicted chunk 的 DataFrame。
 
@@ -284,7 +285,7 @@ def run_evaluation(
         batch_size=batch_size,
         shuffle=False,
         collate_fn=eval_collate,
-        num_workers=0,  # IterableDataset 多进程会重复迭代，评估单进程即可
+        num_workers=num_workers,  # eval_data.__iter__ 已按 worker 切分 episode，多进程才不重复
     )
     # 用 episode 长度估算总 batch 数，给出进度百分比（不读 state；不含静止段剔除，实际略少）
     meta = next(iter(getattr(reader, "metas", {}).values())) if getattr(reader, "metas", None) else {}
@@ -342,6 +343,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-name", type=str, default="goai_arx_6d_eval")
     parser.add_argument("--output-dir", type=str, default="outputs/eval")
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader 工作进程数（按 episode 切分并行解码；0=单进程）")
     parser.add_argument("--device", type=str, default=None, help="如 cuda:0 / cpu；缺省自动选择")
     parser.add_argument("--dtype", type=str, default="float32", help="float32 / bfloat16")
     parser.add_argument("--steps", type=int, default=10, help="generate_actions 去噪步数")
@@ -420,6 +422,7 @@ def main() -> None:
         steps=args.steps,
         convert_20d_to_16d=args.convert_20d_to_16d,
         episode_task_index=episode_task_index,
+        num_workers=args.num_workers,
     )
     if df.empty:
         raise RuntimeError("evaluation produced no frames")

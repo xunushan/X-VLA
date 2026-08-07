@@ -36,6 +36,8 @@ DATA_ROOT="${XVLA_DATA_ROOT:-/data/data/lerobot_v30_ee_6d}"
 MODEL_NAME="$(basename "${MODEL}")"
 OUT_DIR="${XVLA_OUTPUT_DIR:-/data/outputs/${MODEL_NAME}_eval}"
 EVAL_STRIDE="${XVLA_EVAL_STRIDE:-1}"
+EVAL_BATCH_SIZE="${XVLA_BATCH_SIZE:-8}"
+EVAL_NUM_WORKERS="${XVLA_NUM_WORKERS:-0}"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
@@ -74,6 +76,8 @@ PYTHONPATH="${PROJECT_ROOT}" python "${PROJECT_ROOT}/evaluation/evaluate.py" \
   --metas "${EVAL_META}" \
   --output-dir "${OUT_DIR}" \
   --frame-stride "${EVAL_STRIDE}" \
+  --batch-size "${EVAL_BATCH_SIZE}" \
+  --num-workers "${EVAL_NUM_WORKERS}" \
   --convert-20d-to-16d
 
 # 3. 打印指标（含按任务拆分）
