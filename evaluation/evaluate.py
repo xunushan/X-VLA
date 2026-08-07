@@ -52,6 +52,7 @@ from tools.metric import (  # noqa: E402
     save_metrics_by_task_plots,
     save_metrics_plots,
 )
+from xvla_datasets import timing  # noqa: E402
 from xvla_datasets.eval_data import EvalDataReader, eval_collate  # noqa: E402
 from xvla_datasets.utils import load_episode_indices, xvla20_to_ee16  # noqa: E402
 
@@ -312,6 +313,17 @@ def run_evaluation(
                 print(f"[evaluate] batch {done}/{total_batches_est} ({pct:.0f}%) done, {len(rows)} frames")
             else:
                 print(f"[evaluate] {done} batches done, {len(rows)} frames")
+    # 视频解码耗时汇总（handler 的 record_decode/record_sample 一直在进程内累计，
+    # 无需设 XVLA_TIMING_DIR 也能读；用于量化瓶颈：decode vs 总墙钟）
+    timing.flush()
+    _tstate = timing._state
+    if _tstate["decode_s"] > 0 or _tstate["samples"] > 0:
+        per_ms = 1000.0 * _tstate["decode_s"] / max(1, _tstate["samples"])
+        print(
+            f"[evaluate] decode timing: {_tstate['decode_s']:.1f}s video decode "
+            f"for {_tstate['samples']} samples ({per_ms:.0f} ms/sample), "
+            f"{_tstate['frames']} frames decoded"
+        )
     return pd.DataFrame(rows)
 
 
