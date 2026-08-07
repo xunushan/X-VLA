@@ -150,6 +150,42 @@ def test_image_pipeline_matches_training(image_aug):
     assert torch.equal(ours, training)
 
 
+def test_invert_gripper_false_reference_convention(make_client):
+    """参考 ee6d 模型约定：invert_gripper=False → 输入/输出 gripper 均不反转。"""
+    client = make_client(invert_gripper=False)
+    obs = _make_obs(14)
+    encoded = client._encode_observation(obs)
+    # 输入：20d gripper = 16d 原值（1=开，不反转）
+    assert np.isclose(encoded["state20"][9], obs["state"]["left_ee_joint_state"][0])
+    assert np.isclose(encoded["state20"][19], obs["state"]["right_ee_joint_state"][0])
+
+    # 输出：模型输出（=state20 平铺）不反转 → 回到 obs 原值
+    client.update_obs(obs)
+    actions = client.get_action()
+    for a in actions:
+        assert np.isclose(a["left_ee_joint_state"][0], obs["state"]["left_ee_joint_state"][0], atol=1e-6)
+        assert np.isclose(a["right_ee_joint_state"][0], obs["state"]["right_ee_joint_state"][0], atol=1e-6)
+
+
+def test_valid_views_reference_convention(make_client):
+    """参考模型只训 cam_head：valid_views=1 → image_mask 前置 True，其余 False。"""
+    client = make_client(valid_views=1)
+    obs = _make_obs(15)
+    encoded = client._encode_observation(obs)
+    assert encoded["image_input"].shape == (3, 3, 224, 224)  # 仍提取 3 路，但 mask 只留 1 路
+    assert encoded["image_mask"].tolist() == [True, False, False]
+
+    client2 = make_client(valid_views=1, camera_keys=["observation.images.cam_high"])
+    encoded2 = client2._encode_observation(obs)
+    assert encoded2["image_input"].shape == (1, 3, 224, 224)  # 只提取 1 路
+    assert encoded2["image_mask"].tolist() == [True]
+
+    with pytest.raises(ValueError):
+        make_client(valid_views=0)._encode_observation(obs)
+    with pytest.raises(ValueError):
+        make_client(valid_views=4)._encode_observation(obs)
+
+
 # =============================================================================
 # 后处理：全 chunk / 截断 / reset
 # =============================================================================
