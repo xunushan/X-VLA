@@ -264,7 +264,6 @@ def save_metrics_plots(
     # 转换数据
     expert_raw = np.array(df["expert_action_chunk"].tolist())
     pred_raw = np.array(df["predicted_action_chunk"].tolist())
-    frame_indices = np.asarray(df["frame_index"].tolist())
 
     N = len(df)
     chunk_size = expert_raw.shape[1] // 16
@@ -274,10 +273,33 @@ def save_metrics_plots(
     expert_first = expert_raw.reshape(N, chunk_size, action_dim)[:, 0, :]  # [N, 16]
     pred_first = pred_raw.reshape(N, chunk_size, action_dim)[:, 0, :]  # [N, 16]
 
-    # 降采样用于时序图
-    vis_idx = frame_indices[::stride]
-    vis_expert = expert_first[::stride]
-    vis_pred = pred_first[::stride]
+    # ---- 去重 + 排序：同一 (episode, frame) 仅保留一行，按 episode 内帧序排布。
+    # 原始 df 可能多 worker 交错或含重复行；不处理会让时序图在 episode 之间乱连。----
+    plot_df = df[["episode_index", "frame_index"]].astype(int).copy()
+    plot_df = plot_df.drop_duplicates().sort_values(["episode_index", "frame_index"])
+    if plot_df.empty:
+        return
+    sel = plot_df.index.to_numpy()  # 排序后选中的原始 df 行位置
+    ep_arr = plot_df["episode_index"].to_numpy()
+    frame_arr = plot_df["frame_index"].to_numpy()
+
+    # stride 采样：在每集内部按帧序均匀抽帧（每集保留首行），而非按全局行切一刀
+    if stride > 1:
+        keep = np.zeros(len(plot_df), dtype=bool)
+        bounds = np.flatnonzero(np.concatenate(([True], ep_arr[1:] != ep_arr[:-1], [True])))
+        for lo, hi in zip(bounds[:-1], bounds[1:], strict=True):
+            keep[lo:hi:stride] = True
+        sel, ep_arr, frame_arr = sel[keep], ep_arr[keep], frame_arr[keep]
+
+    vis_expert = expert_first[sel]  # [M, 16]
+    vis_pred = pred_first[sel]  # [M, 16]
+
+    # 每集一条线段；集数过多时均匀抽样显示，均值线始终基于全部采样帧
+    all_eps = np.unique(ep_arr)
+    EPISODE_CAP = 30
+    shown_eps = all_eps
+    if len(all_eps) > EPISODE_CAP:
+        shown_eps = all_eps[np.linspace(0, len(all_eps) - 1, EPISODE_CAP).astype(int)]
 
     # ---- 时序图（每组一行，6 张）----
     for group_name, indices in ACTION_GROUPS.items():
@@ -288,13 +310,23 @@ def save_metrics_plots(
         )
         axes = np.atleast_1d(axes)
         for ax, dim in zip(axes, indices, strict=True):
-            ax.plot(vis_idx, vis_expert[:, dim], label="expert", linewidth=1.8)
-            ax.plot(vis_idx, vis_pred[:, dim], label="predicted", linestyle="--", linewidth=1.5)
+            # 每集一条单调线段（帧序在集内递增，不跨集乱连），低透明度叠成带
+            for ep_id in shown_eps:
+                m = ep_arr == ep_id
+                ax.plot(frame_arr[m], vis_expert[m, dim], color="#4C72B0", lw=0.9, alpha=0.35)
+                ax.plot(frame_arr[m], vis_pred[m, dim], color="#DD8452", lw=0.9, alpha=0.35, linestyle="--")
+            # 按帧对齐的跨集均值（去噪，标出总体趋势）
+            agg = pd.DataFrame(
+                {"frame": frame_arr, "expert": vis_expert[:, dim], "pred": vis_pred[:, dim]}
+            ).groupby("frame", as_index=False).mean()
+            ax.plot(agg["frame"], agg["expert"], color="#4C72B0", lw=2.2, label="expert (mean)")
+            ax.plot(agg["frame"], agg["pred"], color="#DD8452", lw=2.2, linestyle="--", label="predicted (mean)")
             ax.set_ylabel(ACTION_NAMES[dim])
             ax.grid(alpha=0.25)
         axes[0].legend()
-        axes[-1].set_xlabel("frame index")
-        fig.suptitle(f"{group_name} — expert vs predicted (stride={stride})", fontsize=11)
+        axes[-1].set_xlabel("frame index within episode")
+        cap_note = "" if len(shown_eps) == len(all_eps) else f", showing {len(shown_eps)}/{len(all_eps)} episodes"
+        fig.suptitle(f"{group_name} — expert vs predicted (stride={stride}{cap_note})", fontsize=11)
         fig.tight_layout()
         fig.savefig(output_dir / f"{group_name}_timeseries.png", dpi=150)
         plt.close(fig)

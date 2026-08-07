@@ -135,6 +135,32 @@ def test_save_metrics_plots(tmp_path):
         assert p.stat().st_size > 0
 
 
+def test_save_metrics_plots_unsorted_dedup(tmp_path):
+    """乱序 + 重复 (episode, frame) 的多集数据也能画时序图（先排序去重，再按集画线）。"""
+    chunk = 2
+
+    def row(ep, frame, val):
+        return {
+            "episode_index": ep,
+            "frame_index": frame,
+            "expert_action_chunk": list(np.full(chunk * 16, val)),
+            "predicted_action_chunk": list(np.full(chunk * 16, val + 0.1)),
+        }
+
+    # 行乱序，且 (ep0, frame0) 重复出现两行（去重应只留 1 行）
+    df = pd.DataFrame([
+        row(1, 0, 1.0),
+        row(0, 0, 2.0),
+        row(0, 25, 2.5),
+        row(0, 0, 2.0),  # 重复 (0, 0)
+        row(2, 0, 3.0),
+        row(1, 25, 1.5),
+    ])
+    m = compute_metrics(df, chunk_size=chunk)
+    save_metrics_plots(tmp_path, df, m, stride=1)
+    assert (tmp_path / "left_position_timeseries.png").is_file()
+
+
 def make_df_with_task(n=4, chunk=30):
     """构造含 task_index 列的 df：episode 0/1/2 -> task 0，episode 3 -> task 1。"""
     df = make_df(chunk=chunk, n=n)
