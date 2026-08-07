@@ -22,6 +22,7 @@ dependencies = [
     "av==15.0.0",
     "opencv-python>=4.8.0",
     "Pillow>=9.0.0",
+    "pandas>=2.0.0",
     "fastapi>=0.100.0",
     "uvicorn==0.34.3",
     "json_numpy==2.1.0",
@@ -41,4 +42,5 @@ packages = [
     "xvla_datasets.domain_handler",
     "evaluation",
     "evaluation.robodojo",
+    "tools",
 ]
