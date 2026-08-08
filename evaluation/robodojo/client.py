@@ -7,6 +7,13 @@
 #   - 图像管线 = 训练一致 Resize(224,224,BICUBIC) + ImageNet 归一化；
 #   - 全 chunk 模式：每次 get_action 运行一次 generate_actions，返回完整
 #     num_actions 个动作（仿真端执行完一个 chunk 后再请求下一次预测）。
+#
+# 可配置约定（deploy.yml / cfg，默认值保持本模型 arx_ee6d 行为）：
+#   - invert_gripper (默认 true)：输入/输出 gripper 是否做 1-g 反转。本模型训练
+#     数据 1=闭合 → true；参考官方 ee6d 模型 1=开（输出 sigmoid 开合概率）→ false。
+#   - valid_views (默认 null=全部)：image_mask 前置有效视角数。本模型 3 路全用；
+#     参考模型只训 cam_head → 设 1（其余视角 mask=false，等价参考侧补零，不进网络）。
+#   - domain_id (默认 6)：索引 transformer 逐 domain 软 prompt/投影；参考模型用 0。
 # ------------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -124,6 +131,14 @@ class RoboDojoPolicyClient:
         self.log_io = bool(self.cfg.get("log_io", True))
         self.steps = int(self.cfg.get("steps", 10))
         self.domain_id = int(self.cfg.get("domain_id", 6))  # DATA_DOMAIN_ID["arx_x5_ee"]
+        # gripper 反转约定：本模型（arx_ee6d，训练数据 1=闭合）默认 True；
+        # 参考官方 ee6d 模型（1=开，proprio/action 输入夹爪被 preprocess 清零、
+        # 输出为 sigmoid 后的开合概率）需设 False。
+        self.invert_gripper = bool(self.cfg.get("invert_gripper", True))
+        # image_mask 有效视角数：None → 全部提取相机有效（本模型）；
+        # 参考模型只训过 cam_head，需设 1（其余视角 mask=False，等价于参考侧补零）。
+        valid_views = self.cfg.get("valid_views", None)
+        self.valid_views: int | None = None if valid_views is None else int(valid_views)
         self.model_id = self._resolve_model_id(self.cfg)
         self._latest_obs: dict[str, Any] | None = None
         self._latest_obs_batch: list[dict[str, Any]] = []
@@ -192,13 +207,15 @@ class RoboDojoPolicyClient:
             "num_actions": self.num_actions,
             "actions_per_chunk": self.actions_per_chunk,
             "domain_id": self.domain_id,
+            "invert_gripper": self.invert_gripper,
+            "valid_views": self.valid_views,
             "image_pipeline": "Resize(224,224,BICUBIC)+ToTensor+ImageNetNormalize",
         })
 
     # ------------------------------------------------------------------ 预处理
     def _encode_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         state16 = _state16(observation)
-        state20 = ee16_to_xvla20(state16, invert_gripper=True)  # 输入 gripper 反转
+        state20 = ee16_to_xvla20(state16, invert_gripper=self.invert_gripper)  # 输入 gripper 反转（按配置）
         instruction = str(observation.get("instruction", ""))[:200]
 
         image_tensors: list[torch.Tensor] = []
@@ -209,7 +226,12 @@ class RoboDojoPolicyClient:
             pil = Image.fromarray(np.asarray(image)[..., :3])
             image_tensors.append(self.image_aug(pil))
         image_input = torch.stack(image_tensors, dim=0)  # [V,3,224,224]
-        image_mask = torch.ones(image_input.shape[0], dtype=torch.bool)
+        n_views = image_input.shape[0]
+        n_valid = n_views if self.valid_views is None else self.valid_views
+        if n_valid < 1 or n_valid > n_views:
+            raise ValueError(f"valid_views must be in [1, {n_views}], got {n_valid}")
+        image_mask = torch.zeros(n_views, dtype=torch.bool)
+        image_mask[:n_valid] = True
 
         lang = self.processor.encode_language([instruction])
         return {
@@ -292,7 +314,7 @@ class RoboDojoPolicyClient:
 
         encoded = self._encode_observation(observation)
         chunk20 = self._run_model(encoded)  # [num_actions, 20]
-        chunk16 = xvla20_to_ee16(chunk20, invert_gripper=True, clip_gripper=True)  # [num_actions, 16]
+        chunk16 = xvla20_to_ee16(chunk20, invert_gripper=self.invert_gripper, clip_gripper=True)  # [num_actions, 16]
         chunk16 = self._sanitize_action_chunk(chunk16)
         actions = self._unpack_action_chunk(chunk16)
         if self.actions_per_chunk < self.num_actions:

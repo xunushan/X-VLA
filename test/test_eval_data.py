@@ -7,11 +7,18 @@ from __future__ import annotations
 import itertools
 import json
 
+import av
+import numpy as np
 import pytest
 import torch
 
 from xvla_datasets.domain_handler.lerobot_v3_robodojo import LeRobotV3RoboDojoHandler
-from xvla_datasets.eval_data import EvalDataReader, eval_collate
+from xvla_datasets.eval_data import (
+    EvalDataReader,
+    StridedVideoHandler,
+    _seek_frame,
+    eval_collate,
+)
 
 from conftest import DATA_ROOT, fake_frames, fake_state
 
@@ -116,12 +123,23 @@ def test_expert_chunk_matches_abs_trajectory(meta_json, monkeypatch):
     assert torch.allclose(s["expert_action_chunk"], expect, atol=1e-5)
 
 
+def _fake_decode(self, cam, ep, indices=None):
+    """同时充当父类全量解码与 seek 子类按索引解码的假实现（stride>1 时 EvalDataReader 用 seek 子类）。
+
+    帧数与 ep["length"] 一致（真实数据不变量：视频段帧数 == meta length），
+    64×64 小帧保证 stride=25 也有多个候选；内容无关，image_aug 测试里恒为零张量。
+    """
+    n = max(1, int(ep["length"]))
+    fr = fake_frames(n, h=64, w=64)
+    if indices is None:
+        return fr
+    return {i: fr[i] for i in indices}
+
+
 def test_frame_stride(meta_json, monkeypatch):
-    monkeypatch.setattr(
-        LeRobotV3RoboDojoHandler,
-        "_decode_episode_video",
-        lambda self, cam, ep: fake_frames(40),
-    )
+    monkeypatch.setattr(LeRobotV3RoboDojoHandler, "_decode_episode_video", _fake_decode)
+    # stride>1 时 EvalDataReader 改用 StridedVideoHandler（seek 子类），需同时 patch 子类方法
+    monkeypatch.setattr(StridedVideoHandler, "_decode_episode_video", _fake_decode)
     monkeypatch.setattr(
         LeRobotV3RoboDojoHandler,
         "_read_state",
@@ -136,6 +154,136 @@ def test_frame_stride(meta_json, monkeypatch):
     assert f2 <= f1
     assert all(f % 2 == 0 for f in f2)
     assert len(s2) < len(s1) if len(s1) > 1 else True
+
+
+# ---------------------------------------------------------------- seek 解码正确性
+def _make_video(path, n=120, fps=25, h=64, w=64):
+    """编码一集纯色视频（第 k 帧为灰度值 k），用于验证 seek 逐帧解码与顺序解码一致。"""
+    c = av.open(str(path), "w", format="mp4")
+    s = c.add_stream("libx264", rate=fps)
+    s.width, s.height = w, h
+    s.pix_fmt = "yuv420p"
+    for i in range(n):
+        frame = av.VideoFrame.from_ndarray(
+            np.full((h, w, 3), i % 256, dtype=np.uint8), format="rgb24"
+        )
+        for pkt in s.encode(frame):
+            c.mux(pkt)
+    for pkt in s.encode():
+        c.mux(pkt)
+    c.close()
+    return path
+
+
+def test_seek_frame_matches_sequential(tmp_path):
+    """_seek_frame 逐帧 seek 解码的结果，与父类顺序全量解码逐帧一致（核心正确性）。"""
+    n = 120
+    path = _make_video(tmp_path / "test.mp4", n=n)
+    fps = 25.0
+    from_ts, to_ts = 0.0, n / fps
+    tol = 0.5 / fps
+
+    c_seq = av.open(str(path))
+    stream = c_seq.streams.video[0]
+    c_seq.seek(int(from_ts / stream.time_base), stream=stream)
+    full = []
+    for packet in c_seq.demux(stream):
+        for frame in packet.decode():
+            if frame.pts is None:
+                continue
+            ts = float(frame.pts) * stream.time_base
+            if ts < from_ts - tol:
+                continue
+            if ts >= to_ts - tol:
+                break
+            full.append(frame.to_ndarray(format="rgb24"))
+    c_seq.close()
+    assert len(full) == n
+
+    c = av.open(str(path))
+    stream = c.streams.video[0]
+    for idx in (0, 1, 5, 24, 25, 26, 50, 99, 119):
+        got = _seek_frame(c, stream, from_ts + idx / fps, from_ts, to_ts, tol)
+        assert got is not None, f"idx {idx} not found"
+        np.testing.assert_array_equal(got, full[idx])
+    # 越界（target 在段尾之外）→ None
+    assert _seek_frame(c, stream, to_ts - 0.01, from_ts, to_ts, tol) is None
+    c.close()
+
+
+# ---------------------------------------------------------------- StridedVideoHandler 对拍
+def _fast_handler(meta_json, frame_stride, monkeypatch):
+    """构建 StridedVideoHandler（假视频/假 state），并同时 patch 父类与子类解码方法。"""
+    monkeypatch.setattr(LeRobotV3RoboDojoHandler, "_decode_episode_video", _fake_decode)
+    monkeypatch.setattr(StridedVideoHandler, "_decode_episode_video", _fake_decode)
+    monkeypatch.setattr(
+        LeRobotV3RoboDojoHandler,
+        "_read_state",
+        lambda self, ep: fake_state(int(ep["length"]), seed=int(ep["episode_index"])),
+    )
+    return StridedVideoHandler(
+        meta=json.load(open(meta_json)), num_views=3, frame_stride=frame_stride
+    )
+
+
+def _iter_full(handler, img):
+    """按 (episode, frame) 收集父类全量 iter_episode 的样本（供对拍）。"""
+    out = {}
+    for traj_idx in range(len(handler.meta["datalist"])):
+        for s in handler.iter_episode(
+            traj_idx, num_actions=30, training=False, image_aug=img, frame_info=True
+        ):
+            out[(s["episode_index"], s["frame_index"])] = s
+    return out
+
+
+def test_strided_handler_stride1_equals_parent(meta_json, monkeypatch):
+    """stride=1 时 fast 子类完全委托父类 → 逐样本输出一致。"""
+    img = lambda x: torch.zeros(3, 224, 224)
+    parent = LeRobotV3RoboDojoHandler(
+        meta=json.load(open(meta_json)), num_views=3
+    )
+    fast = _fast_handler(meta_json, frame_stride=1, monkeypatch=monkeypatch)
+    assert len(parent.meta["datalist"]) == len(fast.meta["datalist"])
+    for traj_idx in range(len(parent.meta["datalist"])):
+        a = list(parent.iter_episode(
+            traj_idx, num_actions=30, training=False, image_aug=img, frame_info=True))
+        b = list(fast.iter_episode(
+            traj_idx, num_actions=30, training=False, image_aug=img, frame_info=True))
+        assert len(a) == len(b) > 0
+        for sa, sb in zip(a, b):
+            assert set(sa) == set(sb)
+            for k in sa:
+                if torch.is_tensor(sa[k]):
+                    assert torch.equal(sa[k], sb[k]), k
+                else:
+                    assert sa[k] == sb[k], k
+
+
+def test_strided_handler_stride25_matches_parent_filter(meta_json, monkeypatch):
+    """stride=25 fast 子类 == “父类全量 + idx % 25 过滤”（对拍，锁定语义等价）。"""
+    img = lambda x: torch.zeros(3, 224, 224)
+    parent = LeRobotV3RoboDojoHandler(
+        meta=json.load(open(meta_json)), num_views=3
+    )
+    fast = _fast_handler(meta_json, frame_stride=25, monkeypatch=monkeypatch)
+    full = _iter_full(parent, img)
+    fast_all = {}
+    for traj_idx in range(len(fast.meta["datalist"])):
+        for s in fast.iter_episode(
+            traj_idx, num_actions=30, training=False, image_aug=img, frame_info=True
+        ):
+            fast_all[(s["episode_index"], s["frame_index"])] = s
+    # fast 集合 == 父类全量 ∩ stride 过滤（数量与内容都一致）
+    expected_keys = {k for k in full if k[1] % 25 == 0}
+    assert set(fast_all) == expected_keys
+    for key, s in fast_all.items():
+        assert s["frame_index"] % 25 == 0
+        for k in ("abs_trajectory", "image_input", "image_mask", "language_instruction"):
+            if torch.is_tensor(s[k]):
+                assert torch.equal(s[k], full[key][k]), k
+            else:
+                assert s[k] == full[key][k], k
 
 
 # ---------------------------------------------------------------- eval_collate

@@ -16,11 +16,19 @@
 
 from __future__ import annotations
 
+import io
+from typing import Dict, Iterable, List, Optional, Union
+
+import av
+import numpy as np
 import torch
+from PIL import Image
+from scipy.interpolate import interp1d
 from torch.utils.data import IterableDataset
 
 from .dataset import InfiniteDataReader
 from .domain_config import DATA_DOMAIN_ID
+from .domain_handler.lerobot_v3_robodojo import LeRobotV3RoboDojoHandler
 from .domain_handler.registry import get_handler_cls
 from .utils import action_slice
 
@@ -43,6 +51,159 @@ def eval_collate(batch: list[dict]) -> dict:
         else:
             out[key] = elems
     return out
+
+
+def _seek_frame(
+    container: av.container.InputContainer,
+    stream: av.video.stream.VideoStream,
+    target_ts: float,
+    from_ts: float,
+    to_ts: float,
+    tol: float,
+) -> Optional[np.ndarray]:
+    """在单个已打开的 mp4 container 里 seek 到 target_ts，解码返回该帧 [H,W,C] uint8。
+
+    与 lerobot torchcodec 的 get_frames_at(indices=...) 同思路：逐帧索引定位解码，
+    只解需要的帧，避免整段 AV1/h264 顺序全量解码。target_ts 落在帧网格上
+    （from_ts + k/fps），seek 到其前 keyframe 后首个 ts >= target_ts-tol 的帧即目标帧，
+    与父类顺序解码逐帧结果一致（test_eval_data 对拍验证）。段尾/越界返回 None。
+    """
+    container.seek(int(target_ts / stream.time_base), stream=stream)
+    for packet in container.demux(stream):
+        for frame in packet.decode():
+            if frame.pts is None:
+                continue
+            ts = float(frame.pts) * stream.time_base
+            if ts < from_ts - tol:
+                continue
+            if ts < target_ts - tol:
+                continue
+            if ts >= to_ts - tol:
+                return None
+            return frame.to_ndarray(format="rgb24")
+    return None
+
+
+class StridedVideoHandler(LeRobotV3RoboDojoHandler):
+    """评估专用子类：按 frame_stride 只解码所需帧（逐帧 seek），避免整集视频全量解码。
+
+    仅评估路径（EvalDataReader, frame_stride > 1）使用；父类（训练/stride=1）行为不变：
+      - frame_stride <= 1：iter_episode 完全委托父类；
+      - frame_stride > 1：候选只取 i % stride == 0 的索引，_decode_episode_video 用
+        pyav seek 逐帧解码这些帧（返回 Dict[int, ndarray]），解码量降到 ~1/stride。
+    正确性由 test_eval_data.py 对拍：stride=1 与父类逐样本一致；stride>1 与
+    “父类全量 + idx % stride 过滤”结果一致。
+    """
+
+    def __init__(self, meta: dict, num_views: int, frame_stride: int = 1) -> None:
+        super().__init__(meta, num_views)
+        self.frame_stride = max(1, int(frame_stride))
+
+    def _decode_episode_video(
+        self, cam_key: str, ep: dict, indices: Optional[List[int]] = None
+    ) -> Union[np.ndarray, Dict[int, np.ndarray]]:
+        """indices=None → 父类全量解码 [T,H,W,C]；否则只逐帧 seek 解码 indices 里的帧。"""
+        if indices is None:
+            return super()._decode_episode_video(cam_key, ep)
+        ci = int(ep[f"videos/{cam_key}/chunk_index"])
+        fi = int(ep[f"videos/{cam_key}/file_index"])
+        from_ts = float(ep[f"videos/{cam_key}/from_timestamp"])
+        to_ts = float(ep[f"videos/{cam_key}/to_timestamp"])
+        path = self.root / "videos" / cam_key / f"chunk-{ci:03d}" / f"file-{fi:03d}.mp4"
+        if path.exists():
+            container = av.open(str(path))
+        else:  # 远程/云存储兜底
+            from mmengine import fileio
+            container = av.open(io.BytesIO(fileio.get(str(path))))
+        tol = 0.5 / self.fps
+        out: Dict[int, np.ndarray] = {}
+        try:
+            stream = container.streams.video[0]
+            for idx in indices:
+                frame = _seek_frame(
+                    container, stream, from_ts + idx / self.fps, from_ts, to_ts, tol
+                )
+                if frame is None:
+                    break  # 段尾截断：后续索引同样越界，与父类 clip 到 length 对齐
+                out[idx] = frame
+            return out
+        finally:
+            container.close()
+
+    def iter_episode(
+        self,
+        traj_idx: int,
+        *,
+        num_actions: int,
+        training: bool,
+        image_aug,
+        lang_aug_map: dict | None = None,
+        frame_info: bool = False,
+        **kwargs,
+    ) -> Iterable[dict]:
+        if self.frame_stride <= 1:
+            yield from super().iter_episode(
+                traj_idx,
+                num_actions=num_actions,
+                training=training,
+                image_aug=image_aug,
+                lang_aug_map=lang_aug_map,
+                frame_info=frame_info,
+                **kwargs,
+            )
+            return
+
+        ep_idx = self.meta["datalist"][traj_idx]
+        ep = self.episodes[ep_idx]
+
+        # 与父类同语义：state 读 20d 绝对轨迹，T = min(state 长度, 视频长度)
+        state = self._to_20d(self._read_state(ep))
+        n_views = min(self.num_views, len(self.camera_keys))
+        T = min(state.shape[0], int(ep["length"]))
+        if T < 2:
+            return
+        state_T = state[:T]
+        lt = np.arange(T, dtype=np.float64) * (self.qdur / num_actions)
+        L = interp1d(lt, state_T, axis=0, bounds_error=False, fill_value=(state_T[0], state_T[-1]))
+
+        # 候选 = 父类候选 ∩ stride 过滤：i <= T-1-num_actions 且 i % stride == 0
+        last_start = lt[-1] - self.qdur
+        idxs = [i for i in range(0, T, self.frame_stride) if lt[i] <= last_start]
+        if not idxs:
+            return
+
+        videos = [
+            self._decode_episode_video(cam, ep, indices=idxs)
+            for cam in self.camera_keys[:n_views]
+        ]
+        ins = self._instruction(ep)
+        image_mask = torch.zeros(self.num_views, dtype=torch.bool)
+        image_mask[:n_views] = True
+
+        for idx in idxs:
+            if any(idx not in v for v in videos):  # 某相机段尾帧缺失（防御父类 ±1 偏差）
+                continue
+            cur = lt[idx]
+            q = np.linspace(cur, cur + self.qdur, num_actions + 1, dtype=np.float32)
+            seq = torch.tensor(L(q)).float()
+            # 跳过双臂完全静止段（与父类一致）
+            if (seq[1] - seq[0]).abs().max() < 1e-5:
+                continue
+
+            imgs = [image_aug(Image.fromarray(videos[v][idx])) for v in range(n_views)]
+            while len(imgs) < self.num_views:
+                imgs.append(torch.zeros_like(imgs[0]))
+
+            sample = {
+                "language_instruction": ins,
+                "image_input": torch.stack(imgs, dim=0),
+                "image_mask": image_mask,
+                "abs_trajectory": seq,
+            }
+            if frame_info:
+                sample["episode_index"] = ep_idx
+                sample["frame_index"] = idx
+            yield sample
 
 
 def _shard_indices(n: int, n_workers: int, worker_id: int) -> range:
@@ -74,6 +235,10 @@ class EvalDataReader(IterableDataset):
       proprio              [D]        当前状态
       expert_action_chunk  [num_actions, D]  expert 动作 chunk（绝对目标）
       domain_id            LongTensor[]     domain id
+
+    num_views=1 时仅使用第 0 路相机（handler 只解码该路，其余视角零填充 + mask=False，
+    模型 forward_vlm 对 mask 视角不编码），满足单视角模型评估。
+    domain_id 传入时覆盖 DATA_DOMAIN_ID 查表（不同模型可能用不同 domain id）。
     """
 
     def __init__(
@@ -83,6 +248,7 @@ class EvalDataReader(IterableDataset):
         num_views: int = 3,
         action_mode: str = "ee6d",
         frame_stride: int = 1,
+        domain_id: int | None = None,
     ):
         base = InfiniteDataReader(
             metas_path,
@@ -98,6 +264,8 @@ class EvalDataReader(IterableDataset):
         self.action_mode = action_mode
         self.image_aug = base.image_aug  # 独立持有，测试可替换为快速版
         self.frame_stride = max(1, int(frame_stride))
+        # 覆盖所有 dataset 的 domain_id；None 时按 robot_type 查 DATA_DOMAIN_ID
+        self.domain_id = int(domain_id) if domain_id is not None else None
 
     def __iter__(self):
         # num_workers>0 时每个 worker 独立运行 __iter__：按 worker id 切分 episode，
@@ -109,8 +277,15 @@ class EvalDataReader(IterableDataset):
         for dataset_name, meta in self.metas.items():
             robot_type = meta.get("robot_type", dataset_name)
             Handler = get_handler_cls(robot_type)
-            handler = Handler(meta=meta, num_views=self.num_views)
-            domain_id = torch.tensor(DATA_DOMAIN_ID.get(robot_type, 0))
+            # stride>1 时用 seek 子类只解码采样帧（ArX v3.0 AV1 视频全量解码是评估瓶颈）
+            if self.frame_stride > 1 and issubclass(Handler, LeRobotV3RoboDojoHandler):
+                handler = StridedVideoHandler(
+                    meta=meta, num_views=self.num_views, frame_stride=self.frame_stride
+                )
+            else:
+                handler = Handler(meta=meta, num_views=self.num_views)
+            did = self.domain_id if self.domain_id is not None else DATA_DOMAIN_ID.get(robot_type, 0)
+            domain_id = torch.tensor(did)
 
             for traj_idx in _shard_indices(len(meta["datalist"]), n_workers, worker_id):
                 for sample in handler.iter_episode(
