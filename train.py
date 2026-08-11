@@ -95,7 +95,7 @@ def get_args_parser():
         type=str,
         default=None,
         help="Optional dir to collect DataLoader worker-side video decode timing (smoke/瓶颈量化用). "
-             "Enables XVLA_TIMING_DIR for workers; train.py aggregates decode_*.jsonl at exit.",
+        "Enables XVLA_TIMING_DIR for workers; train.py aggregates decode_*.jsonl at exit.",
     )
 
     # Data
@@ -104,9 +104,11 @@ def get_args_parser():
     )
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument(
-        "--num_workers", type=int, default=4,
+        "--num_workers",
+        type=int,
+        default=4,
         help="DataLoader worker processes per rank (each worker independently decodes video; "
-             "on CPU-rich test machines raise this to parallelize decode)",
+        "on CPU-rich test machines raise this to parallelize decode)",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -245,7 +247,10 @@ def _resolve_latest(out: Path) -> dict | None:
     for wd in weights:
         problems = weights_dir_complete(wd)
         if problems:
-            print(f"[train] WARN skip incomplete weights {wd}: {', '.join(problems)}", file=sys.stderr)
+            print(
+                f"[train] WARN skip incomplete weights {wd}: {', '.join(problems)}",
+                file=sys.stderr,
+            )
             continue
         step = read_global_step(wd)
         msd = next(
@@ -270,7 +275,11 @@ def _resolve_latest(out: Path) -> dict | None:
     for ck in legacy:
         problems = checkpoint_is_complete(ck)
         if not problems:
-            return {"weights_dir": str(ck), "model_state_dir": str(ck), "global_step": read_global_step(ck)}
+            return {
+                "weights_dir": str(ck),
+                "model_state_dir": str(ck),
+                "global_step": read_global_step(ck),
+            }
     return None
 
 
@@ -295,13 +304,21 @@ def resolve_resume(args) -> dict | None:
         if (p / "pretrained").is_dir() or (p / "model_state").is_dir():
             info = _resolve_latest(p)  # 显式给 output_dir 根
         elif p.parent.name == "pretrained":
-            info = {"weights_dir": str(p), "model_state_dir": None, "global_step": read_global_step(p)}
+            info = {
+                "weights_dir": str(p),
+                "model_state_dir": None,
+                "global_step": read_global_step(p),
+            }
             ms = p.parent.parent / "model_state" / p.name
             if ms.is_dir() and not model_state_dir_complete(ms):
                 info["model_state_dir"] = str(ms)
         elif p.parent.name == "model_state":
             wd = p.parent.parent / "pretrained" / p.name
-            info = {"weights_dir": str(wd), "model_state_dir": str(p), "global_step": read_global_step(p)}
+            info = {
+                "weights_dir": str(wd),
+                "model_state_dir": str(p),
+                "global_step": read_global_step(p),
+            }
         elif p.is_dir():
             # 旧版单目录 ckpt（权重 + optimizer 同目录）：校验完整性，报出具体缺失文件
             problems = checkpoint_is_complete(p)
@@ -309,16 +326,24 @@ def resolve_resume(args) -> dict | None:
                 raise ValueError(
                     f"--resume dir {p} not a complete checkpoint: {', '.join(problems)}"
                 )
-            info = {"weights_dir": str(p), "model_state_dir": str(p), "global_step": read_global_step(p)}
+            info = {
+                "weights_dir": str(p),
+                "model_state_dir": str(p),
+                "global_step": read_global_step(p),
+            }
         else:
             raise ValueError(
                 f"--resume path {p} not found (expect output_dir root, pretrained/ckpt-N, "
                 f"model_state/ckpt-N, or a full ckpt dir)"
             )
     if info is None:
-        raise ValueError(f"--resume={args.resume} but no complete checkpoint under {args.output_dir}")
+        raise ValueError(
+            f"--resume={args.resume} but no complete checkpoint under {args.output_dir}"
+        )
     if not Path(info["weights_dir"]).is_dir():
-        raise ValueError(f"--resume={args.resume}: weights dir missing: {info['weights_dir']}")
+        raise ValueError(
+            f"--resume={args.resume}: weights dir missing: {info['weights_dir']}"
+        )
     return info
 
 
@@ -542,7 +567,9 @@ def main(args):
     # 视频解码计时：仅在 --timing_dir 开启时生效，必须在 create_dataloader 之前设 env
     # （DataLoader worker 由 fork 继承环境变量，见 xvla_datasets/timing.py）。
     if args.timing_dir:
-        os.environ["XVLA_TIMING_DIR"] = os.path.join(args.timing_dir, str(accelerator.process_index))
+        os.environ["XVLA_TIMING_DIR"] = os.path.join(
+            args.timing_dir, str(accelerator.process_index)
+        )
     train_dataloader = create_dataloader(
         batch_size=args.batch_size,
         metas_path=args.train_metas_path,
@@ -601,6 +628,12 @@ def main(args):
     # InfiniteDataReader 是无限流，不会抛 StopIteration，无需重启处理
     data_s = 0.0  # 累计本 log 间隔内 next(train_iter) 墙钟耗时（数据预处理+解码+IPC），算 DATA_PCT
     grad_norm = 0.0  # 本 optimizer step 的梯度 L2 范数（剪裁前），供日志
+    # 当前 optimizer step 内所有 micro-batch 的 loss 加权和。loss_dict 中各项均为
+    # batch mean，因此按真实 micro-batch 样本数加权；在 sync_gradients 边界再跨 rank
+    # reduce，日志才对应完整 effective batch，而不是最后一个 micro-batch / 当前 rank。
+    effective_loss_sums: Dict[str, torch.Tensor] = {}
+    effective_loss_total_sum: torch.Tensor | None = None
+    effective_batch_samples_local = 0
     while global_step < args.iters:
         # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
         # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
@@ -620,14 +653,34 @@ def main(args):
             # 只对 tensor 字段搬设备：language_instruction 已 pop，但为防未来引入非 tensor 字段
             # （字符串/None 等），非 tensor 原样保留，否则 v.to() 直接 AttributeError 崩溃
             inputs = {
-                k: v.to(accelerator.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                k: (
+                    v.to(accelerator.device, non_blocking=True)
+                    if isinstance(v, torch.Tensor)
+                    else v
+                )
                 for k, v in inputs.items()
             }
 
             # Forward & backward
-            with accelerator.autocast():
-                loss_dict: Dict[str, torch.Tensor] = model(**inputs)
+            loss_dict: Dict[str, torch.Tensor] = model(**inputs)
             loss = sum(loss_dict.values())
+
+            # 日志聚合使用未被 Accelerate 按 accum steps 缩放的原始 loss。detach 后只保留
+            # 少量标量 tensor，不持有计算图。以 action 的 batch 维作为真实样本数来源。
+            micro_batch_samples = int(inputs["action"].shape[0])
+            for name, value in loss_dict.items():
+                weighted = value.detach().float() * micro_batch_samples
+                if name in effective_loss_sums:
+                    effective_loss_sums[name] += weighted
+                else:
+                    effective_loss_sums[name] = weighted
+            weighted_total = loss.detach().float() * micro_batch_samples
+            if effective_loss_total_sum is None:
+                effective_loss_total_sum = weighted_total
+            else:
+                effective_loss_total_sum += weighted_total
+            effective_batch_samples_local += micro_batch_samples
+
             accelerator.backward(loss)
 
             # 剪裁前的梯度 L2 范数（显式先算范数再做 clip，语义明确为“剪裁前”；
@@ -635,7 +688,12 @@ def main(args):
             # 冻结参数 requires_grad=False，其 grad 为 None，两类计算均自动忽略。
             if accelerator.sync_gradients:
                 grad_norm = float(
-                    sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+                    sum(
+                        p.grad.norm().item() ** 2
+                        for p in model.parameters()
+                        if p.grad is not None
+                    )
+                    ** 0.5
                 )
                 if args.max_grad_norm:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -649,8 +707,35 @@ def main(args):
 
             # Logging
             if global_step % args.log_interval == 0:
-                logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
-                logs["loss_total"] = float(loss.detach().item())
+                if (
+                    effective_loss_total_sum is None
+                    or effective_batch_samples_local <= 0
+                ):
+                    raise RuntimeError(
+                        "No micro-batch losses collected for effective-batch logging"
+                    )
+
+                # 一次 collective 同时归并各 loss 分量、total 和样本数。除以全局真实样本数，
+                # 得到本 optimizer update 对应的 effective-batch mean loss。
+                loss_names = tuple(effective_loss_sums)
+                local_stats = torch.stack(
+                    [effective_loss_sums[name] for name in loss_names]
+                    + [
+                        effective_loss_total_sum,
+                        effective_loss_total_sum.new_tensor(
+                            float(effective_batch_samples_local)
+                        ),
+                    ]
+                )
+                global_stats = accelerator.reduce(local_stats, reduction="sum")
+                effective_batch_samples_global = float(global_stats[-1].item())
+                denominator = max(effective_batch_samples_global, 1.0)
+                logs = {
+                    name: float(global_stats[index].item() / denominator)
+                    for index, name in enumerate(loss_names)
+                }
+                logs["loss_total"] = float(global_stats[-2].item() / denominator)
+                logs["effective_batch_samples"] = effective_batch_samples_global
                 logs["grad_norm"] = grad_norm
                 logs["step"] = global_step
                 logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
@@ -674,6 +759,7 @@ def main(args):
                         f"[{global_step}/{args.iters}] "
                         f"loss={logs['loss_total']:.4f} "
                         f"[{loss_parts}] "
+                        f"effective_batch={int(logs['effective_batch_samples'])} "
                         f"grad_norm={logs['grad_norm']:.4f} "
                         f"lr_core={logs['lr_transformer_core']:.2e} "
                         f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
@@ -682,6 +768,12 @@ def main(args):
                         f"USED_GPU={gpu_mem:.2e} GB "
                     )
 
+            # 无论本 step 是否打印，都必须在 optimizer step 边界清空，避免把多个
+            # optimizer update 混到下一次日志中。
+            effective_loss_sums = {}
+            effective_loss_total_sum = None
+            effective_batch_samples_local = 0
+
             # Checkpointing
             if global_step == args.iters or global_step % args.save_interval == 0:
                 # 新布局：权重存 pretrained/ckpt-{N}（每 save_interval 一份，保留/上传用），
@@ -689,17 +781,26 @@ def main(args):
                 # scripts/prune_checkpoints.py 每小时轮询清理）。
                 # 保存顺序（崩溃安全）：先 optimizer 并写 state.json 提交 model_state，
                 # 再写权重并提交 pretrained —— 中断时二者保持在同一 step，不会错配。
-                weights_dir = os.path.join(output_dir, "pretrained", f"ckpt-{global_step}")
-                model_state_dir = os.path.join(output_dir, "model_state", f"ckpt-{global_step}")
+                weights_dir = os.path.join(
+                    output_dir, "pretrained", f"ckpt-{global_step}"
+                )
+                model_state_dir = os.path.join(
+                    output_dir, "model_state", f"ckpt-{global_step}"
+                )
                 if accelerator.is_main_process:
-                    accelerator.print(f"💾 Saving model to {weights_dir} + state to {model_state_dir}")
+                    accelerator.print(
+                        f"💾 Saving model to {weights_dir} + state to {model_state_dir}"
+                    )
                     # Resume 必需状态：optimizer 动量/步数 + global_step
                     # 注意：optim.state_dict() 仅在普通 DDP（accelerate launch 默认）下完整。
                     # 若切 DeepSpeed / FSDP，优化器状态是分片的，state_dict() 不完整——需改用
                     # accelerator.save_state()/load_state()（内部对 FSDP/DeepSpeed 有专门处理，
                     # 且 random_states_{rank}.pkl 自动 per-rank）。
                     os.makedirs(model_state_dir, exist_ok=True)
-                    torch.save(optim.state_dict(), os.path.join(model_state_dir, "optimizer.pt"))
+                    torch.save(
+                        optim.state_dict(),
+                        os.path.join(model_state_dir, "optimizer.pt"),
+                    )
                     with open(os.path.join(model_state_dir, "state.json"), "w") as f:
                         json.dump({"global_step": global_step}, f)
                     base_model.save_pretrained(weights_dir, safe_serialization=True)
@@ -709,7 +810,9 @@ def main(args):
                 # 所有进程各自保存自己的 RNG（per-rank 文件，在 model_state 目录），
                 # resume 后各 rank 随机性独立
                 save_rng_state(
-                    os.path.join(model_state_dir, f"rng_state_rank{accelerator.process_index}.pt")
+                    os.path.join(
+                        model_state_dir, f"rng_state_rank{accelerator.process_index}.pt"
+                    )
                 )
                 accelerator.wait_for_everyone()
 
@@ -730,7 +833,9 @@ def aggregate_decode_timing(timing_dir: str, logger, is_main_process: bool) -> N
     import glob
 
     samples = decode_s = frames = wall_s = 0
-    for p in glob.glob(os.path.join(timing_dir, "**", "decode_*.jsonl"), recursive=True):
+    for p in glob.glob(
+        os.path.join(timing_dir, "**", "decode_*.jsonl"), recursive=True
+    ):
         with open(p) as f:
             for line in f:
                 r = json.loads(line)

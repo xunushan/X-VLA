@@ -3,10 +3,16 @@ from __future__ import annotations
 import io
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterable, List
 
 import av
+
+# 关闭 pyav 冗余解码日志（decode 每帧刷 INFO 到 stderr；DataLoader worker 子进程
+# 各自 import 本模块，放模块级才能保证 fork/spawn 两种方式下 worker 都生效）
+av.logging.set_level(av.logging.ERROR)
+
 import numpy as np
 import pyarrow.parquet as pq
 import torch
@@ -150,6 +156,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         tol = 0.5 / self.fps
         _t0 = time.time()
         frames: List[np.ndarray] = []
+        done = False
         try:
             stream = container.streams.video[0]
             container.seek(int(from_ts / stream.time_base), stream=stream)
@@ -161,10 +168,14 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                     if ts < from_ts - tol:
                         continue
                     if ts >= to_ts - tol:  # 段尾（to_ts 为下一段起点，开区间）
+                        done = True
                         break
                     frames.append(frame.to_ndarray(format="rgb24"))
                     if len(frames) >= length:
+                        done = True
                         break
+                if done:  # 已取够本段，终止 demux——否则会解码到整个文件末尾（~13× 浪费）
+                    break
         finally:
             container.close()
         # 视频解码耗时插桩（仅设了 XVLA_TIMING_DIR 时才有 IO 开销，见 xvla_datasets/timing.py）
@@ -201,9 +212,16 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         # 1. 绝对状态轨迹（observation.state，20 维）
         state = self._to_20d(self._read_state(ep))  # [T, 20]
 
-        # 2. 三相机视频（pyav 解码 → [T, H, W, C] uint8）
+        # 2. 三相机视频（pyav 解码 → [T, H, W, C] uint8）。各相机独立 seek+demux，
+        #    无共享可变状态，用 ThreadPoolExecutor 并行解码（实测 3 路 ~1.65× 提速，
+        #    16 核服务器上更高）。注意：不要加 stream.thread_type=AUTO——
+        #    实测对 AV1 短 seek 段是负优化（单路慢 0.81×）。
         n_views = min(self.num_views, len(self.camera_keys))
-        videos = [self._decode_episode_video(cam, ep) for cam in self.camera_keys[:n_views]]
+        with ThreadPoolExecutor(max_workers=n_views) as executor:
+            videos = [
+                f.result()
+                for f in [executor.submit(self._decode_episode_video, cam, ep) for cam in self.camera_keys[:n_views]]
+            ]
 
         # 3. 对齐到公共长度（视频帧数与 length 允许 ±1 偏差）
         T = min(state.shape[0], *(v.shape[0] for v in videos))
