@@ -69,9 +69,10 @@ conda activate lerobot
 python .claude/skills/monitor-trainning/src/checkpoint_diff.py full <orig.safetensors> <ft.safetensors> \
     --threshold 3.0 --prefixes model.transformer model.vlm.vision_tower
 # 子命令：full（完整报告）/ key-diff / weight-diff
+# --top-ratio N 输出更新幅度最大的 Top N 权重表（按 ratio 降序），采样段改用这些 key；默认 40，0 关闭
 ```
 
-报告含：key 映射统计（identity/custom/缺失/新增）、Weight diff 统计（更新数 + 更新比例 + 按模块 Top N）、采样 key 对比表、shared.weight 修复验证、image_projection 转置验证、参数量对比。
+报告含：key 映射统计（identity/custom/缺失/新增）、Weight diff 统计（更新数 + 更新比例 + 按模块 Top N）、**Top N 更新权重表（按 ratio 降序，含 rank/key/ratio/diff/verdict）**、采样 key 对比表、shared.weight 修复验证、image_projection 转置验证、参数量对比。
 
 ## 权重统计表格（行=权重key，列=各 checkpoint 统计值）
 

@@ -485,6 +485,7 @@ class CheckpointComparator:
         sample_keys: Optional[Sequence[str]] = None,
         target_prefixes: Optional[Sequence[str]] = None,
         top_n: int = 5,
+        top_ratio: int = 0,
     ) -> str:
         """生成完整的文本报告，整合 key diff + weight diff + sample report。
 
@@ -566,6 +567,28 @@ class CheckpointComparator:
             for mod, cnt in wd.prefix_stats.most_common(top_n):
                 lines.append(f"  {mod}: {cnt}")
         lines.append("")
+
+        # ---- Top N 更新权重（按 ratio 降序）----
+        if top_ratio > 0:
+            ranked = sorted(
+                ((k, d) for k, d in wd.details.items() if d["verdict"] == "updated"),
+                key=lambda kv: kv[1]["ratio"],
+                reverse=True,
+            )[:top_ratio]
+            if sample_keys is None:
+                sample_keys = [k for k, _ in ranked]
+            lines.append("=" * 100)
+            lines.append(f"更新幅度最大的 Top {len(ranked)} 权重（按 ratio 降序）")
+            lines.append("=" * 100)
+            lines.append(f"{'rank':<5} {'key':<70} {'ratio':>10} {'diff':>10} {'verdict':>8}")
+            lines.append("-" * 100)
+            for i, (k, d) in enumerate(ranked, 1):
+                ratio = d["ratio"]
+                ratio_s = f"{ratio:.1f}x" if ratio != float("inf") else "infx"
+                lines.append(
+                    f"{i:<5} {k:<70} {ratio_s:>10} {d['diff']:>10.8f} {d['verdict']:>8}"
+                )
+            lines.append("")
 
         # ---- Sample keys ----
         if sample_keys:
@@ -845,6 +868,7 @@ class XVLACheckpointAnalyzer:
         sample_keys: Optional[Sequence[str]] = None,
         target_prefixes: Optional[Sequence[str]] = None,
         top_n: int = 5,
+        top_ratio: int = 0,
     ) -> str:
         """生成完整报告：通用分析 + X-VLA 专项检查。"""
         lines: list[str] = []
@@ -854,6 +878,7 @@ class XVLACheckpointAnalyzer:
                 sample_keys=sample_keys,
                 target_prefixes=target_prefixes,
                 top_n=top_n,
+                top_ratio=top_ratio,
             )
         )
         lines.extend(self.checker.check_shared_weight())
@@ -956,6 +981,12 @@ def main() -> None:
     p_full.add_argument(
         "--prefixes", nargs="+", default=None, help="Target prefixes to report"
     )
+    p_full.add_argument(
+        "--top-ratio",
+        type=int,
+        default=40,
+        help="输出更新幅度最大的 Top N 权重表（按 ratio 降序），并把采样段改为这些 key；0 关闭",
+    )
 
     args = parser.parse_args()
 
@@ -999,8 +1030,9 @@ def main() -> None:
         print(
             analyzer.full_report(
                 threshold=args.threshold,
-                sample_keys=_default_samples(analyzer.ft.keys),
+                sample_keys=None if args.top_ratio else _default_samples(analyzer.ft.keys),
                 target_prefixes=args.prefixes,
+                top_ratio=args.top_ratio,
             )
         )
 
