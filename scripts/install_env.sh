@@ -5,7 +5,7 @@
 #   - conda env 名可用环境变量 XVLA_CONDA_ENV 覆盖（默认 xvla，train 服务器约定）
 #   - python 版本用 XVLA_PYTHON 覆盖（默认 3.10）
 #   - pip 源默认腾讯云镜像（https://mirrors.cloud.tencent.com/pypi/simple），XVLA_PIP_INDEX_URL 覆盖
-#   - conda 源默认腾讯云镜像（conda create -c 内联指定）
+#   - conda 源走服务器 .condarc 配置（腾讯未镜像 anaconda；本机/服务器通常已配清华等国内源）
 #   - requirements.txt 未钉 torch，先装钉定版本的 CUDA torch（默认 2.8.0，pypi 默认即 CUDA 打包版），
 #     避免后续 pip 回退 CPU 版
 #   - 追加测试/下载依赖（pytest、huggingface_hub）
@@ -58,11 +58,8 @@ if conda env list | awk -v e="${CONDA_ENV}" '$1==e {f=1} END {exit !f}'; then
   echo "[install_env] using existing env ${CONDA_ENV} (python=${PY_VER})"
 else
   echo "[install_env] creating conda env ${CONDA_ENV} (python=${PYTHON_VERSION})"
-  # conda 源走腾讯云镜像（python 包在 pkgs/main）
-  conda create -n "${CONDA_ENV}" "python=${PYTHON_VERSION}" \
-    -c https://mirrors.cloud.tencent.com/anaconda/pkgs/main \
-    -c https://mirrors.cloud.tencent.com/anaconda/pkgs/free \
-    -y
+  # conda 源走服务器 .condarc（腾讯未镜像 anaconda）
+  conda create -n "${CONDA_ENV}" "python=${PYTHON_VERSION}" -y
   conda activate "${CONDA_ENV}"
 fi
 
