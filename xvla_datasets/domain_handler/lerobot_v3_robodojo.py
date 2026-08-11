@@ -35,8 +35,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
       - videos/{camera_key}/chunk-{ci:03d}/file-{fi:03d}.mp4   一个 mp4 含多个 episode
 
     向量约定（20 维）：[l_xyz(3), l_rot6d(6), l_g(1), r_xyz(3), r_rot6d(6), r_g(1)]
-      - gripper 已反转：1=闭合、0=张开（X-VLA-Pt EE6D 约定）
-      - 若数据为 16 维（每臂 xyz+quat_wxyz+g，gripper 0=张开），自动转 20 维并反转 gripper
+      - gripper 不反转，保持原始约定 1=张开、0=闭合（对齐参考 ee6d "1=开"）
+      - 若数据为 16 维（每臂 xyz+quat_wxyz+g，gripper 0=张开），自动转 20 维，gripper 保持原始值
 
     动作时间轴：网格密度 = num_actions / query_duration，与录制帧率**解耦**。查询点 q 恰好落在
     帧网格上，interp1d 是恒等操作 → 动作目标为连续真实帧，不产生合成插值点（与 v2.1 handler 同款
@@ -125,8 +125,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
 
     @staticmethod
     def _to_20d(arr: np.ndarray) -> np.ndarray:
-        """16 维 → 20 维：每臂 [xyz, quat_wxyz, g] → [xyz, rot6d, 1-g]（委托 utils.ee16_to_xvla20）。"""
-        return ee16_to_xvla20(arr, invert_gripper=True)
+        """16 维 → 20 维：每臂 [xyz, quat_wxyz, g] → [xyz, rot6d, g]（委托 utils.ee16_to_xvla20）。"""
+        return ee16_to_xvla20(arr, invert_gripper=False)
 
     def _decode_episode_video(self, cam_key: str, ep: dict) -> np.ndarray:
         """解码单个 episode 的视频段，返回 [T, H, W, C] uint8。
