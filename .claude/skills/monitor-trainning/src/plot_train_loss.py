@@ -20,7 +20,8 @@ loss 分量 key 定义于 train.py 调用的 models/action_hub.py 的 compute_lo
     python src/plot_train_loss.py --smooth 0.9 --window 10 --freeze-steps 1000
 
 产出：
-    - PNG 图（默认 outputs/train_loss.png）：上=整体 loss，中=分项 loss，下=grad_norm
+    - PNG 图（默认 outputs/train_loss.png）：上=整体 loss，中间=各分项独立子图
+      （position/rotate6D/gripper 各占一图，量纲差异大不共轴），下=grad_norm
     - 终端打印训练报告（起始/当前/最低 loss、各分项当前值、EMA、解冻步）
 """
 from __future__ import annotations
@@ -122,10 +123,13 @@ def plot(data: dict, out_png: Path, smooth: float,
     if boundary is None:
         boundary = 0  # 无解冻（全程冻结），不画线
 
-    n_rows = 2 if not parts else 3
+    part_names = sorted(parts)
+    # 版面：整体 loss + 每个分项独立子图 + grad_norm。分项量纲差异大
+    # （如 position 数十 vs gripper <1），共轴会压平小分量，故各占一图。
+    n_rows = 1 + len(part_names) + 1
     fig, axes = plt.subplots(
-        n_rows, 1, figsize=(11, 4.2 * n_rows), sharex=True,
-        gridspec_kw={"hspace": 0.18},
+        n_rows, 1, figsize=(11, 3.4 * n_rows), sharex=True,
+        gridspec_kw={"hspace": 0.22},
     )
     ax1 = axes[0]
 
@@ -143,16 +147,16 @@ def plot(data: dict, out_png: Path, smooth: float,
     ax1.legend(loc="upper right", fontsize=8)
     ax1.grid(True, alpha=0.3)
 
-    # —— 分项 loss（每个分量一条 EMA 曲线）——
-    if parts:
-        ax2 = axes[1]
-        for i, (name, arr) in enumerate(sorted(parts.items())):
-            ax2.plot(step, arr, lw=0.6, alpha=0.3, color=f"C{i}", label=f"{name} (raw)")
-            ax2.plot(step, ema(arr, smooth), lw=1.5, color=f"C{i}", label=f"{name} (EMA)")
-        ax2.set_ylabel("component loss")
-        ax2.set_yscale("log")
-        ax2.legend(loc="upper right", fontsize=8)
-        ax2.grid(True, alpha=0.3)
+    # —— 分项 loss：每个分量独立子图（各自 y 轴量纲，log 尺）——
+    for i, name in enumerate(part_names):
+        ax = axes[1 + i]
+        arr = parts[name]
+        ax.plot(step, arr, lw=0.6, alpha=0.3, color="C0", label=f"{name} (raw)")
+        ax.plot(step, ema(arr, smooth), lw=1.5, color="C0", label=f"{name} (EMA)")
+        ax.set_ylabel(name)
+        ax.set_yscale("log")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
 
     # —— grad_norm ——
     ax_last = axes[-1]

@@ -261,6 +261,25 @@ class WeightDiffResult:
         return len(self.updated) / max(self.total_processed, 1) * 100
 
 
+def count_by_prefix(prefix_stats: Counter, prefix: str) -> int:
+    """统计前缀下的更新 key 数，兼容两种 checkpoint 保存格式：
+      - HF save_pretrained 格式：key 带 `model.` 前缀（如 model.transformer.*）；
+      - 裸 state_dict 格式：无前缀（train.py 直接保存的 transformer.* / vlm.*）。
+    先按原样匹配；无结果时自动去掉/补上 `model.` 前缀再试，避免用户按文档里的
+    `model.` 前缀传入却匹配为 0。
+    """
+    cnt = sum(c for m, c in prefix_stats.items() if m.startswith(prefix))
+    if cnt == 0:
+        for variant in (prefix.removeprefix("model."), "model." + prefix):
+            if variant != prefix:
+                cnt = sum(
+                    c for m, c in prefix_stats.items() if m.startswith(variant)
+                )
+                if cnt:
+                    break
+    return cnt
+
+
 class CheckpointComparator:
     """通用 checkpoint 比较器，与具体模型无关。
 
@@ -541,8 +560,7 @@ class CheckpointComparator:
         if target_prefixes:
             lines.append("=== 指定前缀更新统计 ===")
             for prefix in target_prefixes:
-                cnt = sum(c for m, c in wd.prefix_stats.items() if m.startswith(prefix))
-                lines.append(f"  {prefix}: {cnt}")
+                lines.append(f"  {prefix}: {count_by_prefix(wd.prefix_stats, prefix)}")
         else:
             lines.append(f"=== 按模块更新统计 (Top {top_n}) ===")
             for mod, cnt in wd.prefix_stats.most_common(top_n):
@@ -849,9 +867,16 @@ class XVLACheckpointAnalyzer:
 # ============================================================================
 
 
-def _default_samples() -> list[str]:
-    """X-VLA 默认采样 key，用于快速查看关键层的更新情况。"""
-    return [
+def _default_samples(ft_keys: set[str]) -> list[str]:
+    """X-VLA 默认采样 key，用于快速查看关键层的更新情况。
+
+    兼容两种 checkpoint 保存格式：
+      - HF save_pretrained 格式：key 带 `model.` 前缀（XVLAKeyMapper 的映射目标）；
+      - 裸 state_dict 格式：无前缀（train.py 直接保存的 transformer.* / vlm.*）。
+    对每个规范 key 依次尝试：原名 → 去掉 `model.` 前缀 → 按最后两段后缀匹配实际
+    存在的 key，保证两种格式都能采到样，而不是全部显示"训练后不存在"。
+    """
+    canonical = [
         "model.vlm.language_model.encoder.layers.0.self_attn.q_proj.weight",
         "model.vlm.vision_tower.blocks.0.0.channel_block.channel_attn.qkv.weight",
         "model.vlm.multi_modal_projector.image_projection.weight",
@@ -859,6 +884,19 @@ def _default_samples() -> list[str]:
         "model.transformer.action_decoder.fc.weight",
         "model.transformer.soft_prompt_hub.weight",
     ]
+    resolved: list[str] = []
+    for key in canonical:
+        if key in ft_keys:
+            resolved.append(key)
+            continue
+        stripped = key[len("model."):] if key.startswith("model.") else key
+        if stripped in ft_keys:
+            resolved.append(stripped)
+            continue
+        suffix = ".".join(key.split(".")[-2:])
+        match = next((k for k in ft_keys if k.endswith("." + suffix)), None)
+        resolved.append(match if match is not None else stripped)
+    return resolved
 
 
 def main() -> None:
@@ -961,7 +999,7 @@ def main() -> None:
         print(
             analyzer.full_report(
                 threshold=args.threshold,
-                sample_keys=_default_samples(),
+                sample_keys=_default_samples(analyzer.ft.keys),
                 target_prefixes=args.prefixes,
             )
         )
