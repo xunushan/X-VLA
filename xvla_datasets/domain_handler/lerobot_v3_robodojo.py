@@ -55,7 +55,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
       - camera_keys: 相机顺序（可选，默认 cam_high/cam_left_wrist/cam_right_wrist）
       - fps: 视频帧率，仅用于视频解码时间戳容差（与动作时间轴无关）
       - query_duration: 动作窗口时长（秒，默认 1.0）
-      - episodes: 可选 episode_index 过滤列表
+      - episodes: 可选 episode_index 过滤列表（不传则使用 meta/episodes 下全部数据）
     """
 
     dataset_name = "arx_x5_ee"
