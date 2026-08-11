@@ -62,7 +62,7 @@ python .claude/skills/monitor-trainning/src/plot_train_loss.py outputs/xvla_form
 
 ## checkpoint 对比（判断参数是否被真正训练更新）
 
-`src/checkpoint_diff.py`（源自 `goai_2026/utils/checkpoint_diff.py`）对比两个 safetensors，用 bf16 roundtrip 噪声地板区分「实质更新」vs「仅精度差异」，支持 X-VLA key 重命名映射与 image_projection 转置验证。
+`src/checkpoint_diff.py`对比两个 safetensors，用 bf16 roundtrip 噪声地板区分「实质更新」vs「仅精度差异」，支持 X-VLA key 重命名映射与 image_projection 转置验证。
 
 ```bash
 conda activate lerobot
@@ -75,7 +75,7 @@ python .claude/skills/monitor-trainning/src/checkpoint_diff.py full <orig.safete
 
 ## 权重统计表格（行=权重key，列=各 checkpoint 统计值）
 
-`src/stat_action_dims.py`（改造自 `~/Downloads/stat_action_dims.py`）对任意多个 checkpoint 的动作权重输出对比表：**行 = 权重 key，列 = 每个 checkpoint 的统计值**（默认 `abs_mean`，可切 `--stat`；`--all` 输出全部统计量）。
+`src/stat_action_dims.py`对任意多个 checkpoint 的动作权重输出对比表：**行 = 权重 key，列 = 每个 checkpoint 的统计值**（默认 `abs_mean`，可切 `--stat`；`--all` 输出全部统计量）。
 
 ```bash
 conda activate lerobot
@@ -87,6 +87,21 @@ python .claude/skills/monitor-trainning/src/stat_action_dims.py \
 ```
 
 统计值：shape/param_count/mean/std/min/max/median/abs_mean/l2_norm/is_likely_random/random_score。表中 `nan` 表示该 key 在此 checkpoint 不存在。
+
+### 按 domain 统计（JSON 对比，参考 *_per_dim_stats.json 格式）
+
+`--per-dim` 沿 dim0（num_domains 轴）对 domain 条件化权重逐维切片统计，输出 JSON（类似 `soft_prompt_hub_per_dim_stats.json`），适合对比多 checkpoint 各 domain 维度的权重更新。
+
+```bash
+conda activate lerobot
+python .claude/skills/monitor-trainning/src/stat_action_dims.py \
+    --per-dim [--domain 0 1 2] [-o stats.json] \
+    <ckpt1.safetensors> <ckpt2.safetensors>
+# --per-dim 默认 key 仅 domain 条件化权重（action_decoder/action_encoder/soft_prompt_hub，不含 aux_visual_proj）
+# --domain 指定保留的 domain 索引（默认全部）；-o 后缀 .json → JSON；.csv → CSV；否则 markdown 打印终端
+```
+
+JSON 结构：`{key: {"shape", "num_dims", "kept_domains", "per_dim": {"<ckpt标签>": [{...stats..., "dim": i}]}}}`，`per_dim` 按 checkpoint 标签分组、每个 domain 含完整统计量。
 
 ## 上传 checkpoint 到 HuggingFace
 
