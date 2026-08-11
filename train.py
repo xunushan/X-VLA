@@ -664,9 +664,16 @@ def main(args):
                     t0 = time.time()
                     cpu_mem = psutil.Process(os.getpid()).memory_info().rss / 1024**3
                     gpu_mem = torch.cuda.memory_allocated() / 1024**3
+                    # loss 分量（position_loss/rotate6D_loss/gripper_loss 等），便于观察各动作头收敛
+                    loss_parts = " ".join(
+                        f"{k[:-len('_loss')]}={v:.4f}"
+                        for k, v in logs.items()
+                        if k.endswith("_loss") and k != "loss_total"
+                    )
                     logger.info(
                         f"[{global_step}/{args.iters}] "
                         f"loss={logs['loss_total']:.4f} "
+                        f"[{loss_parts}] "
                         f"grad_norm={logs['grad_norm']:.4f} "
                         f"lr_core={logs['lr_transformer_core']:.2e} "
                         f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
