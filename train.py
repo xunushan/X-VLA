@@ -171,7 +171,7 @@ MIN_WEIGHT_SIZE = 1 << 20  # 1 MB：model.safetensors 最小合理体积（挡�
 #   output_dir/pretrained/ckpt-{N}/   模型权重（model.safetensors + config + processor + state.json）
 #                                     每个 save_interval 存一份并保留（上传/回退用）
 #   output_dir/model_state/ckpt-{N}/  optimizer.pt + rng_state_rank{k}.pt + state.json
-#                                     仅保留最近 K 个（scripts/prune_checkpoints.py 每小时轮询清理）
+#                                     仅保留最近 K 个（monitor-trainning skill 的 prune_checkpoints.py 每小时轮询清理）
 # 旧布局（兼容）：output_dir/ckpt-{N}/  权重 + optimizer 同目录。
 
 
@@ -778,7 +778,7 @@ def main(args):
             if global_step == args.iters or global_step % args.save_interval == 0:
                 # 新布局：权重存 pretrained/ckpt-{N}（每 save_interval 一份，保留/上传用），
                 # 训练状态存 model_state/ckpt-{N}（optimizer + RNG，仅保留最近 K 个，由
-                # scripts/prune_checkpoints.py 每小时轮询清理）。
+                # monitor-trainning skill 的 prune_checkpoints.py 每小时轮询清理）。
                 # 保存顺序（崩溃安全）：先 optimizer 并写 state.json 提交 model_state，
                 # 再写权重并提交 pretrained —— 中断时二者保持在同一 step，不会错配。
                 weights_dir = os.path.join(

@@ -14,10 +14,10 @@
     而跳过，避免删掉半截目录导致 train.py 后续写文件崩溃（keep_last_k 只删旧目录，无竞态）。
 
 用法：
-  python scripts/prune_checkpoints.py --output_dir <OUT> [--keep_model_state 3] \
+  python src/prune_checkpoints.py --output_dir <OUT> [--keep_model_state 3] \
       [--keep_weights N] [--dry-run]
 轮询（每 1 小时）：
-  bash scripts/prune_loop.sh [OUT_DIR] [KEEP_MODEL_STATE]
+  bash src/prune_loop.sh [OUT_DIR] [KEEP_MODEL_STATE]
 """
 from __future__ import annotations
 
