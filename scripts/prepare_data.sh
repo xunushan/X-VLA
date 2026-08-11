@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 服务器数据准备：16 维 lerobot v3.0 数据集 -> 20 维 end-effector 6D 数据集 + 生成 meta json。
 #
-#   - 调用 tools/make_goai_20d.py（xyz+quat+g -> xyz+rot6d+(1-g)，stats.json/info.json 同步重算）
+#   - 调用 tools/make_goai_20d.py（xyz+quat+g -> xyz+rot6d+g，gripper 原样保留不反转；
+#     对齐官方 RoboDojo X_VLA ee6d 约定，见 docs/three_camera_finetuning_plan.md §2）
 #   - 从 /data/splits 读训练集 episode 索引，写入 meta.json 的 episodes 过滤字段
 #     （训练只用训练集划分，见 docs/服务器测试计划.md 2.5）；索引文件格式兼容
 #     JSON dict{train:[...]}/JSON 数组/每行一个索引，见 xvla_datasets.utils.load_episode_indices
@@ -32,7 +33,9 @@ echo "[prepare_data] converting ${SRC_ROOT} -> ${DST_ROOT}"
 echo "[prepare_data] train split file: ${SPLIT_FILE}"
 # PYTHONPATH 必须含项目根：tools/make_goai_20d.py 以脚本所在目录为 sys.path[0]，
 # 否则 `import xvla_datasets` 会解析失败（本地模块，非 pip 包）。
-PYTHONPATH="${PROJECT_ROOT}" python "${PROJECT_ROOT}/tools/make_goai_20d.py" "${SRC_ROOT}" "${DST_ROOT}"
+# 关键：gripper 绝不转换（--no-invert-gripper 保留原始 g，只做四元数->rot6d）。
+# 若误用默认 invert_gripper=True 会 g->1-g，与官方 ee6d 约定相反。
+PYTHONPATH="${PROJECT_ROOT}" python "${PROJECT_ROOT}/tools/make_goai_20d.py" "${SRC_ROOT}" "${DST_ROOT}" --no-invert-gripper
 
 # 生成 v3.0 meta json（相机键 / fps 从 src 的 info.json 读取；episodes 取训练集索引）
 META_JSON="${DST_ROOT}/meta.json"
