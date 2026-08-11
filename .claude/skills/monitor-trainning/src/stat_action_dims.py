@@ -17,6 +17,9 @@
     python src/stat_action_dims.py --all ckpt1.safetensors ckpt2.safetensors   # 全部统计值
     python src/stat_action_dims.py -o stats.csv ckpt1.safetensors ckpt2.safetensors
 
+    # 按 domain（dim0 轴）输出各维度统计 JSON，只保留 domain=0，对比两个 ckpt
+    python src/stat_action_dims.py --per-dim --domain 0 -o stats.json ckpt1 ckpt2
+
 统计值含义：
   mean/std/min/max/median/abs_mean/l2_norm      —— 数值分布
   is_likely_random / random_score               —— 权重是否仍接近随机初始化
@@ -40,6 +43,17 @@ DEFAULT_KEYS = [
     "transformer.soft_prompt_hub.weight",
     "transformer.aux_visual_proj.bias",
     "transformer.aux_visual_proj.weight",
+]
+
+# --per-dim 模式的默认 key：仅 domain 条件化的权重（dim0 = num_domains），
+# 与参考文件 ~/Downloads/*_per_dim_stats.json 的 5 个 key 一致；
+# aux_visual_proj 在本项目 checkpoint 中是普通 Linear（shape 非 [num_domains, ...]），不参与按 domain 切片
+PER_DIM_DEFAULT_KEYS = [
+    "transformer.action_decoder.bias.weight",
+    "transformer.action_decoder.fc.weight",
+    "transformer.action_encoder.bias.weight",
+    "transformer.action_encoder.fc.weight",
+    "transformer.soft_prompt_hub.weight",
 ]
 
 # 可选的统计量名称（--stat / --all 使用）
@@ -73,6 +87,37 @@ def compute_stats(w: np.ndarray) -> dict:
         "is_likely_random": bool(std < 0.03 and abs_mean < 0.01),
         "random_score": float(std + abs_mean * 10),
     }
+
+
+def checkpoint_label(path: Path) -> str:
+    """生成 checkpoint 的短标签。model.safetensors 用父目录名（如 X-VLA-Pt / ckpt-16000）。"""
+    if path.name == "model.safetensors":
+        return path.parent.name
+    return path.stem
+
+
+def compute_per_dim_stats(w: np.ndarray, domains: list[int] | None) -> list[dict]:
+    """沿 dim0（num_domains 轴）切片，对每个 domain 算一遍统计。
+
+    返回 [{compute_stats(...), "dim": i}, ...]；domains=None 表示全部。
+    """
+    n_domains = int(w.shape[0])
+    if domains is None:
+        domains = list(range(n_domains))
+    out = []
+    for i in domains:
+        if not (0 <= i < n_domains):
+            raise KeyError(f"domain {i} 超出范围 [0, {n_domains})")
+        s = compute_stats(w[i])
+        s["dim"] = i
+        out.append(s)
+    return out
+
+
+def json_dump(doc, path: Path) -> None:
+    import json
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
 
 
 def table_markdown(rows: list[tuple[str, list[dict]]], stat: str) -> str:
@@ -128,20 +173,90 @@ def to_csv(rows: list[tuple[str, list[dict]]], stat: str | None) -> str:
     return buf.getvalue()
 
 
+def run_per_dim(args) -> int:
+    """按 domain 输出各维度统计 JSON，支持多 checkpoint 对比。
+
+    JSON 结构（参考 ~/Downloads/*_per_dim_stats.json，扩展为多 ckpt 对比）：
+        {key: {
+            "shape": [...], "num_dims": 30, "kept_domains": [0],
+            "per_dim": {"<ckpt标签>": [{...stats..., "dim": 0}]}
+        }}
+    """
+    labels = [checkpoint_label(p) for p in args.checkpoints]
+    doc: dict = {}
+    for key in args.keys:
+        per_dim: dict = {}
+        shape = num_dims = None
+        for ckpt, label in zip(args.checkpoints, labels):
+            try:
+                w = load_tensor(ckpt, key)
+            except KeyError as e:
+                print(f"  [warn] {e} —— 该 key 在此 checkpoint 不存在，跳过", file=sys.stderr)
+                per_dim[label] = []
+                continue
+            if shape is None:
+                shape = list(w.shape)
+                num_dims = int(w.shape[0])
+            elif list(w.shape) != shape:
+                print(f"  [warn] {label} 的 {key} shape {list(w.shape)} 与首个 {shape} 不一致", file=sys.stderr)
+            per_dim[label] = compute_per_dim_stats(w, args.domain)
+        doc[key] = {
+            "shape": shape,
+            "num_dims": num_dims,
+            "kept_domains": [int(d) for d in args.domain] if args.domain is not None else None,
+            "per_dim": per_dim,
+        }
+
+    if args.output:
+        json_dump(doc, args.output)
+        print(f"已写入: {args.output}")
+
+    # 摘要表：取第一个保留的 domain，对比各 ckpt 的 abs_mean/std
+    d0 = (args.domain or [0])[0]
+    print()
+    print(f"摘要表（domain={d0} 切片统计对比）:")
+    header = ["key"] + [f"{l}.abs_mean" for l in labels] + [f"{l}.std" for l in labels]
+    lines = ["| " + " | ".join(header) + " |",
+             "|" + "|".join("---" for _ in header) + "|"]
+    for key, entry in doc.items():
+        cells = [key]
+        for label in labels:
+            stats = entry["per_dim"].get(label) or []
+            cells.append(f"{stats[0]['abs_mean']:.4g}" if stats else "nan")
+        for label in labels:
+            stats = entry["per_dim"].get(label) or []
+            cells.append(f"{stats[0]['std']:.4g}" if stats else "nan")
+        lines.append("| " + " | ".join(cells) + " |")
+    print("\n".join(lines))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("checkpoints", nargs="+", type=Path,
                     help="一个或多个 .safetensors 文件路径")
-    ap.add_argument("-k", "--keys", nargs="+", default=DEFAULT_KEYS,
-                    help=f"要统计的权重 key（默认动作相关权重：{len(DEFAULT_KEYS)} 个）")
+    ap.add_argument("-k", "--keys", nargs="+", default=None,
+                    help=f"要统计的权重 key（默认：普通模式动作权重 {len(DEFAULT_KEYS)} 个，"
+                         f"--per-dim 模式 {len(PER_DIM_DEFAULT_KEYS)} 个 domain 条件化权重）")
     ap.add_argument("--stat", default="abs_mean", choices=STAT_NAMES,
                     help="表格中展示的统计量（默认 abs_mean）")
     ap.add_argument("--all", action="store_true",
                     help="展示全部统计量（每个 ckpt × 每个 stat 一列）")
+    ap.add_argument("--per-dim", action="store_true",
+                    help="按 domain（dim0 轴）输出各维度统计 JSON（参考 *_per_dim_stats.json 格式），"
+                         "key 默认取 domain 条件化权重")
+    ap.add_argument("--domain", type=int, nargs="+", default=None,
+                    help="--per-dim 模式下保留的 domain 索引（默认全部）")
     ap.add_argument("-o", "--output", type=Path, default=None,
-                    help="写结果到文件（.csv → CSV，否则 markdown）；缺省打印到终端")
+                    help="写结果到文件（.json → JSON；.csv → CSV；否则 markdown）；缺省打印到终端")
     args = ap.parse_args()
+
+    if args.keys is None:
+        args.keys = PER_DIM_DEFAULT_KEYS if args.per_dim else DEFAULT_KEYS
+
+    if args.per_dim:
+        return run_per_dim(args)
 
     if args.all:
         args.stat = None
