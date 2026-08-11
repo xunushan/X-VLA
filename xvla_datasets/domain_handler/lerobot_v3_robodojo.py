@@ -217,9 +217,9 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         lt = np.arange(T, dtype=np.float64) * (self.qdur / num_actions)
         L = interp1d(lt, state_T, axis=0, bounds_error=False, fill_value=(state_T[0], state_T[-1]))
 
-        # 5. 候选帧：排除 episode 尾部不足 qdur 完整窗口的样本
-        last_start = lt[-1] - self.qdur
-        idxs = [i for i in range(T) if lt[i] <= last_start]
+        # 5. 候选帧：与参考 range(0, T-5) 一致，保留 episode 尾部候选（不足 qdur 完整窗口的
+        #    样本不排除，由下方 clamp 到末帧 + 插值压缩处理，语义 = "减速收尾、停在末姿态"）
+        idxs = list(range(max(0, T - 5)))
         if training:
             random.shuffle(idxs)
 
@@ -229,7 +229,9 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
 
         for idx in idxs:
             cur = lt[idx]
-            q = np.linspace(cur, cur + self.qdur, num_actions + 1, dtype=np.float32)
+            # 窗口终点钳到 episode 末帧：缺多少帧就把 num_actions 步压缩到剩余真实帧上
+            # （自适应亚帧插值，终点收敛到末姿态；补 0 才是错的，见 docs/xvla_alignment_plan.md §4）
+            q = np.linspace(cur, min(cur + self.qdur, float(lt[-1])), num_actions + 1, dtype=np.float32)
             seq = torch.tensor(L(q)).float()  # [num_actions+1, 20]
 
             # 跳过双臂完全静止段
