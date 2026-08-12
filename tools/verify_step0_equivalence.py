@@ -32,10 +32,19 @@ action、三项 loss 与总 loss；并做左右腕输入真实性检查（norm �
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 直接以脚本方式运行时（python tools/verify_step0_equivalence.py），sys.path[0]
+# 是 tools/ 而非仓库根目录；把仓库根目录插到最前，保证 models/xvla_datasets 可导入。
+# 若已通过 pytest / python -m / PYTHONPATH 提供根目录，则这里不重复插入。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import copy
 import json
-import sys
 from typing import Dict, List, Tuple
 
 import torch
