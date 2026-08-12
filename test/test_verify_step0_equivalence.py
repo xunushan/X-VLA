@@ -8,6 +8,7 @@ from tools.verify_step0_equivalence import (
     DTYPE_ATOL,
     action_groups_indices,
     build_condition,
+    build_control_report,
     check_wrist_authenticity,
     compare_tensor,
 )
@@ -164,3 +165,56 @@ def test_wrist_authenticity_rejects_odd_token_count():
     assert check["left_all_nonzero"] is False
     assert check["right_all_nonzero"] is False
     assert check["not_elementwise_identical"] is False
+
+
+# ---------------------------------------------------------------------------
+# build_control_report
+# ---------------------------------------------------------------------------
+
+def _make_cap(vals: dict) -> dict:
+    """构造 run_with_capture 的返回 dict（捕获键：aux_proj_output / transformer_output / loss_total）。"""
+    return {
+        "aux_proj_output": torch.zeros(2, 4),
+        "transformer_output": torch.zeros(2, 4),
+        "loss_dict": {"position_loss": torch.tensor(0.1), "rotate6D_loss": torch.tensor(0.2)},
+        "loss_total": torch.tensor(0.3),
+        **vals,
+    }
+
+
+def test_control_report_confirmed_when_differing():
+    # 官方权重 + 真实腕部特征：三项关键输出均与条件 A 明显不同 → sensitivity=confirmed
+    cap_a = _make_cap({})
+    cap_c = _make_cap({
+        "aux_proj_output": torch.ones(2, 4) * 5.0,
+        "transformer_output": torch.ones(2, 4) * 3.0,
+        "loss_total": torch.tensor(9.9),
+    })
+    report = build_control_report(cap_a, cap_c, atol=1e-5)
+    assert report["expected_differ"] is True
+    assert report["all_differed"] is True
+    assert report["sensitivity"] == "confirmed"
+
+
+def test_control_report_weak_when_identical():
+    # 若负对照与条件 A 逐位相同，说明脚本对腕部特征不敏感
+    cap_a = _make_cap({})
+    cap_c = _make_cap({})
+    report = build_control_report(cap_a, cap_c, atol=1e-5)
+    assert report["all_differed"] is False
+    assert report["sensitivity"] == "weak"
+
+
+def test_control_report_uses_loss_total_key():
+    # 回归：捕获 dict 的键是 loss_total（不是显示名 loss/total）。
+    # 此前 --control 分支用 cap_a["loss/total"] 取值导致 KeyError。
+    cap_a = _make_cap({})
+    cap_c = _make_cap({
+        "aux_proj_output": torch.ones(2, 4) * 5.0,
+        "transformer_output": torch.ones(2, 4) * 3.0,
+        "loss_total": torch.tensor(9.9),
+    })
+    report = build_control_report(cap_a, cap_c, atol=1e-5)
+    assert report["loss/total"]["max_abs_diff"] == pytest.approx(9.6)
+    assert report["loss/total"]["differed"] is True
+    assert report["sensitivity"] == "confirmed"

@@ -300,6 +300,30 @@ def run_comparisons(cap_a: dict, cap_b: dict, action_space, atol: float) -> Tupl
     return comparisons, aux_info
 
 
+def build_control_report(cap_a: dict, cap_c: dict, atol: float) -> dict:
+    """负对照：官方权重 + 真实腕部特征（不清零），预期与条件 A 明显不同。
+
+    说明脚本对腕部特征敏感（测试不是空转）。显示名与捕获键的映射在此集中维护：
+    捕获 dict 中总 loss 的键是 loss_total（compare_tensor 的显示名是 loss/total）。
+    """
+    control: dict = {
+        "expected_differ": True,
+        "note": "官方权重 + 真实腕部特征，应与 A 明显不同",
+    }
+    items = {
+        "aux_proj_output": "aux_proj_output",
+        "transformer_output": "transformer_output",
+        "loss/total": "loss_total",
+    }
+    for display, key in items.items():
+        c = compare_tensor(display, cap_a[key], cap_c[key], atol=atol)
+        control[display] = {"max_abs_diff": c["max_abs_diff"], "differed": not c["passed"]}
+    entries = [v["differed"] for v in control.values() if isinstance(v, dict)]
+    control["all_differed"] = bool(entries) and all(entries)
+    control["sensitivity"] = "confirmed" if control["all_differed"] else "weak"
+    return control
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_dir", required=True, help="官方 100k 模型权重目录（必须非实验产物）")
@@ -370,19 +394,11 @@ def main(argv=None) -> int:
     if args.control:
         print("[step0] run negative control (official aux weight, wrist unmasked)")
         cap_c = run_with_capture(model, inputs_b, args.seed)
-        control: dict = {"expected_differ": True, "note": "官方权重 + 真实腕部特征，应与 A 明显不同"}
-        for name in ("aux_proj_output", "transformer_output", "loss/total"):
-            c = compare_tensor(name, cap_a[name], cap_c[name], atol=atol)
-            control[name] = {"max_abs_diff": c["max_abs_diff"], "differed": not c["passed"]}
-        control["all_differed"] = all(control[name]["differed"] for name in control if name.startswith("loss") or name in ("aux_proj_output", "transformer_output"))
-        if control["all_differed"]:
-            control["sensitivity"] = "confirmed"
-        else:
-            control["sensitivity"] = "weak"
+        control_report = build_control_report(cap_a, cap_c, atol)
+        if control_report["sensitivity"] != "confirmed":
             failures.append(
                 "负对照未检测到明显差异——本脚本可能对腕部特征不敏感，等价结论不可信"
             )
-        control_report = control
 
     verdict = "PASS" if not failures else "FAIL"
     report = {
