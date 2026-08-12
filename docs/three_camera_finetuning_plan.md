@@ -94,7 +94,11 @@ print("grad_nonzero_ratio", (p.grad != 0).float().mean().item())
 
 若梯度为零，应检查腕部图像是否仍在其他位置被 mask、projection 是否加入 optimizer，以及是否错误 detach。
 
+当前 `train_three_camera.py` 只在第一次 backward 打印一次 `weight_norm`、`grad_norm` 和 `grad_nonzero_ratio`。其中 `weight_norm` 是第一次 optimizer update **之前**的值，预期接近 0；它不能证明参数已经更新。当前日志没有持续输出 aux 参数更新量。阶段 1 的“参数已更新”应通过比较官方初始化、`ckpt-500` 和 `ckpt-1000` 的 aux weight 来确认；历史梯度无法从 checkpoint 反推，只能来自训练时日志。
+
 ## 4. Step 0 等价性验证
+
+该验证需要单独的只读验证脚本或 notebook，不应塞进正式训练循环。原因是它需要同时保留两个模型状态、复用同一 batch 和同一份 flow noise，并抓取中间层输出；训练入口首个 batch 的梯度日志无法替代它。脚本只做 forward/比较，不保存新模型，也不修改训练数据。
 
 在训练前，对相同 batch 固定 flow noise，比较：
 
@@ -246,26 +250,54 @@ RoboDojo 官方服务中的 X-VLA `generate_actions()` 每次调用都会执行 
 
 ### 7.2 抓取漏斗指标
 
-除最终任务分数外，记录：
+指标以“单只手的一次抓取尝试”为基本单位，而不是直接以 episode 为单位。双臂同时闭合时，左右手分别计一次尝试。第一轮可以人工观看视频按同一协议标注；仿真侧逐步暴露物体位姿、夹爪位姿、指尖接触和任务状态后，再自动化相同定义。
 
-1. 接近成功率：夹爪是否到达物体附近；
-2. 抓空率：夹爪闭合但没有有效接触；
-3. 有效闭合率：物体是否位于两指之间或产生有效接触；
-4. 提起成功率：物体是否离开支撑面达到规定高度；
-5. 条件掉落率：已经提起后又掉落的比例；
-6. 最终任务成功率和任务分数。
+#### 7.2.1 事件与窗口定义
 
-定义：
+- **抓取尝试开始**：某只手的 gripper command 或实际开合量从“开”跨过“闭”阈值，并持续至少 `K_close` 个仿真 step。阈值和 `K_close` 必须按当前 gripper 标度写进评测配置；同一次持续闭合只计一次，不得每帧重复计数。
+- **尝试窗口**：从抓取尝试开始前 `K_pre` 步到开始后 `K_post` 步。建议先以视频人工标注确定合理窗口，再固化为仿真步数。
+- **目标物体**：由任务语义或仿真任务状态指定本次应操作的实例。若无法唯一指定，记录为 `ambiguous_target`，不纳入自动漏斗分母并单独报告数量。
+- **接近成功**：在尝试窗口内，夹爪中心到目标物体表面/包围盒的最小距离不超过 `d_approach`；双指模型可增加“目标位于两指张开区域附近”的几何约束。人工标注时对应“夹爪已经到达可实施抓取的邻域”，而不是仅从画面上经过物体附近。
+- **有效闭合**：闭合后的连续 `K_contact` 步内，满足至少一种证据：两侧手指均与目标接触；目标位于两指之间且存在稳定接触；或仿真提供的 grasp/contact constraint 判定成立。只碰到桌面、非目标物体或单指擦碰不算有效闭合。
+- **抓空**：发生抓取尝试，但窗口内从未达到有效闭合。它包括在物体前闭合、越过物体后闭合、只碰桌面和只夹住空气；“单指擦碰但未形成有效夹持”也计抓空，可另外标注 `edge_contact` 子类。
+- **提起成功**：有效闭合后，目标物体相对其抓取前支撑面高度增加至少 `h_lift`，并连续保持 `K_lift` 步。对非桌面任务应使用相对初始支撑面或任务定义的 lifted 状态，不能统一使用世界坐标绝对高度。
+- **掉落**：已达到提起成功后，在 episode 完成前目标不再被有效夹持，并下降超过 `h_drop`、重新接触支撑面，或仿真明确报告 grasp constraint 丢失且未在短暂容忍窗口 `K_grace` 内恢复。任务主动放置到正确目标区域不计掉落。
+- **最终任务成功**：只采用仿真环境自身的 success 判定；人工视频判断只能作为临时辅助字段，不能替换官方任务分数。
+
+`d_approach`、`K_close`、`K_pre`、`K_post`、`K_contact`、`h_lift`、`K_lift`、`h_drop`、`K_grace` 首轮先通过少量视频标注校准，不在缺乏机器人尺度信息时凭空固定数值。数值一旦用于 checkpoint 对比，中途不得改变。
+
+#### 7.2.2 汇总指标
+
+设抓取尝试数为 `N_attempt`、接近成功数为 `N_approach`、有效闭合数为 `N_valid`、成功提起数为 `N_lift`、提起后掉落数为 `N_drop`：
 
 \[
-\text{EmptyGraspRate}=\frac{\text{抓空次数}}{\text{抓取尝试次数}}
+\text{ApproachRate}=\frac{N_{approach}}{N_{attempt}}
 \]
 
 \[
-\text{DropRate}=\frac{\text{成功提起后掉落次数}}{\text{成功提起次数}}
+\text{EmptyGraspRate}=\frac{N_{attempt}-N_{valid}}{N_{attempt}}
 \]
 
-三路相机有效时，应先看到抓空率下降、有效闭合率与提起成功率上升，而不能只依据训练 loss。
+\[
+\text{ValidClosureRate}=\frac{N_{valid}}{N_{attempt}}
+\]
+
+\[
+\text{LiftRate}=\frac{N_{lift}}{N_{attempt}},\qquad
+\text{ConditionalLiftRate}=\frac{N_{lift}}{N_{valid}}
+\]
+
+\[
+\text{ConditionalDropRate}=\frac{N_{drop}}{N_{lift}}
+\]
+
+分母为 0 时指标记为 `NA`，不能记 0。除总体结果外，必须按任务、左右手、standard/random layout 分层报告，并同时报告原始计数，避免小样本比例误导。
+
+#### 7.2.3 人工视频标注过渡方案
+
+仿真代码未改造前，每次尝试至少记录：`task`、`layout_seed`、`policy_seed`、`episode`、`arm`、`attempt_index`、接近/有效闭合/提起/掉落四个布尔或 `uncertain` 标签，以及备注。建议同一组固定视频由同一标注者使用同一尺度判断；边界样本标 `uncertain`，不强行归类，并报告 uncertain 数量。
+
+三路相机有效时，应优先看到抓空率下降、有效闭合率与提起率上升，而不能只依据训练 loss。
 
 ### 7.3 评测频率
 
@@ -279,7 +311,7 @@ RoboDojo 官方服务中的 X-VLA `generate_actions()` 每次调用都会执行 
 
 ### 7.4 相机消融
 
-对最佳三相机 checkpoint 比较：
+相机消融基于**同一个已经训练好的三相机 checkpoint**，在仿真推理时只改变输入，不重新训练。所有条件使用完全相同的 `(task, layout_seed, policy_seed)`、denoising steps 和 action execution steps，做成对比较。
 
 | 输入 | 目的 |
 |---|---|
@@ -287,12 +319,77 @@ RoboDojo 官方服务中的 X-VLA `generate_actions()` 每次调用都会执行 
 | 主相机 + 左腕 | 左腕贡献 |
 | 主相机 + 右腕 | 右腕贡献 |
 | 仅主相机 | 是否保留官方能力 |
-| 腕部相机延迟 1–2 帧 | 时间同步负对照 |
-| 左右腕图像互换 | camera identity 负对照 |
+| 腕部相机延迟 1–2 帧（可选） | 时间同步压力测试 |
+| 左右腕图像互换（可选） | camera identity 压力测试 |
 
-若提升确实来自辅助相机，应表现为三路优于单腕，单腕优于仅主图；延迟或互换腕部图像后性能应下降。
+mask 某路腕相机时，应保留该相机 token 槽位并将其视觉特征置零，使其经过 projection 后仍产生训练约定的 bias/default token；不要删掉 token 导致后续位置整体变化。
+
+第一轮必做项只有完整三路、仅左腕、仅右腕和仅主相机。延迟 1–2 帧需要仿真 client 保存每路腕部图像的短队列，左右互换也需要推理输入路由开关，均属于后续压力测试，不阻塞第一轮晋级。它们不是常规“贡献消融”：延迟下降说明时间同步敏感，互换下降说明模型使用了相机身份；结果不下降也不能单独证明腕部无用。
+
+理想趋势是三路优于最佳单腕，最佳单腕优于仅主图；但左右相机视野遮挡和任务分工可能不对称，因此不要求每个任务上两只单腕都严格优于主图。判断时使用第 7.2 节漏斗指标和最终任务成功率。
 
 ## 8. 停止与回退条件
+
+### 8.1 每个 checkpoint 的离线监控清单
+
+每个 `ckpt-500` 间隔都生成一份与前一 checkpoint 和官方初始化对比的报告。固定使用 FP32 读取权重并采用同一套离线验证 batch。
+
+#### A. 训练日志指标（不能仅靠 checkpoint 恢复）
+
+| 指标 | 定义 | 关注点 |
+|---|---|---|
+| total/component loss | effective batch 上的 total、position、rotation、gripper loss | NaN/Inf、持续上升、某一分量独占总损失 |
+| global grad norm | 梯度裁剪前所有当前可训练参数的 L2 norm | 非有限值、尖峰、阶段切换后数量级突变 |
+| aux grad norm | `||∇W_aux||₂` | 首 batch 必须大于 0；持续监控需以后增加日志，历史 checkpoint 无法补算 |
+| aux grad nonzero ratio | `count(∇W_aux != 0)/numel(W_aux)` | 首 batch必须大于 0；异常接近 0 时检查 mask/detach |
+| learning rate | 每个参数组的实际 LR | 是否与当前阶段表一致 |
+
+“loss 没有发散”的操作定义：任一 loss 或 grad norm 出现 NaN/Inf 立即停止；相对于同阶段最近稳定窗口的中位数，total loss 连续 `M` 个日志窗口高于预设倍数，或持续单调恶化，则触发人工检查。倍数与 `M` 在 smoke test 后根据正常波动确定，并固定在实验记录中，避免事后挑阈值。
+
+#### B. checkpoint 参数指标
+
+对每个受控参数组 `g` 记录：
+
+\[
+\|\theta_g^{(t)}\|_2,
+\qquad
+\Delta_g^{(t)}=\|\theta_g^{(t)}-\theta_g^{(t-1)}\|_2,
+\qquad
+r_g^{(t)}=\frac{\Delta_g^{(t)}}{\|\theta_g^{(t-1)}\|_2+\epsilon}
+\]
+
+aux weight 从零初始化，首个相对变化率分母接近零，没有解释意义；阶段 1 应改为同时报告 `||W_aux||₂`、每元素 RMS、最大绝对值、有限值比例，以及相邻 checkpoint 的 `Δ_aux`。具体检查：
+
+- `ckpt-500` 的 `||W_aux||₂ > 0` 且 `Δ_aux > 0`，证明参数确实更新；
+- 所有受训参数 finite ratio 必须为 100%；
+- aux weight 的 norm、RMS、max-abs 随 checkpoint 平滑变化，不出现无对应 loss/grad 异常的数量级跳变；
+- 阶段 1 的 aux bias、action heads、soft prompt、Transformer blocks、VLM 应与官方初始化逐元素相同；
+- 阶段 2 中 Transformer blocks/VLM 应保持不变；阶段 3 中 VLM、`vlm_proj`、`pos_emb`、`transformer.norm` 应保持不变；
+- action heads 和 soft prompt 的非目标 domain 行必须逐元素不变；
+- 报告缺失 key、额外 key、shape 或 dtype 变化，任一非预期变化都阻塞晋级。
+
+“参数暴增”不使用单一绝对 norm 阈值拍脑袋定义。初始规则为：相邻 checkpoint 的 norm/RMS/max-abs 出现数量级跳变，同时伴随 loss、grad norm 或固定离线输出恶化时立即停止；积累至少三个正常 checkpoint 后，用正常轨迹的中位数与 MAD/IQR 建立告警带。告警先触发人工复核，不把一次孤立尖峰自动等同模型失败。
+
+#### C. 固定离线 batch 的输出漂移
+
+建立一组冻结的 validation batch，固定样本顺序、预处理、timestep 和 flow noise。对每个 checkpoint 记录：
+
+- position、rotation、gripper 三项 loss 和 total loss；
+- 预测 action 各维均值、标准差、最小值、最大值和 finite ratio；
+- 相对官方模型及前一 checkpoint 的 action RMS difference；
+- gripper 概率均值、饱和比例（接近 0 或 1 的比例）和翻转率；
+- position/rotation 输出是否越过训练数据的高分位范围。
+
+“action 方差”必须区分两个概念：
+
+1. **固定 noise 的 checkpoint 输出漂移**：同一输入和同一 flow noise 下，不同 checkpoint 输出的变化，用于发现训练导致的异常漂移；
+2. **policy stochastic variance**：同一 observation/layout 下改变多个 policy seed 后，最终 action 或轨迹的方差，用于衡量 flow noise 敏感性。
+
+不得把数据集中不同 observation 的自然动作差异当作 policy stochastic variance。推荐对位置、旋转、gripper 分组报告，避免量纲混合。训练数据标准化空间内可报告各组 RMS variance；部署空间内额外报告首个执行窗口的末端位置离散度、旋转离散度和 gripper 决策不一致率。
+
+“action 方差显著增大”的默认统计判定：在完全相同的固定样本和 policy seeds 上，与官方基线做成对比较；若多数样本的方差增加且整体比率的 bootstrap 置信区间排除 1，再结合漏斗指标判断是否有害。在样本不足以做置信区间时，只标记为观察项，不作为单独回退理由。
+
+### 8.2 阶段晋级与回退判定
 
 继续下一阶段至少应满足：
 
@@ -310,6 +407,21 @@ RoboDojo 官方服务中的 X-VLA `generate_actions()` 每次调用都会执行 
 - auxiliary weight 梯度异常或参数暴增；
 - offline loss 下降但抓取漏斗指标不改善；
 - 三相机提升在 mask 腕部相机后仍完全不变，说明模型可能没有真正利用腕部输入。
+
+最后一项应理解为“需要调查”，而不是仅凭一次消融立即停止：如果三路与仅主图在足量成对样本上的漏斗指标、任务成功率和动作输出都近似相同，才认为模型可能未利用腕部输入。
+
+### 8.3 阶段结束报告模板
+
+每个阶段结束至少填写：
+
+1. checkpoint、global step、训练命令、git commit、数据 meta 哈希、effective batch；
+2. 本阶段 loss/grad 曲线摘要及异常窗口；
+3. 各参数组 norm、RMS、max-abs、相邻 checkpoint delta、冻结参数一致性；
+4. 固定离线 batch 的三项 loss、action drift、gripper 饱和/翻转；
+5. 固定 `(layout_seed, policy_seed)` 的第 7.2 节原始事件计数和比例；
+6. 原有成功场景回归结果；
+7. 相机 mask 消融结果（阶段 1 可先少量诊断，最终最佳 checkpoint 做完整消融）；
+8. 结论：晋级、延长当前阶段、回退或需要补充证据，并写明依据。
 
 ## 9. 第一轮最小实验
 
@@ -406,9 +518,9 @@ RoboDojo 官方服务中的 X-VLA `generate_actions()` 每次调用都会执行 
 ```bash
 cd /path/to/X-VLA
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate lerobot
+conda activate xvla
 
-export XVLA_MODEL=/data/checkpoints/xvla/X-VLA-Pt
+export XVLA_MODEL=/data/checkpoints/xvla/ckpt-100000
 export XVLA_META=/data/data/lerobot_v30_ee_6d/meta.json
 export XVLA_OUT=/data/outputs/xvla_three_camera
 ```

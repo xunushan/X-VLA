@@ -61,6 +61,29 @@ def _group(name: str, params, *, weight_decay: float = 0.0) -> dict:
     return {"name": name, "params": params, "lr": 0.0, "weight_decay": weight_decay}
 
 
+def _validate_groups(model, groups: list[dict]) -> set[int]:
+    """Reject duplicate optimizer parameters and verify intentional freezes."""
+    grouped_ids: set[int] = set()
+    for group in groups:
+        for parameter in group["params"]:
+            parameter_id = id(parameter)
+            if parameter_id in grouped_ids:
+                raise ValueError(
+                    f"Parameter appears in more than one optimizer group: {group['name']}"
+                )
+            grouped_ids.add(parameter_id)
+
+    intentionally_frozen = {
+        "transformer.vlm_proj": model.transformer.vlm_proj.parameters(),
+        "transformer.norm": model.transformer.norm.parameters(),
+        "transformer.pos_emb": (model.transformer.pos_emb,),
+    }
+    for module_name, parameters in intentionally_frozen.items():
+        if any(id(parameter) in grouped_ids for parameter in parameters):
+            raise ValueError(f"Intentionally frozen module entered optimizer: {module_name}")
+    return grouped_ids
+
+
 def build_three_camera_optimizer(
     model,
     lr: float,
@@ -91,9 +114,10 @@ def build_three_camera_optimizer(
         _INITIALIZED_MODEL_IDS.add(model_id)
 
     first_aux_grad_logged = False
+    aux_hook_handle = None
 
     def log_first_aux_grad(grad: torch.Tensor) -> torch.Tensor:
-        nonlocal first_aux_grad_logged
+        nonlocal first_aux_grad_logged, aux_hook_handle
         if not first_aux_grad_logged:
             print(
                 "[three-camera] first aux backward: "
@@ -102,9 +126,13 @@ def build_three_camera_optimizer(
                 f"grad_nonzero_ratio={(grad != 0).float().mean().item():.6f}"
             )
             first_aux_grad_logged = True
+            # This is a one-shot diagnostic. Removing it avoids an extra Python
+            # callback on every later backward in stages 1-3.
+            if aux_hook_handle is not None:
+                aux_hook_handle.remove()
         return grad
 
-    aux.weight.register_hook(log_first_aux_grad)
+    aux_hook_handle = aux.weight.register_hook(log_first_aux_grad)
 
     domain_parameters = {
         "soft_prompt": transformer.soft_prompt_hub.weight,
@@ -138,7 +166,7 @@ def build_three_camera_optimizer(
         _group("vlm", model.vlm.parameters(), weight_decay=weight_decay),
     ]
 
-    grouped_ids = {id(p) for group in groups for p in group["params"]}
+    grouped_ids = _validate_groups(model, groups)
     for parameter in model.parameters():
         parameter.requires_grad = id(parameter) in grouped_ids
 
