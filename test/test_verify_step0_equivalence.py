@@ -11,6 +11,7 @@ from tools.verify_step0_equivalence import (
     build_control_report,
     check_wrist_authenticity,
     compare_tensor,
+    run_comparisons,
 )
 
 
@@ -218,3 +219,67 @@ def test_control_report_uses_loss_total_key():
     assert report["loss/total"]["max_abs_diff"] == pytest.approx(9.6)
     assert report["loss/total"]["differed"] is True
     assert report["sensitivity"] == "confirmed"
+
+
+# ---------------------------------------------------------------------------
+# run_comparisons
+# ---------------------------------------------------------------------------
+
+class _FakeActionSpace:
+    POS_IDX_1 = (0,)
+    POS_IDX_2 = (3,)
+    ROT_IDX_1 = (1, 2)
+    ROT_IDX_2 = (4, 5)
+    gripper_idx = (6, 7)
+
+
+def _make_caps(vlm_diff: float = 0.0) -> tuple[dict, dict]:
+    """两条件捕获：aux/vlm/transformer/loss，pred_action 为 [B,T,8]。"""
+    losses = {
+        "position_loss": torch.tensor(0.1),
+        "rotate6D_loss": torch.tensor(0.2),
+        "gripper_loss": torch.tensor(0.3),
+    }
+
+    def _cap():
+        return {
+            "aux_proj_output": torch.zeros(2, 4, 8),
+            "aux_visual_inputs": torch.zeros(2, 4, 8),
+            "vlm_features": torch.zeros(2, 4, 8),
+            "transformer_output": torch.zeros(2, 4, 8),
+            "loss_dict": {k: v.clone() for k, v in losses.items()},
+        }
+
+    cap_a = _cap()
+    cap_b = _cap()
+    cap_b["vlm_features"] = torch.ones(2, 4, 8) * vlm_diff
+    for c in (cap_a, cap_b):
+        c["loss_total"] = sum(c["loss_dict"].values()).clone()
+    return cap_a, cap_b
+
+
+def test_run_comparisons_gates_plan_items_only():
+    cap_a, cap_b = _make_caps(vlm_diff=1e-3)  # vlm_features 明显不同
+    comparisons, informational = run_comparisons(cap_a, cap_b, _FakeActionSpace(), atol=1e-5)
+    # plan §4 验收项全部在 comparisons 且通过
+    for name in ("aux_proj_output", "transformer_output",
+                 "action/position", "action/rotation", "action/gripper",
+                 "loss/position_loss", "loss/rotate6D_loss", "loss/gripper_loss", "loss/total"):
+        assert comparisons[name]["passed"] is True
+    # vlm_features 在 informational，只 gate shape，不判 FAIL
+    assert "vlm_features" not in comparisons
+    vlm = informational["vlm_features"]
+    assert vlm["gate_shape_only"] is True
+    assert vlm["shape_match"] is True
+    assert vlm["max_abs_diff"] == pytest.approx(1e-3)  # 报告但不 gate
+    assert informational["aux_visual_inputs"]["A_is_all_zero"] is True
+
+
+def test_run_comparisons_reports_aux_expected_differ():
+    cap_a, cap_b = _make_caps()
+    cap_b["aux_visual_inputs"] = torch.ones(2, 4, 8)
+    cap_a["aux_visual_inputs"] = torch.zeros(2, 4, 8)
+    comparisons, informational = run_comparisons(cap_a, cap_b, _FakeActionSpace(), atol=1e-5)
+    aux = informational["aux_visual_inputs"]
+    assert aux["expected_differ"] is True
+    assert aux["A_is_all_zero"] is True
