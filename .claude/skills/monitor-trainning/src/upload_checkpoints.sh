@@ -11,13 +11,13 @@
 #
 # 用法：
 #   bash upload_checkpoints.sh [OUTPUT_DIR] [REPO] [EXP] [MIN_STEP] [POLL_SEC]
-#   默认 OUTPUT_DIR=${UPLOAD_OUTPUT_DIR:-./runnings}, REPO=tianSeconds/goai,
-#        EXP=xvla-ee6d, MIN_STEP=0, POLL_SEC=600, RETRY_SEC=300
+#   默认 OUTPUT_DIR=${UPLOAD_OUTPUT_DIR:-./runnings}, REPO=tianSeconds/finetunning,
+#        EXP=pretrained, MIN_STEP=0, POLL_SEC=600, RETRY_SEC=300
 #
 # 服务器（train）后台启动（hf CLI 在 xvla conda env，不在 PATH）：
 #   ssh train "cd /data/X-VLA && PATH=/data/miniconda3/bin:\$PATH \
 #     nohup bash .claude/skills/monitor-trainning/src/upload_checkpoints.sh \
-#     /cloud/cloud-ssd1/xvla_formal tianSeconds/goai xvla-ee6d 12000 600 \
+#     /cloud/cloud-ssd1/xvla_formal tianSeconds/finetunning pretrained 12000 600 \
 #     </dev/null >/cloud/cloud-ssd1/upload_watcher.log 2>&1 &"
 #
 # 产物：
@@ -28,8 +28,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${1:-${UPLOAD_OUTPUT_DIR:-${SCRIPT_DIR}/runnings}}"
-REPO="${2:-tianSeconds/goai}"
-EXP="${3:-xvla-ee6d}"
+REPO="${2:-tianSeconds/finetunning}"
+EXP="${3:-pretrained}"
 MIN_STEP="${4:-0}"
 POLL_SEC="${5:-600}"
 RETRY_SEC="${6:-300}"
@@ -85,7 +85,7 @@ while true; do
   step="${pending}"
   num=$((10#${step}))
   ckpt="${OUTPUT_DIR}/pretrained/ckpt-${step}"
-  target="$(printf '%s/%06d' "${EXP}" "${num}")"
+  target="$(printf '%s/ckpt-%d' "${EXP}" "${num}")"
 
   # 已发起过但上传进程消失且未成功（崩溃/失败）→ 超 RETRY_SEC 才重拉，避免死循环
   if [ -f "${UPLOAD_LOG_DIR}/started_${step}" ]; then

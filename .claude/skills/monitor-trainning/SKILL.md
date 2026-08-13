@@ -106,20 +106,19 @@ JSON 结构：`{key: {"shape", "num_dims", "kept_domains", "per_dim": {"<ckpt标
 
 ## 上传 checkpoint 到 HuggingFace
 
-**目标文件夹不固定**：仓库根目录下按实验名建文件夹（如 `xvla-ee6d`、`xvla-arx-x5`），目录内放 `{step6位补零}/`。**初次上传时 `hf upload` 会自动新建文件夹**，无需先手动建；上传前用 `hf repo list` 或 HF API 查根目录确认目标是否存在（避免误写进已有实验目录）。
+**目标文件夹不固定**：仓库根目录下建文件夹，目录内放完整 checkpoint（如 `pretrained/ckpt-{N}`）。**初次上传时 `hf upload` 会自动新建文件夹**，无需先手动建；上传前用 `hf repo list` 或 HF API 查根目录确认目标是否存在（避免误写进已有实验目录）。
 
 ```bash
 # 后台上传（ssh 会挂起是预期，用轮询确认完成）
-REPO=tianSeconds/goai
-EXP=xvla-ee6d                     # ← 实验名，首次上传自动建该文件夹
+REPO=tianSeconds/finetunning
 CKPT=$OUTPUT_DIR/pretrained/ckpt-20000
 ssh train "cd /cloud/cloud-ssd1 && nohup hf upload $REPO \
-  $CKPT $EXP/020000 \
+  $CKPT pretrained/ckpt-20000 \
   > /cloud/cloud-ssd1/upload_20000.log 2>&1 & echo started"
 ssh train "ps aux | grep '[h]f upload' | grep -v grep | wc -l"   # 轮询，进程退出=完成
 ```
 
-- 目标路径格式：`{实验名}/{step6位补零}/`（如 `xvla-ee6d/020000`）
+- 目标路径格式：`pretrained/ckpt-{N}`（如 `pretrained/ckpt-20000`）
 - 数据转换脚本（16d→20d 生成）：`tools/make_goai_20d.py <src_root> <dst_root>`
 
 ## prune：checkpoint 自动清理
