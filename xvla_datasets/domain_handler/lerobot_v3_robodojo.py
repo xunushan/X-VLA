@@ -272,8 +272,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                     )
                 random.shuffle(idxs)
             else:
-                fw = fw[:T]
-                w = fw[idxs]  # 花式索引取候选帧权重（fw 已为 float64）
+                # 候选帧 idxs = range(0, T-5) 帧序连续，fw 本身按帧序 → 直接切片前 len(idxs) 个即可
+                w = fw[: len(idxs)]
                 w = np.clip(w, 1e-8, None)  # 防全 0 / 非正权重
                 idxs = np.random.choice(idxs, size=len(idxs), replace=True, p=w / w.sum()).tolist()
         elif training:
