@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import random
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -76,6 +77,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         self.meta.setdefault("datalist", self.build_datalist(meta))
         self.episodes: Dict[int, dict] = self._load_episodes()
         self._pq_cache: Dict[str, dict] = {}
+        # frame_weight 列缺失告警（per-handler 一次；DataLoader 每 worker 一个 handler 实例）
+        self._warned_missing_frame_weight = False
 
     # ------------------------------------------------------------------ meta 加载
     @staticmethod
@@ -128,6 +131,20 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         data = self._read_parquet(f"chunk-{ci:03d}/file-{fi:03d}.parquet")
         lo, hi = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
         return np.stack(data["observation.state"][lo:hi]).astype(np.float32)
+
+    def _read_frame_weight(self, ep: dict) -> np.ndarray | None:
+        """读取该 episode 的 frame_weight（与 observation.state 同行对齐，逐帧采样权重）。
+
+        与 _read_state 同一定位方式（同表同 [lo:hi] 切片）；主表无 frame_weight 列时返回
+        None（旧数据），调用方负责兜底。
+        """
+        ci, fi = int(ep["data/chunk_index"]), int(ep["data/file_index"])
+        data = self._read_parquet(f"chunk-{ci:03d}/file-{fi:03d}.parquet")
+        fw = data.get("frame_weight")
+        if fw is None:
+            return None
+        lo, hi = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
+        return np.asarray(fw[lo:hi], dtype=np.float64)
 
     @staticmethod
     def _to_20d(arr: np.ndarray) -> np.ndarray:
@@ -204,6 +221,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         image_aug,
         lang_aug_map: dict | None = None,
         frame_info: bool = False,
+        use_frame_weight: bool = False,
         **kwargs,
     ) -> Iterable[dict]:
         ep_idx = self.meta["datalist"][traj_idx]
@@ -238,7 +256,40 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         # 5. 候选帧：与参考 range(0, T-5) 一致，保留 episode 尾部候选（不足 qdur 完整窗口的
         #    样本不排除，由下方 clamp 到末帧 + 插值压缩处理，语义 = "减速收尾、停在末姿态"）
         idxs = list(range(max(0, T - 5)))
-        if training:
+        if training and use_frame_weight:
+            # frame_weight 有放回采样：先把双臂静止候选按与下方一致的判据过滤掉（避免权重
+            # 落到会被 skip 的帧上导致样本数不定），再对「会真正产出样本」的候选按
+            # frame_weight 归一化为概率做有放回抽取，抽取次数 = 候选数 → 高权重帧被重复
+            # 采样（过采样）、低权重帧可能被跳过，样本总量≈现状。帧权重与 state 同表同行，
+            # 截断到公共长度 T 后索引对齐。
+            fw = self._read_frame_weight(ep)
+            if fw is None:
+                if not self._warned_missing_frame_weight:
+                    self._warned_missing_frame_weight = True
+                    print(
+                        f"[lerobot_v3_robodojo] WARN ep={ep_idx}: main table has no "
+                        "'frame_weight' column; fall back to uniform sampling",
+                        file=sys.stderr,
+                    )
+                random.shuffle(idxs)
+            else:
+                fw = fw[:T]
+                moving, w = [], []
+                for i in idxs:
+                    q = np.linspace(
+                        lt[i], min(lt[i] + self.qdur, float(lt[-1])), num_actions + 1, dtype=np.float32
+                    )
+                    seq = torch.tensor(L(q)).float()
+                    if (seq[1] - seq[0]).abs().max() < 1e-5:
+                        continue
+                    moving.append(i)
+                    w.append(float(fw[i]))
+                if not moving:
+                    return  # 全部候选静止，无样本（与均匀路径全 skip 语义一致）
+                w = np.asarray(w, dtype=np.float64)
+                w = np.clip(w, 1e-8, None)  # 防全 0 / 非正权重
+                idxs = np.random.choice(moving, size=len(moving), replace=True, p=w / w.sum()).tolist()
+        elif training:
             random.shuffle(idxs)
 
         ins = self._instruction(ep)

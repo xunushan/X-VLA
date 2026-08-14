@@ -37,18 +37,21 @@ class InfiniteDataReader(IterableDataset):
         'action': FloatTensor[T, dim_action]
       }
     """
-    def __init__(self, 
-                 metas_path: str, 
-                 num_actions: int = 10, 
-                 num_views: int = 3, 
+    def __init__(self,
+                 metas_path: str,
+                 num_actions: int = 10,
+                 num_views: int = 3,
                  training: bool = True,
                  action_mode: str = "ee6d",
                  lang_aug: str = None,
+                 use_frame_weight: bool = False,
                  ):
         self.num_views = num_views
         self.training = training
         self.num_actions = num_actions
         self.action_mode = action_mode
+        # lerobot v3.0 逐帧采样权重（data/*.parquet frame_weight 列）：开启后高权重帧有放回过采样
+        self.use_frame_weight = use_frame_weight
         self.metas: Dict[str, dict] = {}
         print("use action mode:", action_mode)
         if fileio.isdir(metas_path):
@@ -100,6 +103,10 @@ class InfiniteDataReader(IterableDataset):
         else: robot_type = dataset_name
         Handler = get_handler_cls(robot_type)
         handler = Handler(meta=meta, num_views=self.num_views)
+        # frame_weight 采样是 lerobot v3.0 专属能力（其他 handler 的 iter_episode 未必带
+        # **kwargs，不能全局透传），仅在 v3.0 数据集上转发
+        ep_kwargs = {"use_frame_weight": self.use_frame_weight} \
+            if meta.get("codebase_version") == "v3.0" else {}
         for traj_idx in traj_indices:
                 for sample in handler.iter_episode(
                     traj_idx,
@@ -107,7 +114,8 @@ class InfiniteDataReader(IterableDataset):
                     training=self.training,
                     image_aug=self.image_aug,
                     lang_aug_map= meta["lang_aug_map"] if "lang_aug_map" in meta.keys() else None,
-                    action_mode = self.action_mode
+                    action_mode = self.action_mode,
+                    **ep_kwargs,
                 ):
                     sample["domain_id"] = torch.tensor(DATA_DOMAIN_ID.get(robot_type, 0))
                     idx_for_delta = sample.pop("idx_for_delta", [])

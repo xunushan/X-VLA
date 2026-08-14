@@ -125,6 +125,15 @@ def get_args_parser():
         help="Override pretrained action_mode (e.g. arx_ee6d); None keeps the pretrained config",
     )
 
+    # Data sampling
+    parser.add_argument(
+        "--frame_weight_sampling",
+        action="store_true",
+        default=False,
+        help="Enable per-frame importance sampling for lerobot v3.0 datasets: frames with higher "
+        "frame_weight (main table column) are over-sampled with replacement during training",
+    )
+
     # Optimizer
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument(
@@ -577,6 +586,7 @@ def main(args):
         action_mode=model.action_mode,
         training=True,
         num_workers=args.num_workers,
+        use_frame_weight=args.frame_weight_sampling,
     )
     train_dataloader = accelerator.prepare(train_dataloader, device_placement=[False])
     train_iter = iter(train_dataloader)
