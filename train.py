@@ -576,11 +576,17 @@ def main(args):
     )
 
     # 逐 action step 位置损失加权：运行时属性，不写进 checkpoint config，resume 由本参数重开。
-    # 仅对 ee6d 家族 action space 生效（compute_loss 内 getattr 判断）。
+    # 仅在 ee6d action space 中实现；其他 action_mode 开启时该参数无效，告警提示避免静默 no-op。
     if args.position_step_weighting:
-        model.action_space.use_step_weights = True
-        logger.info("Enable action-step weighted position loss "
-                    "(steps 1-10 x2.0 / 11-15 x1.5 / 16-30 x1.0, normalized to mean 1.0)")
+        if model.action_mode != "ee6d":
+            logger.warning(
+                f"--position_step_weighting enabled but action_mode={model.action_mode}; "
+                "step weighting is only implemented in the 'ee6d' action space, ignored"
+            )
+        else:
+            model.action_space.use_step_weights = True
+            logger.info("Enable action-step weighted position loss "
+                        "(steps 1-10 x2.0 / 11-15 x1.5 / 16-30 x1.0, normalized to mean 1.0)")
 
     # Iterable dataloader。多进程数据分片：accelerate 对 IterableDataset 自动套
     # IterableDatasetShard 按 rank 切流（不是 DistributedSampler——那只适用 map-style
