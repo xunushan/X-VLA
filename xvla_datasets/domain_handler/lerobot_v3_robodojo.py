@@ -257,11 +257,10 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         #    样本不排除，由下方 clamp 到末帧 + 插值压缩处理，语义 = "减速收尾、停在末姿态"）
         idxs = list(range(max(0, T - 5)))
         if training and use_frame_weight:
-            # frame_weight 有放回采样：先把双臂静止候选按与下方一致的判据过滤掉（避免权重
-            # 落到会被 skip 的帧上导致样本数不定），再对「会真正产出样本」的候选按
-            # frame_weight 归一化为概率做有放回抽取，抽取次数 = 候选数 → 高权重帧被重复
-            # 采样（过采样）、低权重帧可能被跳过，样本总量≈现状。帧权重与 state 同表同行，
-            # 截断到公共长度 T 后索引对齐。
+            # frame_weight 有放回采样：直接对全部候选帧按 frame_weight 归一化概率抽样。
+            # 高权重帧不会静止，无需预过滤静止候选（省去对每个候选预计算 seq 的开销）；
+            # 权重落到的静止帧由下方现有判据 inline skip（低权重帧，影响可忽略）。
+            # 抽取次数 = 候选数，样本总量≈现状。帧权重与 state 同表同行，截断到公共长度 T 后索引对齐。
             fw = self._read_frame_weight(ep)
             if fw is None:
                 if not self._warned_missing_frame_weight:
@@ -274,21 +273,9 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                 random.shuffle(idxs)
             else:
                 fw = fw[:T]
-                moving, w = [], []
-                for i in idxs:
-                    q = np.linspace(
-                        lt[i], min(lt[i] + self.qdur, float(lt[-1])), num_actions + 1, dtype=np.float32
-                    )
-                    seq = torch.tensor(L(q)).float()
-                    if (seq[1] - seq[0]).abs().max() < 1e-5:
-                        continue
-                    moving.append(i)
-                    w.append(float(fw[i]))
-                if not moving:
-                    return  # 全部候选静止，无样本（与均匀路径全 skip 语义一致）
-                w = np.asarray(w, dtype=np.float64)
+                w = np.asarray([float(fw[i]) for i in idxs], dtype=np.float64)
                 w = np.clip(w, 1e-8, None)  # 防全 0 / 非正权重
-                idxs = np.random.choice(moving, size=len(moving), replace=True, p=w / w.sum()).tolist()
+                idxs = np.random.choice(idxs, size=len(idxs), replace=True, p=w / w.sum()).tolist()
         elif training:
             random.shuffle(idxs)
 
