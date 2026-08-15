@@ -294,6 +294,11 @@ def main(args: argparse.Namespace) -> None:
                 raise ValueError(
                     "Weights-only continuation warmup requires state.json with global_step"
                 )
+            if int(start) < args.stage2_end:
+                raise ValueError(
+                    "Weights-only continuation warmup requires a stage-3 checkpoint: "
+                    f"global_step={start} < stage2_end={args.stage2_end}"
+                )
             args._continuation_warmup_start = int(start)
             print(
                 "[three-camera] weights-only continuation warmup: "

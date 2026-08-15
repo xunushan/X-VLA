@@ -263,17 +263,17 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             # 抽取次数 = 候选数，样本总量≈现状。帧权重与 state 同表同行，截断到公共长度 T 后索引对齐。
             fw = self._read_frame_weight(ep)
             if fw is None:
-                if not self._warned_missing_frame_weight:
-                    self._warned_missing_frame_weight = True
-                    print(
-                        f"[lerobot_v3_robodojo] WARN ep={ep_idx}: main table has no "
-                        "'frame_weight' column; fall back to uniform sampling",
-                        file=sys.stderr,
-                    )
-                random.shuffle(idxs)
+                raise RuntimeError(
+                    f"--frame_weight_sampling requires a valid 'frame_weight' column; "
+                    f"missing for episode {ep_idx}. Run tools/add_frame_weight.py verify first."
+                )
             else:
                 # 候选帧 idxs = range(0, T-5) 帧序连续，fw 本身按帧序 → 直接切片前 len(idxs) 个即可
                 w = fw[: len(idxs)]
+                if not np.isfinite(w).all() or (w <= 0).any():
+                    raise ValueError(
+                        f"Invalid frame_weight for episode {ep_idx}: values must be finite and > 0"
+                    )
                 w = np.clip(w, 1e-8, None)  # 防全 0 / 非正权重
                 idxs = np.random.choice(idxs, size=len(idxs), replace=True, p=w / w.sum()).tolist()
         elif training:

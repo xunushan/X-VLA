@@ -26,7 +26,10 @@ python tools/add_frame_weight.py verify --csv /data/data/lerobot_v30_ee.csv --da
 ```
 
 - CSV 需含 `episode_index`+`frame_index`，权重取 `frame_weight` 列（直接用）或 `key`/`is_key` 列（key=1.5/普通=1.0，可用 `--weight-key/--weight-normal` 覆盖）。
-- **开服务器后第一步 inspect CSV**：确认 schema 与权重语义（若 CSV 是原始 gripper/位姿信号而非现成 key 标记，则需按计划 §2 推导，先与用户确认再落盘）。
+
+**CSV 已核验（2026-08-15 本地检查）**：`lerobot_v30_ee.csv`（本地 `/Users/isuntaiyang/Documents/competition/goai_2026/data/lerobot_v30_ee.csv`）**已自带 `frame_weight` 列**，仅 1.0/1.5 两个值，无 NaN/异常；592,432 帧 / 1200 episode（train 1080 + val 120）/ 12 task；每 episode `frame_index` 连续 0..len-1 且与 `length` 列一致（0 mismatch）→ 与 ee_6d 主表 `[dataset_from/to_index]` 切片对齐可靠，**无需按计划 §2 推导**。per-task key 比例 13.5%–47.8%，总体 31.4%。
+
+- 服务器路径待确认：脚本默认 `/data/data/lerobot_v30_ee.csv`；若服务器无此文件，需先把本地 CSV 上传（522MB）或指定实际路径。
 
 ## 2. 任务 2：下载 ckpt-6000
 
@@ -92,7 +95,7 @@ No optimizer state for resume; starting fresh optimizer
 ## 4. 执行顺序（服务器开启后）
 
 1. 下载 ckpt-6000 → 校验
-2. `add_frame_weight.py inspect` CSV → **与用户确认权重语义** → apply → verify
+2. 确认服务器上 CSV 路径（无则上传本地 522MB CSV）→ `add_frame_weight.py inspect` 与 ee_6d episodes 对帧数 → apply → verify（抽查权重列与关键帧占比）
 3. **等用户 LR 代码合入**，按其参数更新训练命令 → 确认 → 启动 K1 → 日志验证（resume/stage 3/采样比例）
 4. K1 到 7000（诊断）检查，正常则继续到 9000
 5. K2 从同基线启动 → 同样验证

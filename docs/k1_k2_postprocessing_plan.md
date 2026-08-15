@@ -53,7 +53,7 @@ normal weight = 1.0
 
 它不是强制 key 占 batch 的 60%。若原始 key 占比为 `f`，理论加权比例为 `1.5f/(1+0.5f)`。
 
-先保证任务和 episode 覆盖，再在 episode 内应用 key 权重。日志记录实际 key 比例、任务/episode 分布、相邻起点重复度和三路相机 mask。
+先保证任务和 episode 覆盖，再在 episode 内应用 key 权重。采样是在每个 episode 内独立归一化，因此上述公式只表示单个 episode 的理论比例；全局实际比例还取决于各 episode 的 key 分布。启动前必须用 `tools/add_frame_weight.py verify` 检查所有主表都存在有限且大于0的 `frame_weight`。启用采样后若列缺失或非法，数据加载会立即失败，不允许静默退化成均匀采样。
 
 K1 不冻结 `aux_visual_proj`。关键帧附近腕部图像更可能包含抓取点、夹爪—物体关系和局部对齐信息，重采样既强化关键动作，也提高有效辅助视觉样本对模型梯度的占比。
 
@@ -75,7 +75,7 @@ action step 16--30: weight=1.0
 L_pos = sum(w[t] * mse[t]) / sum(w[t])
 ```
 
-必须验证全部 `w=1` 时与原 position loss 数值等价，并只读记录 step 1--10、11--15、16--30 三段 loss。梯度累积和 `accelerator.clip_grad_norm_` 保持原实现。
+必须验证全部 `w=1` 时与原 position loss 数值等价。当前训练日志记录归一化加权后的总 position loss，不承诺输出三个区间的独立loss；若后续需要分段诊断，应作为只读指标实现，不能重复加入total loss。梯度累积和 `accelerator.clip_grad_norm_` 保持原实现。
 
 ## 5. 训练设置
 
@@ -135,6 +135,16 @@ export XVLA_BASE=/data/checkpoints/pretrained/ckpt-6000
 export XVLA_K1_OUT=/cloud/cloud-ssd1/xvla_k1
 export XVLA_K2_OUT=/cloud/cloud-ssd1/xvla_k2
 ```
+
+训练数据权重必须先通过：
+
+```bash
+python tools/add_frame_weight.py verify \
+  --csv /data/data/lerobot_v30_ee.csv \
+  --data-root /data/data/lerobot_v30_ee_6d
+```
+
+命令必须以退出码0结束并打印 `VERIFY PASSED`；否则禁止启动K1/K2。
 
 启动前检查：
 

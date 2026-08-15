@@ -176,3 +176,69 @@ def test_invalid_stage3_schedule_arguments_are_rejected():
             pass
         else:
             raise AssertionError("invalid stage-3 schedule arguments must raise ValueError")
+
+
+def test_main_starts_warmup_only_for_weights_only_resume(monkeypatch):
+    # main() intentionally installs the three-camera extension points globally;
+    # register their original values with monkeypatch so this test cannot leak
+    # them into train.py helper tests in the same pytest process.
+    monkeypatch.setattr(trainer.base_train, "build_optimizer", trainer.base_train.build_optimizer)
+    monkeypatch.setattr(
+        trainer.base_train,
+        "configure_training_step",
+        trainer.base_train.configure_training_step,
+    )
+    monkeypatch.setattr(trainer.base_train, "main", lambda args: None)
+
+    weights_only = _args(
+        resume="/tmp/pretrained/ckpt-6000",
+        stage3_lr_scale=0.5,
+        continuation_warmup_steps=100,
+    )
+    monkeypatch.setattr(
+        trainer.base_train,
+        "resolve_resume",
+        lambda args: {
+            "weights_dir": args.resume,
+            "model_state_dir": None,
+            "global_step": 6000,
+        },
+    )
+    trainer.main(weights_only)
+    assert weights_only._continuation_warmup_start == 6000
+
+    full_state = _args(
+        resume="/tmp/pretrained/ckpt-6500",
+        stage3_lr_scale=0.5,
+        continuation_warmup_steps=100,
+    )
+    monkeypatch.setattr(
+        trainer.base_train,
+        "resolve_resume",
+        lambda args: {
+            "weights_dir": args.resume,
+            "model_state_dir": "/tmp/model_state/ckpt-6500",
+            "global_step": 6500,
+        },
+    )
+    trainer.main(full_state)
+    assert full_state._continuation_warmup_start is None
+
+
+def test_weights_only_warmup_rejects_pre_stage3_checkpoint(monkeypatch):
+    args = _args(
+        resume="/tmp/pretrained/ckpt-15",
+        continuation_warmup_steps=100,
+    )
+    monkeypatch.setattr(
+        trainer.base_train,
+        "resolve_resume",
+        lambda args: {
+            "weights_dir": args.resume,
+            "model_state_dir": None,
+            "global_step": 15,
+        },
+    )
+
+    with pytest.raises(ValueError, match="requires a stage-3 checkpoint"):
+        trainer.main(args)

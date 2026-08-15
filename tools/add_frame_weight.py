@@ -185,6 +185,10 @@ def main() -> int:
                 n_bad += 1
         print(f"  main-table files: {len(files):,}  missing frame_weight: {n_missing_col}  "
               f"bad (nan/<=0/len-mismatch): {n_bad}")
+        if not files or n_missing_col or n_bad:
+            print("[add_frame_weight] VERIFY FAILED", file=sys.stderr)
+            return 1
+        print("[add_frame_weight] VERIFY PASSED")
         return 0
 
     # ---- apply ----
