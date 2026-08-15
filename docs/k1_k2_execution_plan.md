@@ -47,9 +47,9 @@ snapshot_download(repo_id=\"tianSeconds/finetunning\", allow_patterns=[\"pretrai
 
 ### 待确认项 A：LR（计划 §5.2 未实现）
 
-计划建议 `stage3_lr_scale=0.5` + `continuation_warmup=100`，**代码未实现**（train.py / train_three_camera.py 无此参数，stage-3 LR 硬编码 `aux_visual 2e-5 / soft_prompt 1e-6 / action 1e-5 / transformer_core 2e-6`）。两个选择：
-- **A1（不改代码，推荐先跑）**：用硬编码 stage-3 LR（与原 ckpt-6000 后期训练一致）。
-- **A2（严格按计划）**：先实现并验证 `--stage3_lr_scale` + `--continuation_warmup_steps`，再开跑。
+计划建议 `stage3_lr_scale=0.5` + `continuation_warmup=100`，**代码未实现**（train.py / train_three_camera.py 无此参数，stage-3 LR 硬编码 `aux_visual 2e-5 / soft_prompt 1e-6 / action 1e-5 / transformer_core 2e-6`）。
+
+**决定（用户 2026-08-15）：LR scale 与 continuation warmup 由用户自行实现代码。** 训练命令待用户代码合入后，按其新增参数（`--stage3_lr_scale` / `--continuation_warmup_steps`）更新后再确认。
 
 ### 待确认项 B：训练规模
 
@@ -93,7 +93,7 @@ No optimizer state for resume; starting fresh optimizer
 
 1. 下载 ckpt-6000 → 校验
 2. `add_frame_weight.py inspect` CSV → **与用户确认权重语义** → apply → verify
-3. 确认训练指令（含待确认项 A/B）→ 启动 K1 → 日志验证（resume/stage 3/采样比例）
+3. **等用户 LR 代码合入**，按其参数更新训练命令 → 确认 → 启动 K1 → 日志验证（resume/stage 3/采样比例）
 4. K1 到 7000（诊断）检查，正常则继续到 9000
 5. K2 从同基线启动 → 同样验证
 6. 评测/上传（后续任务）
