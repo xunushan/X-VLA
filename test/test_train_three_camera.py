@@ -1,5 +1,6 @@
 from argparse import Namespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -32,6 +33,9 @@ def _args(**overrides):
         target_domain=1,
         stage1_end=10,
         stage2_end=20,
+        stage3_lr_scale=1.0,
+        continuation_warmup_steps=0,
+        _continuation_warmup_start=None,
         resume=None,
         keep_aux_init=False,
     )
@@ -108,3 +112,67 @@ def test_stage_boundaries_apply_expected_trainable_groups():
             if any(parameter.requires_grad for parameter in group["params"])
         }
         assert actual_names == expected_names
+
+
+def _lrs(optimizer):
+    return {group["name"]: group["lr"] for group in optimizer.param_groups}
+
+
+def test_stage3_defaults_preserve_legacy_learning_rates():
+    model = TinyModel()
+    trainer._ARGS = _args()
+    optimizer = trainer.build_three_camera_optimizer(model, lr=1e-4, weight_decay=0.0)
+
+    trainer.configure_three_camera_step(optimizer, 20, trainer._ARGS)
+
+    assert _lrs(optimizer) == {
+        "aux_visual_weight": 2e-5,
+        "aux_visual_bias": 5e-7,
+        "soft_prompt": 1e-6,
+        "action_encoder": 1e-5,
+        "action_decoder": 1e-5,
+        "transformer_core": 2e-6,
+        "vlm": 0.0,
+    }
+
+
+def test_weights_only_continuation_scales_and_warms_stage3_lrs():
+    args = _args(
+        stage3_lr_scale=0.5,
+        continuation_warmup_steps=100,
+        _continuation_warmup_start=6000,
+    )
+    model = TinyModel()
+    trainer._ARGS = args
+    optimizer = trainer.build_three_camera_optimizer(model, lr=1e-4, weight_decay=0.0)
+
+    trainer.configure_three_camera_step(optimizer, 6000, args)
+    assert _lrs(optimizer)["aux_visual_weight"] == pytest.approx(1e-7)
+    assert _lrs(optimizer)["action_encoder"] == pytest.approx(5e-8)
+    assert _lrs(optimizer)["transformer_core"] == pytest.approx(1e-8)
+
+    trainer.configure_three_camera_step(optimizer, 6050, args)
+    assert _lrs(optimizer)["aux_visual_weight"] == pytest.approx(1e-5 * 0.51)
+
+    trainer.configure_three_camera_step(optimizer, 6099, args)
+    assert _lrs(optimizer)["aux_visual_weight"] == pytest.approx(1e-5)
+
+    trainer.configure_three_camera_step(optimizer, 6100, args)
+    assert _lrs(optimizer)["aux_visual_weight"] == pytest.approx(1e-5)
+
+
+def test_invalid_stage3_schedule_arguments_are_rejected():
+    model = TinyModel()
+    trainer._ARGS = _args()
+    optimizer = trainer.build_three_camera_optimizer(model, lr=1e-4, weight_decay=0.0)
+
+    for args in (
+        _args(stage3_lr_scale=0.0),
+        _args(continuation_warmup_steps=-1),
+    ):
+        try:
+            trainer.configure_three_camera_step(optimizer, 20, args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid stage-3 schedule arguments must raise ValueError")

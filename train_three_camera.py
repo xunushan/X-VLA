@@ -33,6 +33,21 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage1_end", type=int, default=1000)
     parser.add_argument("--stage2_end", type=int, default=3000)
     parser.add_argument(
+        "--stage3_lr_scale",
+        type=float,
+        default=1.0,
+        help="Multiply every non-zero stage-3 parameter-group LR (default 1.0 preserves legacy behavior).",
+    )
+    parser.add_argument(
+        "--continuation_warmup_steps",
+        type=int,
+        default=0,
+        help=(
+            "For a weights-only --resume, linearly warm stage-3 LRs for this many optimizer "
+            "steps starting at the restored global step. Full-state resume does not restart warmup."
+        ),
+    )
+    parser.add_argument(
         "--keep_aux_init",
         action="store_true",
         help="Do not zero aux_visual_proj.weight on a fresh run (debug/ablation only).",
@@ -186,6 +201,10 @@ def configure_three_camera_step(optimizer, step: int, args) -> None:
     global _LAST_PRINTED_STAGE
     if args.stage1_end <= 0 or args.stage2_end <= args.stage1_end:
         raise ValueError("Require 0 < stage1_end < stage2_end")
+    if args.stage3_lr_scale <= 0:
+        raise ValueError("--stage3_lr_scale must be > 0")
+    if args.continuation_warmup_steps < 0:
+        raise ValueError("--continuation_warmup_steps must be >= 0")
 
     if step < args.stage1_end:
         stage = 1
@@ -223,6 +242,20 @@ def configure_three_camera_step(optimizer, step: int, args) -> None:
             "transformer_core": 2e-6,
             "vlm": 0.0,
         }
+        for name in lrs:
+            if lrs[name] > 0.0:
+                lrs[name] *= args.stage3_lr_scale
+
+        warmup_start = getattr(args, "_continuation_warmup_start", None)
+        if warmup_start is not None and step < warmup_start + args.continuation_warmup_steps:
+            if step < warmup_start:
+                raise ValueError(
+                    f"optimizer_step={step} precedes continuation warmup start={warmup_start}"
+                )
+            warmup_scale = float(step - warmup_start + 1) / args.continuation_warmup_steps
+            for name in lrs:
+                if lrs[name] > 0.0:
+                    lrs[name] *= warmup_scale
 
     for group in optimizer.param_groups:
         name = group["name"]
@@ -246,6 +279,32 @@ def configure_three_camera_step(optimizer, step: int, args) -> None:
 def main(args: argparse.Namespace) -> None:
     global _ARGS
     _ARGS = args
+    args._continuation_warmup_start = None
+    if args.stage3_lr_scale <= 0:
+        raise ValueError("--stage3_lr_scale must be > 0")
+    if args.continuation_warmup_steps < 0:
+        raise ValueError("--continuation_warmup_steps must be >= 0")
+    if args.continuation_warmup_steps > 0:
+        resume_info = base_train.resolve_resume(args)
+        if resume_info is None:
+            raise ValueError("--continuation_warmup_steps requires --resume")
+        if resume_info["model_state_dir"] is None:
+            start = resume_info["global_step"]
+            if start is None:
+                raise ValueError(
+                    "Weights-only continuation warmup requires state.json with global_step"
+                )
+            args._continuation_warmup_start = int(start)
+            print(
+                "[three-camera] weights-only continuation warmup: "
+                f"start={start}, steps={args.continuation_warmup_steps}, "
+                f"stage3_lr_scale={args.stage3_lr_scale}"
+            )
+        else:
+            print(
+                "[three-camera] full-state resume detected; do not restart continuation warmup "
+                f"(stage3_lr_scale={args.stage3_lr_scale})"
+            )
     # The original module resolves these names at runtime.  Replacing only these
     # two extension points keeps its accumulation/checkpoint loop byte-for-byte.
     base_train.build_optimizer = build_three_camera_optimizer
