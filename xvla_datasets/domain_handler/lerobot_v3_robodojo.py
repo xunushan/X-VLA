@@ -223,6 +223,67 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             )
         return np.stack(frames[:length], axis=0)
 
+    def _decode_episode_video_indices(
+        self, cam_key: str, ep: dict, indices: list[int]
+    ) -> Dict[int, np.ndarray]:
+        """Decode an episode stream but materialize RGB only for requested frames.
+
+        Inter-frame codecs may still decode packets between requested frames. This
+        path avoids ndarray conversion, resize input allocation and retaining the
+        full episode, and stops immediately after the last requested frame.
+        """
+        wanted = sorted(set(int(i) for i in indices))
+        if not wanted:
+            return {}
+        wanted_set = set(wanted)
+        ci = int(ep[f"videos/{cam_key}/chunk_index"])
+        fi = int(ep[f"videos/{cam_key}/file_index"])
+        from_ts = float(ep[f"videos/{cam_key}/from_timestamp"])
+        to_ts = float(ep[f"videos/{cam_key}/to_timestamp"])
+        path = self.root / "videos" / cam_key / f"chunk-{ci:03d}" / f"file-{fi:03d}.mp4"
+        if path.exists():
+            container = av.open(str(path))
+        else:
+            from mmengine import fileio
+            container = av.open(io.BytesIO(fileio.get(str(path))))
+
+        tol = 0.5 / self.fps
+        decoded_index = 0
+        result: Dict[int, np.ndarray] = {}
+        _t0 = time.time()
+        done = False
+        try:
+            stream = container.streams.video[0]
+            container.seek(int(from_ts / stream.time_base), stream=stream)
+            for packet in container.demux(stream):
+                for frame in packet.decode():
+                    if frame.pts is None:
+                        continue
+                    ts = float(frame.pts) * stream.time_base
+                    if ts < from_ts - tol:
+                        continue
+                    if ts >= to_ts - tol:
+                        done = True
+                        break
+                    if decoded_index in wanted_set:
+                        result[decoded_index] = frame.to_ndarray(format="rgb24")
+                    if decoded_index >= wanted[-1]:
+                        done = True
+                        break
+                    decoded_index += 1
+                if done:
+                    break
+        finally:
+            container.close()
+        timing.record_decode(time.time() - _t0, len(result))
+        missing = [i for i in wanted if i not in result]
+        if missing:
+            raise RuntimeError(
+                f"missing requested frames for {cam_key} ep={ep['episode_index']}: "
+                f"{missing[:10]} ({len(missing)}/{len(wanted)})"
+            )
+        return result
+
     def _instruction(self, ep: dict) -> str:
         tasks = ep.get("tasks") or []
         if tasks:
@@ -249,19 +310,39 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         # 1. 绝对状态轨迹（observation.state，20 维）
         state = self._to_20d(self._read_state(ep))  # [T, 20]
 
-        # 2. 三相机视频（pyav 解码 → [T, H, W, C] uint8）。各相机独立 seek+demux，
+        # Cache/SF allowlists are sparse: determine requested indices before video
+        # decoding so only those frames are converted to RGB and retained.
+        requested = None
+        if sample_allowlist is not None:
+            requested = [
+                idx for idx in range(max(0, state.shape[0] - 5))
+                if (int(ep_idx), int(idx)) in sample_allowlist
+            ]
+            if not requested:
+                return
+
+        # 2. 三相机视频（pyav 解码 → uint8）。各相机独立 seek+demux，
         #    无共享可变状态，用 ThreadPoolExecutor 并行解码（实测 3 路 ~1.65× 提速，
         #    16 核服务器上更高）。注意：不要加 stream.thread_type=AUTO——
         #    实测对 AV1 短 seek 段是负优化（单路慢 0.81×）。
         n_views = min(self.num_views, len(self.camera_keys))
         with ThreadPoolExecutor(max_workers=n_views) as executor:
-            videos = [
-                f.result()
-                for f in [executor.submit(self._decode_episode_video, cam, ep) for cam in self.camera_keys[:n_views]]
-            ]
+            if requested is None:
+                futures = [
+                    executor.submit(self._decode_episode_video, cam, ep)
+                    for cam in self.camera_keys[:n_views]
+                ]
+            else:
+                futures = [
+                    executor.submit(self._decode_episode_video_indices, cam, ep, requested)
+                    for cam in self.camera_keys[:n_views]
+                ]
+            videos = [f.result() for f in futures]
 
         # 3. 对齐到公共长度（视频帧数与 length 允许 ±1 偏差）
-        T = min(state.shape[0], *(v.shape[0] for v in videos))
+        T = state.shape[0] if requested is not None else min(
+            state.shape[0], *(v.shape[0] for v in videos)
+        )
         if T < 2:
             return
 
@@ -274,11 +355,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
 
         # 5. 候选帧：与参考 range(0, T-5) 一致，保留 episode 尾部候选（不足 qdur 完整窗口的
         #    样本不排除，由下方 clamp 到末帧 + 插值压缩处理，语义 = "减速收尾、停在末姿态"）
-        idxs = list(range(max(0, T - 5)))
-        if sample_allowlist is not None:
-            idxs = [idx for idx in idxs if (int(ep_idx), int(idx)) in sample_allowlist]
-            if not idxs:
-                return
+        idxs = requested if requested is not None else list(range(max(0, T - 5)))
         if training and use_frame_weight:
             # frame_weight 有放回采样：直接对全部候选帧按 frame_weight 归一化概率抽样。
             # 高权重帧不会静止，无需预过滤静止候选（省去对每个候选预计算 seq 的开销）；

@@ -17,7 +17,7 @@
 from __future__ import annotations
 from typing import Dict, Iterable, List
 import io, json, random, numpy as np, torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from mmengine import fileio
@@ -107,6 +107,12 @@ class InfiniteDataReader(IterableDataset):
     def _iter_one_dataset(self, dataset_name: str) -> Iterable[dict]:
         meta = self.metas[dataset_name]
         traj_indices = list(range(len(meta["datalist"])))
+        # Non-training iterable readers are used by offline cache/evaluation.
+        # Shard episodes explicitly; otherwise every DataLoader worker repeats
+        # the complete dataset.
+        worker = get_worker_info()
+        if not self.training and worker is not None:
+            traj_indices = traj_indices[worker.id::worker.num_workers]
         if self.training: random.shuffle(traj_indices)
         
         if 'robot_type' in meta.keys(): robot_type = meta['robot_type']

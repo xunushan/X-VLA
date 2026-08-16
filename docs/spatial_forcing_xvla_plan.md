@@ -566,6 +566,9 @@ python tools/cache_vggt_features.py \
   --teacher_image_size 518 \
   --num_actions 30 \
   --action_mode ee6d \
+  --batch_size 4 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
   --device cuda
 
 conda run -n xvla python tools/inspect_sf_cache.py \
@@ -580,6 +583,11 @@ conda run -n xvla python tools/inspect_sf_cache.py \
 - 生成日志中 BF16 roundtrip cosine 均值建议不低于 `0.999`；
 - SQLite 大小与小样本线性估算合理；
 - 人工完成第 4 节的 teacher 质量和 token 对应可视化。
+
+缓存脚本使用batch VGGT前向；这里的 `batch_size=4` 表示一次处理4个样本，实际输入为
+`[4,3,3,518,518]`，三路相机不会被合并成独立样本。`num_workers=4`按episode分片并行解码，
+每个worker内部再并行读取三路相机；不同worker不会重复遍历整套episode。若4090 OOM，依次降为
+`--batch_size 2`、`--batch_size 1`，不要降低worker来解决GPU OOM。
 
 ### 15.6 Step 4：20-step A2 smoke train
 
@@ -639,6 +647,9 @@ python tools/cache_vggt_features.py \
   --teacher_image_size 518 \
   --num_actions 30 \
   --action_mode ee6d \
+  --batch_size 4 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
   --device cuda
 
 conda run -n xvla python tools/inspect_sf_cache.py "$SF_ROOT/vggt-natural-150k.sqlite"
@@ -647,6 +658,11 @@ du -h "$SF_ROOT/vggt-natural-150k.sqlite"
 
 不要在未经审计时添加 `--overwrite`。中断后当前实现不会续写同一cache；应保留失败文件排查，
 确认原因后删除或显式 `--overwrite` 重建。
+
+正式生成前用300帧分别跑 `batch_size=1` 和候选batch，抽查相同 `(episode,frame)` 特征的
+cosine；应接近1。正式150K以smoke中不OOM的最大batch启动，并根据前1000帧耗时重新估算总时长。
+按需解码只对清单中的帧执行RGB转换、Resize和驻留内存；由于MP4帧间压缩，目标帧之间的码流
+仍可能需要解码，这是正常现象。
 
 ### 15.8 Step 6：正式A1/A2成对训练
 

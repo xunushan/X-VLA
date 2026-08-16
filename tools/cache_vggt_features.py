@@ -6,10 +6,12 @@ import argparse
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
@@ -54,6 +56,8 @@ def extract_tokens(aggregated_tokens, patch_start, aggregator, layer, target_gri
 
 
 def main(args):
+    if args.batch_size <= 0 or args.num_workers < 0 or args.prefetch_factor <= 0:
+        raise ValueError("batch_size/prefetch_factor must be positive and num_workers non-negative")
     selection = load_selection(args.selection)
     meta = json.loads(Path(args.train_metas_path).read_text())
     camera_order = list(meta.get("camera_keys", DEFAULT_CAMERA_KEYS))[:3]
@@ -86,6 +90,17 @@ def main(args):
         return_frame_info=True, sample_allowlist=set(selection),
         image_transform=teacher_transform,
     )
+    loader_kwargs = dict(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    if args.num_workers > 0:
+        loader_kwargs.update(
+            persistent_workers=True,
+            prefetch_factor=args.prefetch_factor,
+        )
+    loader = DataLoader(reader, **loader_kwargs)
     metadata = {
         "teacher": "VGGT-1B",
         "teacher_checkpoint_sha256": sha256(Path(args.vggt_checkpoint)),
@@ -100,35 +115,51 @@ def main(args):
     seen = set()
     similarities = []
     writer = None
+    started = time.perf_counter()
     try:
-        for sample in reader:
-            ep, frame = int(sample["episode_index"]), int(sample["frame_index"])
-            key = (ep, frame)
-            if key in seen:
-                continue
-            images = sample["image_input"].unsqueeze(0).to(device)
-            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                                                  enabled=device.type == "cuda"):
+        for batch in loader:
+            images = batch["image_input"].to(device, non_blocking=True)
+            with torch.inference_mode(), torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+            ):
                 aggregated_tokens, patch_start = aggregator(images)
-            feature = extract_tokens(
+            features_fp32 = extract_tokens(
                 aggregated_tokens, patch_start, aggregator, args.teacher_layer,
                 tuple(args.target_token_grid), images.shape[-2:],
-            )[0].cpu()
-            if writer is None:
-                metadata["teacher_feature_dim"] = int(feature.shape[-1])
-                metadata["feature_shape_per_sample"] = list(feature.shape)
-                writer = FeatureCacheWriter(args.output, metadata, overwrite=args.overwrite)
-            if not torch.isfinite(feature).all():
-                raise FloatingPointError(f"non-finite VGGT feature at {ep}:{frame}")
-            if len(similarities) < args.precision_audit_samples:
+            )
+            if not torch.isfinite(features_fp32).all():
+                raise FloatingPointError("non-finite VGGT feature in current batch")
+            audit_left = args.precision_audit_samples - len(similarities)
+            for feature in features_fp32[:max(0, audit_left)]:
                 roundtrip = feature.to(torch.bfloat16).float()
                 similarities.append(float(F.cosine_similarity(
-                    feature.float().flatten(0, -2), roundtrip.flatten(0, -2), dim=-1
+                    feature.flatten(0, -2), roundtrip.flatten(0, -2), dim=-1
                 ).mean()))
-            writer.add(ep, frame, bool(selection[key]["is_key_frame"]), feature)
-            seen.add(key)
-            if len(seen) % args.log_interval == 0:
-                print(f"cached {len(seen)}/{len(selection)}")
+            # Cache format is BF16; halve device-to-host traffic versus copying
+            # interpolated FP32 features and converting them again in the writer.
+            features = features_fp32.to(device="cpu", dtype=torch.bfloat16)
+            if writer is None:
+                metadata["teacher_feature_dim"] = int(features.shape[-1])
+                metadata["feature_shape_per_sample"] = list(features.shape[1:])
+                metadata["cache_batch_size"] = int(args.batch_size)
+                metadata["cache_num_workers"] = int(args.num_workers)
+                writer = FeatureCacheWriter(args.output, metadata, overwrite=args.overwrite)
+            episodes = batch["episode_index"].tolist()
+            frames = batch["frame_index"].tolist()
+            for ep, frame, feature in zip(episodes, frames, features, strict=True):
+                key = (int(ep), int(frame))
+                if key in seen:
+                    continue
+                writer.add(ep, frame, bool(selection[key]["is_key_frame"]), feature)
+                seen.add(key)
+            if len(seen) % args.log_interval < len(features):
+                elapsed = max(time.perf_counter() - started, 1e-6)
+                rate = len(seen) / elapsed
+                eta_hours = (len(selection) - len(seen)) / max(rate, 1e-9) / 3600
+                print(
+                    f"cached {len(seen)}/{len(selection)} "
+                    f"rate={rate:.2f} samples/s eta={eta_hours:.2f}h"
+                )
             if len(seen) == len(selection):
                 break
     finally:
@@ -156,6 +187,9 @@ if __name__ == "__main__":
     p.add_argument("--num_actions", type=int, default=30)
     p.add_argument("--action_mode", default="ee6d")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--prefetch_factor", type=int, default=2)
     p.add_argument("--precision_audit_samples", type=int, default=100)
     p.add_argument("--log_interval", type=int, default=100)
     p.add_argument("--overwrite", action="store_true")
