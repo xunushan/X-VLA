@@ -121,8 +121,11 @@ def main(args):
         # correspondence: best 518-token per 336-token
         M = f336 @ f518.transpose(-1, -2)                          # [3,49,49]
         best = M.argmax(dim=-1)                                    # [3,49]
-        idx = torch.arange(49).reshape(7, 7).to(best.device)
-        off = (best.reshape(n_views, 7, 7) - idx.unsqueeze(0)).abs().sum(dim=-1)  # manhattan / row+col
+        br, bc = best // 7, best % 7                               # best-match grid pos
+        g = torch.arange(7, device=best.device)
+        gr, gc = torch.meshgrid(g, g, indexing="ij")               # 7x7 grid positions
+        fr, fc = gr.reshape(-1), gc.reshape(-1)                    # flat grid rows/cols
+        off = ((br - fr).abs() + (bc - fc).abs()).reshape(n_views, 7, 7)  # manhattan drift
         row_cos_lo = float(grid.min())
         row_cos_hi = float(grid.max())
         # images
