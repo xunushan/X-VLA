@@ -92,8 +92,15 @@ def main(args):
             flags = data["is_key_frame"][lo:lo + usable]
         elif "frame_weight" in data:
             flags = [float(x) > 1.0 for x in data["frame_weight"][lo:lo + usable]]
+        elif args.sampling_mode == "natural":
+            # Natural sampling never consumes key-frame labels (uniform rng.sample),
+            # so a dataset without them is fine; report everything as regular.
+            flags = [False] * usable
         else:
-            raise RuntimeError(f"{data_path} has neither is_key_frame nor frame_weight")
+            raise RuntimeError(
+                f"{data_path} has neither is_key_frame nor frame_weight; "
+                "key_regular_1to1 requires key-frame labels"
+            )
         task = (row.get("tasks") or ["unknown"])[0]
         for frame, is_key in enumerate(flags):
             # Exactly mirrors the handler's static-sample exclusion. With the
