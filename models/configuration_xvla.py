@@ -53,6 +53,10 @@ class XVLAConfig(PretrainedConfig):
         num_actions: int = 30,
         action_mode: str = "ee6d",
         use_proprio: bool = True,
+        sf_student_dim: int | None = None,
+        sf_teacher_dim: int | None = None,
+        sf_hidden_dim: int | None = None,
+        sf_start_step: int | None = None,
 
         **kwargs,
     ):
@@ -83,6 +87,12 @@ class XVLAConfig(PretrainedConfig):
         
         self.real_action_dim = real_action_dim
         self.max_action_dim = max_action_dim
+        # Optional training-only Spatial Forcing projector. Old checkpoints omit
+        # these fields and therefore instantiate no extra module.
+        self.sf_student_dim = sf_student_dim
+        self.sf_teacher_dim = sf_teacher_dim
+        self.sf_hidden_dim = sf_hidden_dim
+        self.sf_start_step = sf_start_step
         
         # Initialize base HF config attributes (e.g. name_or_path)
         super().__init__(**kwargs)

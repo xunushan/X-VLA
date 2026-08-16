@@ -28,6 +28,7 @@ from PIL import Image
 import uvicorn
 import json_numpy
 import cv2
+from torch import nn
 
 from transformers import PreTrainedModel
 from .modeling_florence2 import Florence2ForConditionalGeneration
@@ -97,6 +98,16 @@ class XVLA(PreTrainedModel):
             use_hetero_proj=config.use_hetero_proj,
         )
 
+        self.sf_projector = None
+        if config.sf_teacher_dim is not None:
+            hidden = config.sf_hidden_dim or config.sf_student_dim
+            self.sf_projector = nn.Sequential(
+                nn.LayerNorm(config.sf_student_dim),
+                nn.Linear(config.sf_student_dim, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, config.sf_teacher_dim),
+            )
+
         # Deferred FastAPI app
         self.app: FastAPI | None = None
 
@@ -128,6 +139,11 @@ class XVLA(PreTrainedModel):
         image_features = valid_feats.new_zeros((B * V, N, D))
         image_features[flat_mask] = valid_feats
         image_features = image_features.view(B, V, N, D)        # [B, V, N, D]
+        # Training-only opt-in used by train_spatial_forcing.py. The flag is
+        # absent/False for every existing training and inference entry point, so
+        # no activation graph is retained in normal operation.
+        if getattr(self, "_sf_capture_features", False):
+            self._sf_student_features = image_features
 
         inputs_embeds = self.vlm.get_input_embeddings()(input_ids)  # [B, L, D]
 

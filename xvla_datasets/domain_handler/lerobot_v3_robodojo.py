@@ -240,6 +240,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         lang_aug_map: dict | None = None,
         frame_info: bool = False,
         use_frame_weight: bool = False,
+        sample_allowlist: set[tuple[int, int]] | None = None,
         **kwargs,
     ) -> Iterable[dict]:
         ep_idx = self.meta["datalist"][traj_idx]
@@ -274,6 +275,10 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         # 5. 候选帧：与参考 range(0, T-5) 一致，保留 episode 尾部候选（不足 qdur 完整窗口的
         #    样本不排除，由下方 clamp 到末帧 + 插值压缩处理，语义 = "减速收尾、停在末姿态"）
         idxs = list(range(max(0, T - 5)))
+        if sample_allowlist is not None:
+            idxs = [idx for idx in idxs if (int(ep_idx), int(idx)) in sample_allowlist]
+            if not idxs:
+                return
         if training and use_frame_weight:
             # frame_weight 有放回采样：直接对全部候选帧按 frame_weight 归一化概率抽样。
             # 高权重帧不会静止，无需预过滤静止候选（省去对每个候选预计算 seq 的开销）；
@@ -287,7 +292,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                 )
             else:
                 # 候选帧 idxs = range(0, T-5) 帧序连续，fw 本身按帧序 → 直接切片前 len(idxs) 个即可
-                w = fw[: len(idxs)]
+                # idxs may be sparse when an SF cache allowlist is active.
+                w = np.asarray([fw[i] for i in idxs], dtype=np.float64)
                 if not np.isfinite(w).all() or (w <= 0).any():
                     raise ValueError(
                         f"Invalid frame_weight for episode {ep_idx}: values must be finite and > 0"

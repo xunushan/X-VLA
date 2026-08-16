@@ -46,6 +46,10 @@ class InfiniteDataReader(IterableDataset):
                  action_mode: str = "ee6d",
                  lang_aug: str = None,
                  use_frame_weight: bool = False,
+                 disable_image_augmentation: bool = False,
+                 return_frame_info: bool = False,
+                 sample_allowlist: set[tuple[int, int]] | None = None,
+                 image_transform=None,
                  ):
         self.num_views = num_views
         self.training = training
@@ -53,6 +57,8 @@ class InfiniteDataReader(IterableDataset):
         self.action_mode = action_mode
         # lerobot v3.0 逐帧采样权重（data/*.parquet frame_weight 列）：开启后高权重帧有放回过采样
         self.use_frame_weight = use_frame_weight
+        self.return_frame_info = return_frame_info
+        self.sample_allowlist = sample_allowlist
         self.metas: Dict[str, dict] = {}
         print("use action mode:", action_mode)
         if fileio.isdir(metas_path):
@@ -86,14 +92,17 @@ class InfiniteDataReader(IterableDataset):
                 print(f"== lerobot v3.0 dataset {meta['robot_type']} with {len(meta['datalist'])} trajs at {meta['root_path']}====")
             else: raise NotImplementedError(f"unrecognized meta file format: {file}")
 
-        self.image_aug = [
-            transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.) \
-                if training else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=True),
-        ]
-        self.image_aug = transforms.Compose(self.image_aug)
+        if image_transform is not None:
+            self.image_aug = image_transform
+        else:
+            self.image_aug = transforms.Compose([
+                transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.)
+                    if training and not disable_image_augmentation
+                    else transforms.Lambda(lambda x: x),
+                transforms.ToTensor(),
+                transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=True),
+            ])
 
     def _iter_one_dataset(self, dataset_name: str) -> Iterable[dict]:
         meta = self.metas[dataset_name]
@@ -108,6 +117,11 @@ class InfiniteDataReader(IterableDataset):
         # **kwargs，不能全局透传），仅在 v3.0 数据集上转发
         ep_kwargs = {"use_frame_weight": self.use_frame_weight} \
             if meta.get("codebase_version") == "v3.0" else {}
+        if meta.get("codebase_version") == "v3.0":
+            ep_kwargs.update(
+                frame_info=self.return_frame_info,
+                sample_allowlist=self.sample_allowlist,
+            )
         for traj_idx in traj_indices:
                 for sample in handler.iter_episode(
                     traj_idx,
