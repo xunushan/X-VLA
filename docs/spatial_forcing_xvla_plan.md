@@ -489,8 +489,8 @@ export VGGT_CKPT=/cloud/cloud-ssd1/models/VGGT-1B/model.pt
 
 mkdir -p "$SF_ROOT" "$(dirname "$VGGT_REPO")" "$(dirname "$VGGT_CKPT")"
 git clone https://github.com/facebookresearch/vggt.git "$VGGT_REPO"
-pip install -e "$VGGT_REPO"
-huggingface-cli download facebook/VGGT-1B model.pt \
+/data/miniconda3/envs/xvla/bin/pip install -e "$VGGT_REPO"
+/data/miniconda3/envs/xvla/bin/huggingface-cli download facebook/VGGT-1B model.pt \
   --local-dir "$(dirname "$VGGT_CKPT")"
 sha256sum "$VGGT_CKPT"
 ```
@@ -502,11 +502,15 @@ sha256sum "$VGGT_CKPT"
 - 记录 VGGT repo commit：`git -C "$VGGT_REPO" rev-parse HEAD`。
 
 VGGT 依赖只要求存在于 teacher 缓存环境。训练环境可以完全不安装 VGGT。
+本实验服务器统一使用 `xvla` conda 环境（`/data/miniconda3/envs/xvla`）：VGGT `pip install -e`
+安装进 `xvla`，训练进程 `train_spatial_forcing.py` 不 import VGGT，互不冲突。
+非交互 ssh 远程命令中 conda 不在 PATH，一律用完整路径 `/data/miniconda3/envs/xvla/bin/python`
+（accelerate 同理为 `/data/miniconda3/envs/xvla/bin/accelerate`）；交互式 shell 内可用 `conda run -n xvla`。
 
 ### 15.3 Step 1：X-VLA token grid audit（必须人工确认）
 
 ```bash
-conda run -n lerobot python tools/audit_xvla_token_grid.py \
+conda run -n xvla python tools/audit_xvla_token_grid.py \
   --models "$R1_CKPT6000" \
   --device cuda | tee "$SF_ROOT/xvla_token_audit.json"
 ```
@@ -562,7 +566,7 @@ python tools/cache_vggt_features.py \
   --action_mode ee6d \
   --device cuda
 
-conda run -n lerobot python tools/inspect_sf_cache.py \
+conda run -n xvla python tools/inspect_sf_cache.py \
   "$SF_ROOT/vggt-smoke-300.sqlite" | tee "$SF_ROOT/cache-smoke-audit.json"
 ```
 
@@ -581,7 +585,7 @@ R1 `ckpt-6000`只作为初始化模型传给 `--models`，不传 `--resume`。�
 local/global step都从0开始，20步smoke填写 `--iters 20`。
 
 ```bash
-conda run -n lerobot accelerate launch --mixed_precision bf16 \
+conda run -n xvla accelerate launch --mixed_precision bf16 \
   train_spatial_forcing.py \
   --models "$R1_CKPT6000" \
   --train_metas_path "$TRAIN_META" \
@@ -635,7 +639,7 @@ python tools/cache_vggt_features.py \
   --action_mode ee6d \
   --device cuda
 
-conda run -n lerobot python tools/inspect_sf_cache.py "$SF_ROOT/vggt-30k.sqlite"
+conda run -n xvla python tools/inspect_sf_cache.py "$SF_ROOT/vggt-30k.sqlite"
 du -h "$SF_ROOT/vggt-30k.sqlite"
 ```
 
@@ -658,10 +662,10 @@ COMMON_ARGS="--models $R1_CKPT6000 \
 --sf_warmup_steps 100 --sf_loss_weight 0.1 --save_interval 250 \
 --log_interval 20 --max_grad_norm 1.0"
 
-conda run -n lerobot accelerate launch --mixed_precision bf16 \
+conda run -n xvla accelerate launch --mixed_precision bf16 \
   train_spatial_forcing.py $COMMON_ARGS --output_dir "$SF_ROOT/A1"
 
-conda run -n lerobot accelerate launch --mixed_precision bf16 \
+conda run -n xvla accelerate launch --mixed_precision bf16 \
   train_spatial_forcing.py $COMMON_ARGS --enable_sf --output_dir "$SF_ROOT/A2"
 ```
 
