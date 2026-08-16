@@ -33,13 +33,17 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-# 训练步日志行（新/旧格式均可；分项块与 effective_batch 为可选组）
+# 训练步日志行（新/旧格式均可；分项块与 effective_batch 为可选组）。
+# 容忍 train_three_camera.py 在 effective_batch 与 lr_vlm 之间插入的
+# 额外字段（key_ratio=../clip_coef=..），用懒惰 `\S+` 跳过未知 token。
 STEP_RE = re.compile(
     r"\[\s*(\d+)\s*/\s*(\d+)\s*\]\s+"
     r"loss=([0-9.]+)\s+"
     r"(?:\[([^\]]*)\]\s+)?"          # 分项 loss 块（新格式）：[position=.. rotate6D=.. ..]
     r"(?:effective_batch=(\d+)\s+)?"  # effective batch（新格式，可选）
+    r"(?:\S+\s+)*?"                  # 容忍中间新增字段（key_ratio 等）
     r"grad_norm=([0-9.eE+-]+)\s+"
+    r"(?:\S+\s+)*?"                  # 容忍 clip_coef 等
     r"lr_core=([0-9.eE+-]+)\s+"
     r"lr_vlm=([0-9.eE+-]+)"
 )
