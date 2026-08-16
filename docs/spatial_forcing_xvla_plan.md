@@ -626,20 +626,26 @@ conda run -n xvla accelerate launch --mixed_precision bf16 \
 
 依次将物理 batch 测为1、2、4；选择4090不OOM的最大值，再用梯度累积保持 effective batch=32。
 
-### 15.7 Step 5：生成正式150K自然分布缓存
+### 15.7 Step 5：生成正式60K自然分布缓存（@518）
+
+分辨率决策（2026-08-17 实测）：336 与 518 吞吐相同（管线解码受限 ~3.1 samples/s，
+forward 完全隐藏在解码后），且腕部相机 7×7 教师特征对比中 336 明显分叉
+（cam_left_wrist cos=0.73/diag=0.13，cam_right_wrist cos=0.59/diag=0.11，
+主相机 cos=0.96/diag=0.76）。336 无提速、教师质量更差 → **正式缓存固定 518**。
+样本数定为 60k（~5.4h 墙钟，磁盘 ~36GB）。
 
 ```bash
 python tools/build_sf_sample_manifest.py \
   --meta "$TRAIN_META" \
-  --output "$SF_ROOT/selection-natural-150k.jsonl" \
-  --samples 150000 \
+  --output "$SF_ROOT/selection-natural-60k.jsonl" \
+  --samples 60000 \
   --sampling_mode natural \
   --seed 0
 
 python tools/cache_vggt_features.py \
   --train_metas_path "$TRAIN_META" \
-  --selection "$SF_ROOT/selection-natural-150k.jsonl" \
-  --output "$SF_ROOT/vggt-natural-150k.sqlite" \
+  --selection "$SF_ROOT/selection-natural-60k.jsonl" \
+  --output "$SF_ROOT/vggt-natural-60k.sqlite" \
   --vggt_repo "$VGGT_REPO" \
   --vggt_checkpoint "$VGGT_CKPT" \
   --target_token_grid 7 7 \
@@ -652,9 +658,13 @@ python tools/cache_vggt_features.py \
   --prefetch_factor 2 \
   --device cuda
 
-conda run -n xvla python tools/inspect_sf_cache.py "$SF_ROOT/vggt-natural-150k.sqlite"
-du -h "$SF_ROOT/vggt-natural-150k.sqlite"
+conda run -n xvla python tools/inspect_sf_cache.py "$SF_ROOT/vggt-natural-60k.sqlite"
+du -h "$SF_ROOT/vggt-natural-60k.sqlite"
 ```
+
+运行注意：该脚本 print 无 flush，管道重定向时必须 `python -u` 启动，否则缓存进度行
+因 stdout 块缓冲（~8KB）要 ~1 小时才落盘。已做 b1-vs-b4 同帧 cosine 抽查（0.994-0.999），
+确认 batch 推理无跨样本污染。
 
 不要在未经审计时添加 `--overwrite`。中断后当前实现不会续写同一cache；应保留失败文件排查，
 确认原因后删除或显式 `--overwrite` 重建。
@@ -670,14 +680,15 @@ A1不传 `--enable_sf`；A2传入。二者均使用同一个自然分布缓存�
 两组都不传 `--frame_weight_sampling`，因此缓存中每一帧等概率进入训练。日志中的
 `KEY_RATIO` 应在随机波动范围内接近清单生成时的 `selected_key_ratio`。
 
-正式SF训练预算为1500个新的optimizer steps，填写 `--iters=1500`：
+正式SF训练预算为3000个新的optimizer steps（2026-08-17 决策，原1500上调），
+填写 `--iters=3000`，每500步保存并评测：
 
 ```bash
 COMMON_ARGS="--models $R1_CKPT6000 \
---train_metas_path $TRAIN_META --teacher_cache $SF_ROOT/vggt-natural-150k.sqlite \
+--train_metas_path $TRAIN_META --teacher_cache $SF_ROOT/vggt-natural-60k.sqlite \
 --batch_size 4 --gradient_accumulation_steps 8 --num_workers 4 \
---iters 1500 --sf_phase1_steps 500 \
---sf_warmup_steps 100 --sf_loss_weight 0.1 --save_interval 250 \
+--iters 3000 --sf_phase1_steps 500 \
+--sf_warmup_steps 100 --sf_loss_weight 0.1 --save_interval 500 \
 --log_interval 20 --max_grad_norm 1.0"
 
 conda run -n xvla accelerate launch --mixed_precision bf16 \
@@ -688,14 +699,26 @@ conda run -n xvla accelerate launch --mixed_precision bf16 \
 ```
 
 若shell不适合字符串展开，应把 `COMMON_ARGS` 展开为完整参数，不要加引号作为一个参数传入。
-A1/A2必须使用相同seed和起点；不要并行运行导致资源争用。每250步按第11、12节评测，连续两个
-checkpoint退化即停止。
+A1/A2必须使用相同seed和起点；**串行执行**（A1 先跑完再跑 A2，不并行避免资源争用）。
+每500步按第11、12节评测，连续两个checkpoint退化即停止。
+
+监控与上传：训练期间每15-30分钟巡检一次（按 15.9 节重点项 1/2/3：action loss 不退化、
+sf_loss 单独不算成功、vision_last/sf_projector 梯度非零且 finite、A1/A2 相同组 LR/采样比例/
+action 梯度可比）。每个 checkpoint 用 `upload_checkpoints.sh` 上传到 HF 仓库
+`tianSeconds/finetunning` 的 `A1/`、`A2/` 子目录（EXP 参数）。监控分析结果落到本地
+`outputs/sf/`。
 
 ### 15.9 每个checkpoint检查清单
 
 1. `sf_loss`下降不能单独作为成功；action loss不能连续明显恶化；
-2. A2的 `vision_last` 和 `sf_projector` 梯度非零且finite；
-3. A1/A2相同组的LR、采样比例、action梯度应可比较；
+2. 直接检查训练日志中的 `grad_norm_preclip_vision_last`、
+   `grad_norm_preclip_sf_projector` 及对应nonzero/tensor计数：A2应非零且finite；它们按
+   `log_interval`在完整梯度累积结束、裁剪前打印。checkpoint权重差分是额外检查“梯度是否形成
+   参数更新”，不是判断梯度存在的前置条件；
+3. A1/A2相同组的LR、采样比例、action梯度应按相同阶段比较。Phase 1（默认前500步）
+   `action_encoder/action_decoder` 的LR=0、梯度为空是预期行为；只从Phase 2开始比较日志中的
+   `grad_norm_preclip_action_encoder/decoder`、nonzero ratio和LR。比较同一窗口的中位数/分位数，
+   不要求两个独立DataLoader运行逐step完全相等；
 4. 对固定离线probe保存关键/普通帧 action MSE、vision feature drift、action输出方差；
 5. 仿真比较A1、A2、ckpt-6000和官方100K，优先看抓空、接触点、放置对齐漏斗；
 6. 训练结束后部署模型可删除训练专用 `sf_projector` 权重并清除config中的 `sf_*` 字段；
