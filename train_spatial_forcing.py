@@ -93,15 +93,21 @@ def build_sf_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
                      tr.action_decoder.bias.weight]
     for p in domain_params:
         _domain_mask(p, ARGS.target_domain)
+    vision_params = list(vision.parameters())
     groups = [
         {"name": "sf_projector", "params": list(model.sf_projector.parameters())},
-        {"name": "vision_last", "params": list(vision.parameters())},
+        {"name": "vision_last", "params": vision_params},
         {"name": "aux_visual_weight", "params": [aux.weight]},
         {"name": "aux_visual_bias", "params": [aux.bias]},
         {"name": "soft_prompt", "params": [domain_params[0]], "monitor_domain": ARGS.target_domain},
         {"name": "action_encoder", "params": domain_params[1:3], "monitor_domain": ARGS.target_domain},
         {"name": "action_decoder", "params": domain_params[3:5], "monitor_domain": ARGS.target_domain},
         {"name": "transformer_core", "params": list(tr.blocks.parameters())},
+        # Compatibility-only empty group: train.py's stable log line always
+        # reads lr_vlm. The actual trainable VLM subset is vision_last above;
+        # adding all remaining VLM weights here would needlessly make them part
+        # of optimizer/DDP state despite a permanent zero LR.
+        {"name": "vlm", "params": []},
     ]
     selected = {id(p) for g in groups for p in g["params"]}
     if sum(len(g["params"]) for g in groups) != len(selected):
@@ -129,6 +135,7 @@ def configure_sf_step(optimizer, step, args):
         "action_encoder": 0.0 if phase1 else args.sf_action_lr,
         "action_decoder": 0.0 if phase1 else args.sf_action_lr,
         "transformer_core": 0.0 if phase1 else args.sf_transformer_lr,
+        "vlm": 0.0,
     }
     for group in optimizer.param_groups:
         group["lr"] = lrs[group["name"]]
