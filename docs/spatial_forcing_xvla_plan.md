@@ -469,7 +469,7 @@ VGGT。每条 feature 在 SQLite 中以 BF16 原始位保存；训练读出后�
 相机顺序直接读取训练 meta 的 `camera_keys` 并写入缓存，训练启动时再次从 meta 读取并强校验。
 
 首版自动mask只包含训练数据的 `image_mask` 和finite检查；VGGT feature接口本身没有直接提供
-逐token几何置信度。因此第4.1节的低质量样本筛除仍是正式30K清单生成前的人工audit门槛，
+逐token几何置信度。因此第4.1节的低质量样本筛除仍是正式150K清单生成前的人工audit门槛，
 不能把“缓存成功生成”等同于teacher质量合格。
 
 ### 15.2 Step 0：准备路径和 VGGT teacher 环境
@@ -517,10 +517,12 @@ conda run -n xvla python tools/audit_xvla_token_grid.py \
 
 检查：
 
-- `encode_image_shape=[1,N,D]`；
-- `candidate_square_grid` 非空；
+- `encode_image_shape=[1,50,1024]`；
+- `image_feature_source=[spatial_avg_pool, temporal_avg_pool]`；
+- `global_token_indices=[0]`、`spatial_slice=[1,50]`；
+- `spatial_tokens=49`、`spatial_grid=[7,7]`；
 - 按第 4.2 节完成 token 回投可视化后，再把该网格传给 teacher；
-- 下文以审计得到 `16 16` 为示例，**不得未经确认照抄**。
+- 当前R1-6000审计结果应使用 `7 7`。若换模型/config，必须重新audit，不能沿用。
 
 ### 15.4 Step 2：先建 300 样本 smoke 清单
 
@@ -559,7 +561,7 @@ python tools/cache_vggt_features.py \
   --output "$SF_ROOT/vggt-smoke-300.sqlite" \
   --vggt_repo "$VGGT_REPO" \
   --vggt_checkpoint "$VGGT_CKPT" \
-  --target_token_grid 16 16 \
+  --target_token_grid 7 7 \
   --teacher_layer -1 \
   --teacher_image_size 518 \
   --num_actions 30 \
@@ -616,31 +618,31 @@ conda run -n xvla accelerate launch --mixed_precision bf16 \
 
 依次将物理 batch 测为1、2、4；选择4090不OOM的最大值，再用梯度累积保持 effective batch=32。
 
-### 15.7 Step 5：生成正式30K缓存
+### 15.7 Step 5：生成正式150K自然分布缓存
 
 ```bash
 python tools/build_sf_sample_manifest.py \
   --meta "$TRAIN_META" \
-  --output "$SF_ROOT/selection-30k.jsonl" \
-  --samples 30000 \
+  --output "$SF_ROOT/selection-natural-150k.jsonl" \
+  --samples 150000 \
   --sampling_mode natural \
   --seed 0
 
 python tools/cache_vggt_features.py \
   --train_metas_path "$TRAIN_META" \
-  --selection "$SF_ROOT/selection-30k.jsonl" \
-  --output "$SF_ROOT/vggt-30k.sqlite" \
+  --selection "$SF_ROOT/selection-natural-150k.jsonl" \
+  --output "$SF_ROOT/vggt-natural-150k.sqlite" \
   --vggt_repo "$VGGT_REPO" \
   --vggt_checkpoint "$VGGT_CKPT" \
-  --target_token_grid 16 16 \
+  --target_token_grid 7 7 \
   --teacher_layer -1 \
   --teacher_image_size 518 \
   --num_actions 30 \
   --action_mode ee6d \
   --device cuda
 
-conda run -n xvla python tools/inspect_sf_cache.py "$SF_ROOT/vggt-30k.sqlite"
-du -h "$SF_ROOT/vggt-30k.sqlite"
+conda run -n xvla python tools/inspect_sf_cache.py "$SF_ROOT/vggt-natural-150k.sqlite"
+du -h "$SF_ROOT/vggt-natural-150k.sqlite"
 ```
 
 不要在未经审计时添加 `--overwrite`。中断后当前实现不会续写同一cache；应保留失败文件排查，
@@ -656,7 +658,7 @@ A1不传 `--enable_sf`；A2传入。二者均使用同一个自然分布缓存�
 
 ```bash
 COMMON_ARGS="--models $R1_CKPT6000 \
---train_metas_path $TRAIN_META --teacher_cache $SF_ROOT/vggt-30k.sqlite \
+--train_metas_path $TRAIN_META --teacher_cache $SF_ROOT/vggt-natural-150k.sqlite \
 --batch_size 4 --gradient_accumulation_steps 8 --num_workers 4 \
 --iters 1500 --sf_phase1_steps 500 \
 --sf_warmup_steps 100 --sf_loss_weight 0.1 --save_interval 250 \

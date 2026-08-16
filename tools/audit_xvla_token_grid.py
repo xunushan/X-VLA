@@ -7,6 +7,7 @@ import torch
 
 from models.configuration_xvla import XVLAConfig
 from models.modeling_xvla import XVLA
+from spatial_forcing.token_layout import resolve_spatial_token_layout
 
 
 if __name__ == "__main__":
@@ -20,15 +21,13 @@ if __name__ == "__main__":
     with torch.no_grad():
         feature = model.vlm._encode_image(image)
     n = int(feature.shape[1])
-    side = int(n ** 0.5)
+    layout = resolve_spatial_token_layout(model.vlm.image_feature_source, n)
     report = {
         "encode_image_shape": list(feature.shape),
         "num_tokens": n,
-        "candidate_square_grid": [side, side] if side * side == n else None,
+        "image_feature_source": list(model.vlm.image_feature_source),
+        **layout,
         "feature_dim": int(feature.shape[-1]),
         "image_projection_shape": list(model.vlm.image_projection.shape),
     }
     print(json.dumps(report, indent=2))
-    if side * side != n:
-        raise SystemExit("token count is not a square grid; do not run token-wise SF")
-

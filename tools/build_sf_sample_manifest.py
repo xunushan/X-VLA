@@ -33,6 +33,8 @@ def balanced_take(groups, total, rng):
 
 def select_records(all_records, samples, sampling_mode, rng):
     """Select without replacement; natural mode never uses key-frame labels."""
+    if samples <= 0:
+        raise ValueError(f"samples must be positive, got {samples}")
     if samples > len(all_records):
         raise RuntimeError(f"only {len(all_records)} eligible samples, requested {samples}")
     if sampling_mode == "natural":
@@ -129,12 +131,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--meta", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--samples", type=int, default=30000)
+    p.add_argument("--samples", type=int, default=150000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--sampling_mode",
         choices=("natural", "key_regular_1to1"),
-        default="key_regular_1to1",
+        default="natural",
         help=("natural=uniform over all train-eligible frames; "
               "key_regular_1to1=legacy task-balanced 50/50 pool"),
     )

@@ -14,6 +14,7 @@ import train as base_train
 from models.configuration_xvla import XVLAConfig
 from models.modeling_xvla import XVLA
 from spatial_forcing.cache import FeatureCacheReader
+from spatial_forcing.token_layout import select_spatial_tokens
 from xvla_datasets import worker_init_fn
 from xvla_datasets.dataset import InfiniteDataReader
 from xvla_datasets.domain_handler.lerobot_v3_robodojo import DEFAULT_CAMERA_KEYS
@@ -149,8 +150,16 @@ def sf_model_forward(self, teacher_feature=None, episode_index=None, frame_index
     if teacher is None:
         raise ValueError("--enable_sf requires teacher_feature in every cached sample")
     b, v, n, dt = teacher.shape
+    if student.shape[:2] != (b, v):
+        raise ValueError(f"SF batch/view mismatch student={tuple(student.shape)} teacher={tuple(teacher.shape)}")
+    student, layout = select_spatial_tokens(
+        student, self.vlm.image_feature_source, spatial_tokens=n
+    )
     if student.shape[:3] != (b, v, n):
-        raise ValueError(f"SF shape mismatch student={tuple(student.shape)} teacher={tuple(teacher.shape)}")
+        raise ValueError(
+            f"SF spatial shape mismatch after layout={layout}: "
+            f"student={tuple(student.shape)} teacher={tuple(teacher.shape)}"
+        )
     student = student.float()
     teacher = teacher.float()
     projected = F.normalize(self.sf_projector(student), dim=-1)
@@ -177,6 +186,22 @@ def main(args):
     expected = CACHE.metadata
     if expected.get("color_jitter") is not False:
         raise ValueError("cache must declare color_jitter=false")
+    target_grid = expected.get("target_token_grid")
+    feature_shape = expected.get("feature_shape_per_sample")
+    if not (
+        isinstance(target_grid, list) and len(target_grid) == 2
+        and isinstance(feature_shape, list) and len(feature_shape) == 3
+    ):
+        raise ValueError(
+            "cache must declare target_token_grid=[H,W] and "
+            "feature_shape_per_sample=[V,N,D]"
+        )
+    target_tokens = int(target_grid[0]) * int(target_grid[1])
+    if int(feature_shape[1]) != target_tokens:
+        raise ValueError(
+            f"cache grid/feature mismatch: target_token_grid={target_grid}, "
+            f"feature_shape_per_sample={feature_shape}"
+        )
     train_meta = json.loads(Path(args.train_metas_path).read_text())
     camera_order = list(train_meta.get("camera_keys", DEFAULT_CAMERA_KEYS))[:3]
     if list(expected.get("camera_order", [])) != camera_order:
