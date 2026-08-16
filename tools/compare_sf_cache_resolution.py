@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-from spatial_forcing.cache import FeatureCacheReader
+from spatial_forcing.cache import FeatureCacheReader, sample_key
 from xvla_datasets.dataset import InfiniteDataReader
 from xvla_datasets.domain_handler.lerobot_v3_robodojo import DEFAULT_CAMERA_KEYS
 
@@ -88,8 +88,10 @@ def main(args):
         raise ValueError(f"need 3 cameras, got {cam_names}")
     records = load_manifest(args.manifest, args.num_samples)
     allowlist = {(int(r["episode_index"]), int(r["frame_index"])) for r in records}
-    if any(k not in c518.entries or k not in c336.entries for k in allowlist):
-        raise ValueError("manifest contains frames missing from one of the caches")
+    missing = [k for k in allowlist
+               if sample_key(*k) not in c518.entries or sample_key(*k) not in c336.entries]
+    if missing:
+        raise ValueError(f"manifest contains frames missing from a cache: {missing[:5]}")
     display_transform = transforms.Compose([
         transforms.Resize((args.display_size, args.display_size),
                           interpolation=InterpolationMode.BICUBIC),
