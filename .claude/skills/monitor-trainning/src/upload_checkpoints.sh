@@ -46,6 +46,11 @@ if [ -z "${HF_BIN}" ]; then
 fi
 [ -n "${HF_BIN}" ] || { echo "[upload] ERROR: hf CLI not found" >&2; exit 1; }
 
+# 2026-08-17 实测：默认 Xet 后端在 LFS 大文件上传完成后，create_commit 阶段挂死
+# （进程 100% 后空转，repo 无新文件）。HF_HUB_DISABLE_XET=1 切到全文件直传路径，
+# 上传可靠完成（每 ckpt ~3.5GB 全量，~5min/档，无增量去重）。
+export HF_HUB_DISABLE_XET=1
+
 # marker/日志目录放 OUTPUT_DIR 父级（如 /cloud/cloud-ssd1），避免被 prune 清理
 WATCH_DIR="$(dirname "${OUTPUT_DIR}")"
 UPLOAD_LOG_DIR="${WATCH_DIR}/hf_uploads"
