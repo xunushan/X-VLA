@@ -81,6 +81,34 @@ def test_optimizer_groups_and_domain_guard(capsys):
     assert "first aux backward" not in capsys.readouterr().out
 
 
+def test_gradient_monitor_reports_active_domain_row_before_clipping():
+    model = TinyModel()
+    trainer._ARGS = _args(target_domain=1)
+    optimizer = trainer.build_three_camera_optimizer(
+        model, lr=1e-4, weight_decay=0.0
+    )
+    trainer.configure_three_camera_step(optimizer, 10, trainer._ARGS)
+
+    loss = sum(
+        parameter.sum()
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+        if parameter.requires_grad
+    )
+    loss.backward()
+    stats = trainer.base_train._optimizer_group_gradient_stats(optimizer)
+
+    assert stats["action_encoder"]["norm"] > 0
+    assert stats["action_encoder"]["nonzero_ratio"] == pytest.approx(1.0)
+    assert stats["action_encoder"]["tensors_with_grad"] == 2
+    assert stats["action_decoder"]["norm"] > 0
+    assert stats["action_decoder"]["nonzero_ratio"] == pytest.approx(1.0)
+    assert stats["soft_prompt"]["nonzero_ratio"] == pytest.approx(1.0)
+    assert stats["transformer_core"]["norm"] == 0.0
+    assert stats["transformer_core"]["nonzero_ratio"] is None
+    assert stats["transformer_core"]["tensors_with_grad"] == 0
+
+
 def test_stage_boundaries_apply_expected_trainable_groups():
     model = TinyModel()
     trainer._ARGS = _args()

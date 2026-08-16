@@ -450,6 +450,64 @@ def get_group_lr(optim: torch.optim.Optimizer, name: str) -> float:
     return 0.0
 
 
+_GRADIENT_MONITOR_GROUPS = {
+    "aux_visual_weight",
+    "aux_visual_bias",
+    "soft_prompt",
+    "action_encoder",
+    "action_decoder",
+    "transformer_core",
+}
+
+
+def _optimizer_group_gradient_stats(optim):
+    """Compute pre-clip diagnostics for key three-camera optimizer groups.
+
+    Domain-aware tables contain all domains although training updates one row.
+    A group's optional ``monitor_domain`` selects that active row so its nonzero
+    ratio is not diluted by the other 29 deliberately masked rows.
+    """
+    stats = {}
+    for group in optim.param_groups:
+        name = group.get("name")
+        if name not in _GRADIENT_MONITOR_GROUPS:
+            continue
+
+        squared_norm = 0.0
+        nonzero = 0
+        elements = 0
+        tensors_with_grad = 0
+        monitor_domain = group.get("monitor_domain")
+        # Counting 300M+ Transformer elements every log interval is needlessly
+        # expensive. Its aggregate norm is useful; element-wise sparsity is not.
+        monitor_nonzero = name != "transformer_core"
+        for parameter in group["params"]:
+            grad = parameter.grad
+            if grad is None:
+                continue
+            if monitor_domain is not None:
+                if grad.ndim < 1 or not 0 <= monitor_domain < grad.shape[0]:
+                    raise ValueError(
+                        f"monitor_domain={monitor_domain} invalid for optimizer group "
+                        f"{name!r} gradient shape={tuple(grad.shape)}"
+                    )
+                grad = grad[monitor_domain]
+            grad = grad.detach()
+            squared_norm += grad.float().pow(2).sum().item()
+            if monitor_nonzero:
+                nonzero += torch.count_nonzero(grad).item()
+                elements += grad.numel()
+            tensors_with_grad += 1
+
+        stats[name] = {
+            "norm": squared_norm**0.5,
+            "nonzero_ratio": nonzero / elements if elements else None,
+            "tensors_with_grad": tensors_with_grad,
+            "tensor_count": len(group["params"]),
+        }
+    return stats
+
+
 def linear_warmup_cosine(step, start, warmup, total, base_lr, min_ratio):
     """Linear warmup followed by cosine decay."""
     if step < start:
@@ -664,6 +722,9 @@ def main(args):
     effective_loss_sums: Dict[str, torch.Tensor] = {}
     effective_loss_total_sum: torch.Tensor | None = None
     effective_batch_samples_local = 0
+    # key 帧占比统计：累计 key 帧数与带 key 信息的样本数（跨 micro-batch / rank 归并）
+    effective_key_sum_local = 0.0
+    effective_key_samples_local = 0
     while global_step < args.iters:
         # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
         # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
@@ -675,6 +736,12 @@ def main(args):
             _t = time.time()
             batch = next(train_iter)
             data_s += time.time() - _t
+
+            # key 帧占比统计：pop 掉 is_key_frame（只进日志不进模型），按 micro-batch 样本累计
+            batch_key = batch.pop("is_key_frame", None)
+            if batch_key is not None:
+                effective_key_sum_local += float(batch_key.float().sum().item())
+                effective_key_samples_local += int(batch_key.numel())
 
             # Encode language
             lang = processor.encode_language(batch["language_instruction"])
@@ -725,6 +792,20 @@ def main(args):
                     )
                     ** 0.5
                 )
+                # 分组统计只在即将打印的 optimizer step 计算，避免每步扫描大型
+                # Transformer 参数。这里仍位于 clip/step 之前，因此语义明确为
+                # 累积完整 effective batch 后的裁剪前梯度。
+                should_log_grad_groups = (global_step + 1) % args.log_interval == 0
+                group_grad_stats = (
+                    _optimizer_group_gradient_stats(optim)
+                    if should_log_grad_groups
+                    else {}
+                )
+                clip_coef = (
+                    min(1.0, float(args.max_grad_norm) / max(grad_norm, 1e-12))
+                    if args.max_grad_norm
+                    else 1.0
+                )
                 if args.max_grad_norm:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
@@ -745,8 +826,8 @@ def main(args):
                         "No micro-batch losses collected for effective-batch logging"
                     )
 
-                # 一次 collective 同时归并各 loss 分量、total 和样本数。除以全局真实样本数，
-                # 得到本 optimizer update 对应的 effective-batch mean loss。
+                # 一次 collective 同时归并各 loss 分量、total、样本数和 key 帧计数。
+                # 除以全局真实样本数，得到本 optimizer update 对应的 effective-batch mean loss。
                 loss_names = tuple(effective_loss_sums)
                 local_stats = torch.stack(
                     [effective_loss_sums[name] for name in loss_names]
@@ -755,18 +836,31 @@ def main(args):
                         effective_loss_total_sum.new_tensor(
                             float(effective_batch_samples_local)
                         ),
+                        effective_loss_total_sum.new_tensor(float(effective_key_sum_local)),
+                        effective_loss_total_sum.new_tensor(float(effective_key_samples_local)),
                     ]
                 )
                 global_stats = accelerator.reduce(local_stats, reduction="sum")
-                effective_batch_samples_global = float(global_stats[-1].item())
+                effective_batch_samples_global = float(global_stats[-3].item())
+                key_sum_global = float(global_stats[-2].item())
+                key_samples_global = float(global_stats[-1].item())
                 denominator = max(effective_batch_samples_global, 1.0)
                 logs = {
                     name: float(global_stats[index].item() / denominator)
                     for index, name in enumerate(loss_names)
                 }
-                logs["loss_total"] = float(global_stats[-2].item() / denominator)
+                logs["loss_total"] = float(global_stats[-4].item() / denominator)
                 logs["effective_batch_samples"] = effective_batch_samples_global
+                # 本 optimizer step 全量样本（跨 micro-batch / rank）的 key 帧占比
+                if key_samples_global > 0:
+                    logs["key_frame_ratio"] = key_sum_global / key_samples_global
                 logs["grad_norm"] = grad_norm
+                logs["grad_clip_coef"] = clip_coef
+                for group_name, stats in group_grad_stats.items():
+                    logs[f"grad_norm_preclip_{group_name}"] = stats["norm"]
+                    if stats["nonzero_ratio"] is not None:
+                        logs[f"grad_nonzero_ratio_{group_name}"] = stats["nonzero_ratio"]
+                    logs[f"grad_tensors_{group_name}"] = stats["tensors_with_grad"]
                 logs["step"] = global_step
                 logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
                 accelerator.log(logs, step=global_step)
@@ -785,24 +879,43 @@ def main(args):
                         for k, v in logs.items()
                         if k.endswith("_loss") and k != "loss_total"
                     )
+                    grad_parts = " ".join(
+                        f"{name}={stats['norm']:.3e}/nz="
+                        f"{stats['nonzero_ratio']:.3f}"
+                        if stats["nonzero_ratio"] is not None
+                        else f"{name}={stats['norm']:.3e}"
+                        for name, stats in group_grad_stats.items()
+                    )
+                    # 当前批次 key 帧占比（数据未携带 key 信息时为 NA）
+                    key_pct = (
+                        f"{logs['key_frame_ratio'] * 100:.1f}%"
+                        if "key_frame_ratio" in logs
+                        else "NA"
+                    )
                     logger.info(
                         f"[{global_step}/{args.iters}] "
                         f"loss={logs['loss_total']:.4f} "
                         f"[{loss_parts}] "
                         f"effective_batch={int(logs['effective_batch_samples'])} "
+                        f"key_ratio={key_pct} "
                         f"grad_norm={logs['grad_norm']:.4f} "
+                        f"clip_coef={logs['grad_clip_coef']:.3e} "
                         f"lr_core={logs['lr_transformer_core']:.2e} "
                         f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
                         f"DATA_PCT={data_pct:.0f}% "
                         f"USED_CPU={cpu_mem:.2e} GB "
                         f"USED_GPU={gpu_mem:.2e} GB "
                     )
+                    if grad_parts:
+                        logger.info(f"GRAD_PRECLIP [{grad_parts}]")
 
             # 无论本 step 是否打印，都必须在 optimizer step 边界清空，避免把多个
             # optimizer update 混到下一次日志中。
             effective_loss_sums = {}
             effective_loss_total_sum = None
             effective_batch_samples_local = 0
+            effective_key_sum_local = 0.0
+            effective_key_samples_local = 0
 
             # Checkpointing
             if global_step == args.iters or global_step % args.save_interval == 0:

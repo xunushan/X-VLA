@@ -146,6 +146,24 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         lo, hi = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
         return np.asarray(fw[lo:hi], dtype=np.float64)
 
+    def _read_is_key_frame(self, ep: dict) -> np.ndarray | None:
+        """读取该 episode 的 is_key_frame（0/1，与 observation.state 同行对齐）。
+
+        与 _read_frame_weight 同一定位方式。主表无 is_key_frame 列时从 frame_weight
+        推导（fw > 1.0 视为 key 帧，与 tools/add_frame_weight.py 的 key 阈值一致）；
+        两列都缺失返回 None（旧数据），调用方跳过该字段。
+        """
+        ci, fi = int(ep["data/chunk_index"]), int(ep["data/file_index"])
+        data = self._read_parquet(f"chunk-{ci:03d}/file-{fi:03d}.parquet")
+        lo, hi = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
+        is_key = data.get("is_key_frame")
+        if is_key is None:
+            fw = data.get("frame_weight")
+            if fw is None:
+                return None
+            return (np.asarray(fw[lo:hi], dtype=np.float64) > 1.0).astype(np.int64)
+        return np.asarray(is_key[lo:hi], dtype=np.int64)
+
     @staticmethod
     def _to_20d(arr: np.ndarray) -> np.ndarray:
         """16 维 → 20 维：每臂 [xyz, quat_wxyz, g] → [xyz, rot6d, g]（委托 utils.ee16_to_xvla20）。"""
@@ -279,6 +297,9 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         elif training:
             random.shuffle(idxs)
 
+        # 逐帧 key 标记（0/1）：与 frame_weight 同源同表，随样本输出供统计 batch key 帧占比
+        key_status = self._read_is_key_frame(ep)
+
         ins = self._instruction(ep)
         image_mask = torch.zeros(self.num_views, dtype=torch.bool)
         image_mask[:n_views] = True
@@ -313,6 +334,10 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                 "image_mask": image_mask,
                 "abs_trajectory": seq,
             }
+            # is_key_frame 随样本输出（batch key 帧占比统计用）：主表无 is_key_frame 列时
+            # 由 _read_is_key_frame 从 frame_weight 推导兜底，两列都缺失才不携带该字段
+            if key_status is not None:
+                sample["is_key_frame"] = int(key_status[idx])
             # frame_info 为评估用 opt-in：训练路径不传（默认 False）→ 样本 dict 不变
             if frame_info:
                 sample["episode_index"] = ep_idx

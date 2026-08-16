@@ -1,15 +1,17 @@
 #!/usr/bin/env python
-"""给 lerobot v3.0 主表 parquet 添加逐帧采样权重列 `frame_weight`（K1 用）。
+"""给 lerobot v3.0 主表 parquet 添加逐帧采样权重列 `frame_weight` 与 `is_key_frame`（K1 用）。
 
 背景（docs/k1_k2_postprocessing_plan.md）：
   K1 关键帧重采样通过 `--frame_weight_sampling` 开启，数据侧要求主表
   `data/chunk-{ci:03d}/file-{fi:03d}.parquet`（与 observation.state 同表同行）
   存在 `frame_weight` 列。本脚本从 CSV（默认 /data/data/lerobot_v30_ee.csv）
   读取逐帧权重并写入训练数据集（默认 /data/data/lerobot_v30_ee_6d）的主表。
+  同时写入 `is_key_frame` 列（0/1，key 帧 = frame_weight 超过普通帧权重阈值），
+  供 handler 随样本输出 batch key 帧占比统计（训练日志用）。
 
 CSV 支持两种来源列（按存在性自动识别，优先级从高到低）：
   1. `frame_weight` 列：直接作为该帧权重（nan/<=0 按告警钳到 1e-8）
-  2. `key`/`is_key`/`key_frame` 列（0/1 或 True/False）：key 帧取 1.5、普通帧取 1.0
+  2. `key`/`is_key`/`key_frame` 列（0/1 或 True/False）：key 帧取 2.0、普通帧取 1.0
      （可用 --weight-key / --weight-normal 覆盖）
 
 索引列要求：`episode_index`（或 `episode`）+ `frame_index`（或 `frame`/`idx`），
@@ -67,7 +69,7 @@ def parse_args() -> argparse.ArgumentParser:
 
     p_apply = sub.add_parser("apply", parents=[common],
                              help="把 CSV 权重写入主表 frame_weight 列")
-    p_apply.add_argument("--weight-key", type=float, default=1.5,
+    p_apply.add_argument("--weight-key", type=float, default=2.0,
                          help="key 帧权重（CSV 用 key 布尔列时）")
     p_apply.add_argument("--weight-normal", type=float, default=1.0,
                          help="普通帧权重")
@@ -175,8 +177,11 @@ def main() -> int:
         files = sorted((data_root / "data").glob("chunk-*/file-*.parquet"))
         n_missing_col = 0
         n_bad = 0
+        n_missing_key = 0
         for path in files:
             t = pq.read_table(str(path))
+            if "is_key_frame" not in t.column_names:
+                n_missing_key += 1  # 旧数据无此列，handler 从 frame_weight 推导，不判失败
             if "frame_weight" not in t.column_names:
                 n_missing_col += 1
                 continue
@@ -184,7 +189,7 @@ def main() -> int:
             if len(fw) != t.num_rows or np.isnan(fw).any() or (fw <= 0).any():
                 n_bad += 1
         print(f"  main-table files: {len(files):,}  missing frame_weight: {n_missing_col}  "
-              f"bad (nan/<=0/len-mismatch): {n_bad}")
+              f"bad (nan/<=0/len-mismatch): {n_bad}  missing is_key_frame: {n_missing_key}")
         if not files or n_missing_col or n_bad:
             print("[add_frame_weight] VERIFY FAILED", file=sys.stderr)
             return 1
@@ -250,14 +255,18 @@ def main() -> int:
                     print(f"[add_frame_weight] WARN ep={e} fr={local} out of [0,{hi-lo})",
                           file=sys.stderr)
         total_frames += n
-        n_key = int((col > args.weight_normal + 1e-9).sum())
+        key_mask = col > args.weight_normal + 1e-9
+        n_key = int(key_mask.sum())
         print(f"  {path.relative_to(data_root)} rows={n:,} "
               f"key>normal: {n_key:,} ({(n_key / n * 100):.1f}%)")
         if args.apply:
-            if "frame_weight" in table.column_names:
-                table = table.drop(["frame_weight"])
+            for drop_col in ("frame_weight", "is_key_frame"):
+                if drop_col in table.column_names:
+                    table = table.drop([drop_col])
             table = table.append_column(
                 "frame_weight", pa.array(col.astype(np.float32)))
+            table = table.append_column(
+                "is_key_frame", pa.array(key_mask.astype(np.int8)))
             pq.write_table(table, path)
 
     print(f"[add_frame_weight] frames total={total_frames:,} covered_by_csv={covered_frames:,} "

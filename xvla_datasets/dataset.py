@@ -34,7 +34,8 @@ class InfiniteDataReader(IterableDataset):
         'image_input': FloatTensor[V, C, H, W],
         'image_mask': BoolTensor[V],
         'proprio': FloatTensor[dim_proprio],
-        'action': FloatTensor[T, dim_action]
+        'action': FloatTensor[T, dim_action],
+        'is_key_frame': int,          # v3.0 专属：该样本起始帧是否 key 帧（batch key 占比统计用）
       }
     """
     def __init__(self,

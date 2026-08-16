@@ -69,11 +69,22 @@ def _mask_domain_row(parameter: torch.nn.Parameter, domain_id: int, name: str) -
     parameter.register_hook(keep_row)
 
 
-def _group(name: str, params, *, weight_decay: float = 0.0) -> dict:
+def _group(
+    name: str,
+    params,
+    *,
+    weight_decay: float = 0.0,
+    monitor_domain: int | None = None,
+) -> dict:
     params = list(params)
     if not params:
         raise ValueError(f"Empty optimizer parameter group: {name}")
-    return {"name": name, "params": params, "lr": 0.0, "weight_decay": weight_decay}
+    group = {"name": name, "params": params, "lr": 0.0, "weight_decay": weight_decay}
+    if monitor_domain is not None:
+        # Optimizers ignore this metadata. train.py uses it only to report the
+        # gradient of the active domain row rather than all 30 table rows.
+        group["monitor_domain"] = monitor_domain
+    return group
 
 
 def _validate_groups(model, groups: list[dict]) -> set[int]:
@@ -162,14 +173,20 @@ def build_three_camera_optimizer(
     groups = [
         _group("aux_visual_weight", [aux.weight]),
         _group("aux_visual_bias", [aux.bias]),
-        _group("soft_prompt", [domain_parameters["soft_prompt"]]),
+        _group(
+            "soft_prompt",
+            [domain_parameters["soft_prompt"]],
+            monitor_domain=_ARGS.target_domain,
+        ),
         _group(
             "action_encoder",
             [domain_parameters["action_encoder_fc"], domain_parameters["action_encoder_bias"]],
+            monitor_domain=_ARGS.target_domain,
         ),
         _group(
             "action_decoder",
             [domain_parameters["action_decoder_fc"], domain_parameters["action_decoder_bias"]],
+            monitor_domain=_ARGS.target_domain,
         ),
         # Keep the two legacy group names because train.py's stable logging path
         # reports lr_transformer_core and lr_vlm explicitly.
