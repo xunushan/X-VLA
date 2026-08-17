@@ -56,6 +56,20 @@ from typing import Optional, Protocol, Sequence
 import torch
 from safetensors import safe_open
 
+
+def parse_slice_spec(spec: str) -> tuple[str, int, int]:
+    """解析 --slice 规格：`key@dim:idx`，返回 (key, dim, idx)。
+
+    对任意 key 沿任意维度取任意索引做分析，不预设 domain 语义。示例：
+        --slice transformer.action_decoder.fc.weight@0:0   # 取 dim0 第 0 行
+        --slice transformer.soft_prompt_hub.weight@0:0
+    若某个 key 是 [60, n]，想分析 60 里的第一维就用 `key@0:0`。
+    """
+    key, _, dim_idx = spec.rpartition("@")
+    dim, _, idx = dim_idx.partition(":")
+    return key, int(dim), int(idx)
+
+
 # ============================================================================
 # 1. Data layer – one-shot load
 # ============================================================================
@@ -346,11 +360,64 @@ class CheckpointComparator:
     # ------------------------------------------------------------------
     # 3.2 Weight diff – 核心分析：判断每个参数是否被真正训练更新
     # ------------------------------------------------------------------
+    def _key_metrics(
+        self,
+        orig_t: torch.Tensor,
+        ft_t: torch.Tensor,
+        threshold: float,
+        slice_dim: Optional[int],
+        slice_idx: Optional[int],
+    ) -> dict:
+        """对单个 tensor 对计算差异指标与判定（可选切片）。
+
+        指标：
+          diff      = mean(abs(orig - ft))，元素平均绝对差异（真实差异值）
+          max_delta = max(abs(orig - ft))，元素最大绝对差异
+          rel_delta = diff / mean(abs(orig))，相对原权重量级的相对变化
+          roundtrip = mean(abs(orig - orig.bfloat16().float()))，bf16 精度噪声地板
+          ratio     = diff / roundtrip；roundtrip==0（基线为 bf16 精确常数/全零）时为 None
+          verdict   = updated / precision
+
+        判定（三分法，全零/常数张量不再产生 infx 误报）：
+          - roundtrip>0：ratio > threshold → updated，否则 precision（仅精度噪声）；
+          - roundtrip==0 且 diff>0：基线为常数（如 LayerNorm weight=1/bias=0），
+            无噪声地板可归一化，但确实被训练移动 → updated（ratio=N/A）；
+          - roundtrip==0 且 diff==0：两档相同（如全零 final_logits_bias）→ precision，
+            不进 updated、不纳入结论。
+        """
+        if slice_dim is not None and orig_t.ndim > slice_dim:
+            idx = torch.tensor([slice_idx], dtype=torch.long)
+            orig_t = torch.index_select(orig_t, slice_dim, idx)
+            ft_t = torch.index_select(ft_t, slice_dim, idx)
+
+        delta = (orig_t - ft_t).abs()
+        diff = float(delta.mean())
+        max_delta = float(delta.max())
+        roundtrip = float((orig_t.bfloat16().float() - orig_t).abs().mean())
+        base_abs = float(orig_t.abs().mean())
+        rel_delta = diff / base_abs if base_abs > 0 else float("nan")
+
+        if roundtrip > 0:
+            ratio = diff / roundtrip
+            verdict = "updated" if ratio > threshold else "precision"
+        else:
+            ratio = None
+            verdict = "updated" if diff > 0 else "precision"
+        return {
+            "diff": diff,
+            "max_delta": max_delta,
+            "rel_delta": rel_delta,
+            "roundtrip": roundtrip,
+            "ratio": ratio,
+            "verdict": verdict,
+        }
+
     def weight_diff(
         self,
         threshold: float = 3.0,
         target_prefixes: Optional[Sequence[str]] = None,
         top_n: int = 5,
+        slices: Optional[dict[str, tuple[int, int]]] = None,
     ) -> WeightDiffResult:
         """逐参数比较权重值，区分"真正训练更新"和"仅 bf16 精度噪声"。
 
@@ -364,6 +431,7 @@ class CheckpointComparator:
         3. ratio = diff / roundtrip
            - ratio ≈ 1.0：差异全部由 bf16 精度转换解释，权重未被训练触及。
            - ratio > threshold（默认 3.0）：差异显著大于噪声，判定为真正更新。
+           - roundtrip==0：ratio=N/A，由 diff 直接判定（见 _key_metrics）。
 
         Parameters
         ----------
@@ -373,11 +441,15 @@ class CheckpointComparator:
             指定前缀列表，用于定向统计。如果为 None，则输出 top_n 最多的前缀。
         top_n : int, default=5
             前缀统计时取前 N 个。
+        slices : dict[str, tuple[int, int]] | None
+            通用 per-key 切片：{key: (dim, idx)}，对指定 key 只沿 dim 取 idx 行做 diff。
+            不预设 domain 语义；未列出的 key 整张分析。
 
         Returns
         -------
         WeightDiffResult
         """
+        slices = slices or {}
         mapping = self.mapping
         result = WeightDiffResult(threshold=threshold)
 
@@ -398,24 +470,15 @@ class CheckpointComparator:
                 result.unmatched.append(ft_key)
                 continue
 
-            # 计算差异
-            diff = (orig_t - ft_t).abs().mean().item()
-            # 计算 bf16 精度噪声地板
-            roundtrip = (orig_t.bfloat16().float() - orig_t).abs().mean().item()
-            # ratio：差异是噪声的多少倍
-            ratio = diff / roundtrip if roundtrip > 0 else float("inf")
-            verdict = "updated" if ratio > threshold else "precision"
-
+            sd, si = slices.get(ft_key, (None, None))
+            m = self._key_metrics(orig_t, ft_t, threshold, sd, si)
             result.details[ft_key] = {
-                "diff": diff,
-                "roundtrip": roundtrip,
-                "ratio": ratio,
-                "verdict": verdict,
+                **m,
                 "orig_key": orig_key,
                 "is_identity": ft_key == orig_key,
             }
 
-            if verdict == "updated":
+            if m["verdict"] == "updated":
                 result.updated.append(ft_key)
                 # 按前3段前缀聚合，快速定位哪些模块被修改最多
                 prefix = ".".join(ft_key.split(".")[:3])
@@ -428,21 +491,27 @@ class CheckpointComparator:
     # ------------------------------------------------------------------
     # 3.3 Sample report – 对指定 key 输出详细对比表格
     # ------------------------------------------------------------------
-    def sample_report(self, sample_keys: Sequence[str], threshold: float = 3.0) -> str:
-        """对一组指定的 key 输出详细的 diff / roundtrip / ratio / verdict 表格。
+    def sample_report(
+        self,
+        sample_keys: Sequence[str],
+        threshold: float = 3.0,
+        slices: Optional[dict[str, tuple[int, int]]] = None,
+    ) -> str:
+        """对一组指定的 key 输出详细的 meanΔ / maxΔ / relΔ / ratio / verdict 表格。
 
         与 weight_diff() 共用同一套内存中的 tensor，无需重新读取文件。
         原代码中 _compare_sample_keys 与 weight_diff 主循环逻辑完全重复，
         重构后统一为单一流，sample_report 只是对已有 tensors 的筛选输出。
         """
+        slices = slices or {}
         mapping = self.mapping
         lines: list[str] = []
         header = (
-            f"{'key':<60} {'diff':>10} {'roundtrip':>10} "
-            f"{'ratio':>6} {'verdict':>6} {'map':>10}"
+            f"{'key':<52} {'meanΔ':>10} {'maxΔ':>10} {'relΔ':>7} "
+            f"{'ratio':>7} {'verdict':>9} {'map':>9}"
         )
         lines.append(header)
-        lines.append("-" * 100)
+        lines.append("-" * 106)
 
         for ft_key in sample_keys:
             if ft_key not in self.ft.tensors:
@@ -461,17 +530,19 @@ class CheckpointComparator:
                 lines.append(f"  {ft_key}: 形状不匹配 {orig_t.shape} vs {ft_t.shape}")
                 continue
 
-            diff = (orig_t - ft_t).abs().mean().item()
-            roundtrip = (orig_t.bfloat16().float() - orig_t).abs().mean().item()
-            ratio = diff / roundtrip if roundtrip > 0 else float("inf")
-            verdict = "updated" if ratio > threshold else "precision"
+            sd, si = slices.get(ft_key, (None, None))
+            m = self._key_metrics(orig_t, ft_t, threshold, sd, si)
+            ratio_s = "N/A" if m["ratio"] is None else f"{m['ratio']:.1f}x"
+            rel_s = "nan" if m["rel_delta"] != m["rel_delta"] else f"{m['rel_delta']:.3f}"
             map_type = "identity" if ft_key == orig_key else "remapped"
 
-            # 取最后3段作为短名称，避免表格过宽
+            # 取最后3段作为短名称，避免表格过宽；切片 key 标注取的行
             short = ".".join(ft_key.split(".")[-3:])
+            if si is not None:
+                short = f"{short}@{si}"
             lines.append(
-                f"  {short:<60} {diff:>10.8f} {roundtrip:>10.8f} "
-                f"{ratio:>6.1f}x {verdict:>6} {map_type:>10}"
+                f"  {short:<52} {m['diff']:>10.2e} {m['max_delta']:>10.2e} "
+                f"{rel_s:>7} {ratio_s:>7} {m['verdict']:>9} {map_type:>9}"
             )
 
         return "\n".join(lines)
@@ -486,12 +557,14 @@ class CheckpointComparator:
         target_prefixes: Optional[Sequence[str]] = None,
         top_n: int = 5,
         top_ratio: int = 0,
+        slices: Optional[dict[str, tuple[int, int]]] = None,
     ) -> str:
         """生成完整的文本报告，整合 key diff + weight diff + sample report。
 
         这是通用报告，不包含任何模型特定的专项检查（如 X-VLA 的 shared.weight）。
         模型特定的检查由外部 XVLASpecialChecker 完成，通过 XVLACheckpointAnalyzer 拼接。
         """
+        slices = slices or {}
         lines: list[str] = []
         lines.append("=" * 100)
         lines.append("Checkpoint Diff 完整报告")
@@ -544,7 +617,10 @@ class CheckpointComparator:
 
         # ---- Weight diff section ----
         wd = self.weight_diff(
-            threshold=threshold, target_prefixes=target_prefixes, top_n=top_n
+            threshold=threshold,
+            target_prefixes=target_prefixes,
+            top_n=top_n,
+            slices=slices,
         )
         lines.append("-" * 50)
         lines.append("Weight Diff 统计")
@@ -555,6 +631,11 @@ class CheckpointComparator:
         lines.append(f"  新增 key:             {len(wd.new_keys)}")
         lines.append(f"  形状不匹配:           {len(wd.unmatched)}")
         lines.append(f"  更新比例:             {wd.update_ratio:.1f}%")
+        if slices:
+            spec_str = ", ".join(
+                f"{k}@{d}:{i}" for k, (d, i) in sorted(slices.items())
+            )
+            lines.append(f"  切片分析:            {spec_str}")
         lines.append("")
 
         # 按模块前缀统计更新（支持指定前缀或 Top N）
@@ -568,25 +649,32 @@ class CheckpointComparator:
                 lines.append(f"  {mod}: {cnt}")
         lines.append("")
 
-        # ---- Top N 更新权重（按 ratio 降序）----
+        # ---- Top N 更新权重（按 meanΔ 降序；meanΔ 为真实差异值，ratio 仅辅助）----
         if top_ratio > 0:
             ranked = sorted(
                 ((k, d) for k, d in wd.details.items() if d["verdict"] == "updated"),
-                key=lambda kv: kv[1]["ratio"],
+                key=lambda kv: kv[1]["diff"],
                 reverse=True,
             )[:top_ratio]
             if sample_keys is None:
                 sample_keys = [k for k, _ in ranked]
             lines.append("=" * 100)
-            lines.append(f"更新幅度最大的 Top {len(ranked)} 权重（按 ratio 降序）")
+            lines.append(f"更新幅度最大的 Top {len(ranked)} 权重（按 meanΔ 降序）")
             lines.append("=" * 100)
-            lines.append(f"{'rank':<5} {'key':<70} {'ratio':>10} {'diff':>10} {'verdict':>8}")
+            lines.append(
+                f"{'key':<66} {'meanΔ':>10} {'maxΔ':>10} {'relΔ':>8} {'ratio':>8} {'verdict':>9}"
+            )
             lines.append("-" * 100)
-            for i, (k, d) in enumerate(ranked, 1):
-                ratio = d["ratio"]
-                ratio_s = f"{ratio:.1f}x" if ratio != float("inf") else "infx"
+            for k, d in ranked:
+                ratio_s = "N/A" if d["ratio"] is None else f"{d['ratio']:.1f}x"
+                rel_s = "nan" if d["rel_delta"] != d["rel_delta"] else f"{d['rel_delta']:.3f}"
+                label = k
+                sd, si = slices.get(k, (None, None))
+                if si is not None:
+                    label = f"{k}@{si}"
                 lines.append(
-                    f"{i:<5} {k:<70} {ratio_s:>10} {d['diff']:>10.8f} {d['verdict']:>8}"
+                    f"{label:<66} {d['diff']:>10.2e} {d['max_delta']:>10.2e} "
+                    f"{rel_s:>8} {ratio_s:>8} {d['verdict']:>9}"
                 )
             lines.append("")
 
@@ -595,7 +683,7 @@ class CheckpointComparator:
             lines.append("=" * 100)
             lines.append("采样 key 对比")
             lines.append("=" * 100)
-            lines.append(self.sample_report(sample_keys, threshold))
+            lines.append(self.sample_report(sample_keys, threshold, slices))
             lines.append("")
 
         return "\n".join(lines)
@@ -869,6 +957,7 @@ class XVLACheckpointAnalyzer:
         target_prefixes: Optional[Sequence[str]] = None,
         top_n: int = 5,
         top_ratio: int = 0,
+        slices: Optional[dict[str, tuple[int, int]]] = None,
     ) -> str:
         """生成完整报告：通用分析 + X-VLA 专项检查。"""
         lines: list[str] = []
@@ -879,6 +968,7 @@ class XVLACheckpointAnalyzer:
                 target_prefixes=target_prefixes,
                 top_n=top_n,
                 top_ratio=top_ratio,
+                slices=slices,
             )
         )
         lines.extend(self.checker.check_shared_weight())
@@ -890,6 +980,28 @@ class XVLACheckpointAnalyzer:
 # ============================================================================
 # 7. CLI
 # ============================================================================
+
+
+def _add_slice_arg(parser: argparse.ArgumentParser) -> None:
+    """为子命令添加通用 per-key 切片参数 --slice key@dim:idx（可重复）。"""
+    parser.add_argument(
+        "--slice",
+        action="append",
+        default=None,
+        metavar="KEY@DIM:IDX",
+        help=("通用 per-key 切片：只对指定 key 沿 dim 取 idx 行做 diff/统计，"
+              "如 --slice transformer.action_decoder.fc.weight@0:0。"
+              "可重复；未列出的 key 整张分析。"),
+    )
+
+
+def _slices_from(specs: Optional[list[str]]) -> dict[str, tuple[int, int]]:
+    """把 --slice 参数列表解析成 {key: (dim, idx)}。"""
+    out: dict[str, tuple[int, int]] = {}
+    for spec in specs or []:
+        key, dim, idx = parse_slice_spec(spec)
+        out[key] = (dim, idx)
+    return out
 
 
 def _default_samples(ft_keys: set[str]) -> list[str]:
@@ -970,6 +1082,7 @@ def main() -> None:
     p_wt.add_argument(
         "--prefixes", nargs="+", default=None, help="Target prefixes to report"
     )
+    _add_slice_arg(p_wt)
 
     # ---- full ----
     p_full = sub.add_parser("full", help="X-VLA 完整报告（key + weight + 专项检查）")
@@ -985,8 +1098,9 @@ def main() -> None:
         "--top-ratio",
         type=int,
         default=40,
-        help="输出更新幅度最大的 Top N 权重表（按 ratio 降序），并把采样段改为这些 key；0 关闭",
+        help="输出更新幅度最大的 Top N 权重表（按 meanΔ 降序），并把采样段改为这些 key；0 关闭",
     )
+    _add_slice_arg(p_full)
 
     args = parser.parse_args()
 
@@ -1014,13 +1128,19 @@ def main() -> None:
             CheckpointData.from_path(args.ft),
             XVLAKeyMapper(),
         )
-        wd = comp.weight_diff(threshold=args.threshold, target_prefixes=args.prefixes)
+        wd = comp.weight_diff(
+            threshold=args.threshold,
+            target_prefixes=args.prefixes,
+            slices=_slices_from(args.slice),
+        )
         print(f"总 key: {wd.total_processed}")
         print(f"精度差异: {len(wd.precision_only)}")
         print(f"实质性更新: {len(wd.updated)}")
         print(f"新增: {len(wd.new_keys)}")
         print(f"不匹配: {len(wd.unmatched)}")
         print(f"更新比例: {wd.update_ratio:.1f}%")
+        if args.slice:
+            print(f"切片分析: {', '.join(args.slice)}")
         print("\n=== 按模块更新统计 (Top 5) ===")
         for mod, cnt in wd.prefix_stats.most_common(5):
             print(f"  {mod}: {cnt}")
@@ -1033,6 +1153,7 @@ def main() -> None:
                 sample_keys=None if args.top_ratio else _default_samples(analyzer.ft.keys),
                 target_prefixes=args.prefixes,
                 top_ratio=args.top_ratio,
+                slices=_slices_from(args.slice),
             )
         )
 
