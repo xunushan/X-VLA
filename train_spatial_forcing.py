@@ -23,6 +23,7 @@ from xvla_datasets.domain_handler.lerobot_v3_robodojo import DEFAULT_CAMERA_KEYS
 ARGS = None
 CACHE = None
 SF_START_STEP = 0
+_LAST_SF_PHASE = None
 
 
 class CachedTeacherDataset(IterableDataset):
@@ -124,10 +125,17 @@ def build_sf_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
 
 
 def configure_sf_step(optimizer, step, args):
+    global _LAST_SF_PHASE
     local = step - SF_START_STEP
     phase1 = local < args.sf_phase1_steps
+    projector_phase2_lr = (
+        args.sf_projector_lr
+        if args.sf_projector_phase2_lr is None
+        else args.sf_projector_phase2_lr
+    )
+    projector_lr = args.sf_projector_lr if phase1 else projector_phase2_lr
     lrs = {
-        "sf_projector": args.sf_projector_lr if args.enable_sf else 0.0,
+        "sf_projector": projector_lr if args.enable_sf else 0.0,
         "vision_last": args.sf_vision_lr,
         "aux_visual_weight": 0.0 if phase1 else args.sf_aux_lr,
         "aux_visual_bias": 0.0 if phase1 else args.sf_aux_bias_lr,
@@ -141,6 +149,14 @@ def configure_sf_step(optimizer, step, args):
         group["lr"] = lrs[group["name"]]
         for p in group["params"]:
             p.requires_grad = group["lr"] > 0
+    phase = 1 if phase1 else 2
+    if phase != _LAST_SF_PHASE:
+        print(
+            f"[sf] enter phase {phase} at global_step={step}, local_step={local}: "
+            f"projector_lr={lrs['sf_projector']:.2e}, "
+            f"vision_lr={lrs['vision_last']:.2e}"
+        )
+        _LAST_SF_PHASE = phase
 
 
 _ORIGINAL_XVLA_FORWARD = XVLA.forward
@@ -187,8 +203,16 @@ def configure_and_track(optimizer, step, args):
 
 
 def main(args):
-    global ARGS, CACHE, SF_START_STEP
+    global ARGS, CACHE, SF_START_STEP, _LAST_SF_PHASE
     ARGS = args
+    _LAST_SF_PHASE = None
+    lr_values = {
+        "sf_projector_lr": args.sf_projector_lr,
+        "sf_projector_phase2_lr": args.sf_projector_phase2_lr,
+        "sf_vision_lr": args.sf_vision_lr,
+    }
+    if any(value is not None and value < 0 for value in lr_values.values()):
+        raise ValueError(f"SF learning rates must be non-negative: {lr_values}")
     CACHE = FeatureCacheReader(args.teacher_cache)
     expected = CACHE.metadata
     if expected.get("color_jitter") is not False:
@@ -244,6 +268,13 @@ def parser():
     p.add_argument("--sf_loss_weight", type=float, default=0.1)
     p.add_argument("--sf_hidden_dim", type=int, default=None)
     p.add_argument("--sf_projector_lr", type=float, default=1e-4)
+    p.add_argument(
+        "--sf_projector_phase2_lr",
+        type=float,
+        default=None,
+        help=("Projector LR after sf_phase1_steps. Defaults to sf_projector_lr "
+              "for backward-compatible behavior."),
+    )
     p.add_argument("--sf_vision_lr", type=float, default=1e-7)
     p.add_argument("--sf_transformer_lr", type=float, default=5e-7)
     p.add_argument("--sf_aux_lr", type=float, default=5e-6)
