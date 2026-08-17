@@ -146,10 +146,10 @@ SF loss 的直接反向路径为：
    只能通过改变student vision来继续下降。该方案不是当前主实验，因为过早冻结一个尚未校准好的
    projector也可能给vision错误监督；
 3. `vision_last` 从 `1e-7` 提到 `1e-6`（10倍而非直接到1e-4）；每500步只做日志和权重稳定性
-   检查，不做仿真。只有vision更新仍接近0且step 1000固定任务仿真未退化时，才考虑后续尝试
-   `3e-6`；
-4. 先跑1000–1500步机制验证，不直接再跑3000步；step 250/500用于权重分析，下一轮仿真的首个
-   比较点为step 1000；
+   检查，不做仿真。只有vision更新仍接近0且最终选中checkpoint的固定任务仿真未退化时，才考虑
+   后续尝试`3e-6`；
+4. 训练到step 2000但不直接跑多个仿真点。先对step 1000和2000做现有权重diff与空间关系离线诊断，
+   从中选一个checkpoint，再对A1/A2的同一步checkpoint各跑一次仿真；step 250/500只用于权重分析；
 5. 不新增action MSE/输出方差，也不划分held-out。离线机制诊断只考虑在同一小批现有cache帧上
    计算不经过projector的空间关系一致性，定义见§9.1；
 6. action domain表的权重diff只统计 `target_domain=0` 活跃行，不能用整张30-domain表的均值稀释；
@@ -164,7 +164,7 @@ SF loss 的直接反向路径为：
 
 下一轮只做以下最小检查：
 
-1. 对R1起点、step 500和step 1000继续运行现有`checkpoint_diff`与`stat_action_dims`；
+1. 对R1起点、step 500、step 1000和step 2000继续运行现有`checkpoint_diff`与`stat_action_dims`；
 2. 检查`sf_projector`、`vision_last`、`action_encoder`和`action_decoder`现有的mean/max abs delta
    与diff判定；
 3. domain相关的action encoder/decoder和soft prompt只看`target_domain=0`活跃行，避免整张
@@ -205,8 +205,8 @@ SF loss 的直接反向路径为：
    `tools/evaluate_sf_spatial_relation.py`，不修改训练代码或checkpoint。示例命令：
 
    ```bash
-   export A1_CKPT1000="$SF_ROOT/next-lr-1500/A1/ckpt-1000"
-   export A2_CKPT1000="$SF_ROOT/next-lr-1500/A2/ckpt-1000"
+   export A1_CKPT1000="$SF_ROOT/next-lr-2000/A1/ckpt-1000"
+   export A2_CKPT1000="$SF_ROOT/next-lr-2000/A2/ckpt-1000"
 
    python tools/evaluate_sf_spatial_relation.py \
      --models "$R1_CKPT6000" "$A1_CKPT1000" "$A2_CKPT1000" \
@@ -220,31 +220,34 @@ SF loss 的直接反向路径为：
 
    输出JSON包含实际使用的256个`episode/frame`键、每个模型的整体和分相机`relation_mse`，以及
    相对第一个模型的delta、ratio和improvement fraction。正式比较看
-   `A2-1000 relation_mse < A1-1000 relation_mse`；R1只提供起点参考。
+   `A2 relation_mse < A1 relation_mse`；R1只提供起点参考。下一轮对step 1000和2000各运行一次
+   该脚本，优先选择“A2相对同段A1的relation_mse下降更多、且vision diff明确非零”的step进入
+   仿真；如果两个step都不满足，则不启动昂贵仿真。
 
-判定也保持简单：提高`vision_last` LR后，如果step 1000的现有diff仍显示vision基本未变，则说明
-`1e-6`仍不足；如果vision已有明确变化，再由step 1000固定任务仿真判断这种变化是否有价值。
+判定也保持简单：提高`vision_last` LR后，如果step 1000和2000的现有diff仍显示vision基本未变，
+则说明`1e-6`仍不足；如果vision已有明确变化，用空间关系诊断在1000/2000中选一个点，再对A1/A2
+同一步checkpoint做固定任务仿真。
 
-### 9.2 首轮A1 checkpoint仿真结果
+### 9.2 首轮A1/A2 checkpoint仿真结果
 
-截至2026-08-17，首轮A1的ckpt-1000/2000/3000仿真均已完成：
+截至2026-08-17，首轮A1/A2的ckpt-1000/2000/3000仿真均已完成。三任务、两个seed汇总如下：
 
-| checkpoint | stack_blocks | stack_bowls | hang_mugs | 三任务平均score | 当前结论 |
+| 系列 | ckpt-1000 success/score | ckpt-2000 success/score | ckpt-3000 success/score | 三档整体 success/score | 系列峰值 |
 |---|---:|---:|---:|---:|---|
-| A1 ckpt-1000 | 31.25 | **91.67** | 13.75 | **45.56** | 总平均最佳，提升主要来自stack_bowls |
-| A1 ckpt-2000 | 30.00 | 46.67 | 9.58 | 28.75 | 明显退化 |
-| A1 ckpt-3000 | 24.17 | 69.17 | **17.92** | 37.09 | 较2000回升但未恢复1000；hang_mugs首次出现成功率 |
+| A1 | **0.389 / 45.56** | 0.222 / 28.75 | 0.306 / 37.09 | 0.306 / 37.13 | ckpt-1000 |
+| A2 | 0.306 / 35.42 | **0.389 / 43.47** | 0.278 / 32.78 | **0.324 / 37.22** | ckpt-2000 |
 
-这组结果首先说明存在明显的checkpoint非单调性，**尚不足以单独证明LR过高或过低**：A1没有SF
-loss，且权重报告显示action head和vision last都几乎未发生实质变化，仿真差异还可能同时包含
-小规模评测方差和其他已解冻参数的微小更新。处理原则是：
+同一步对比的score差为：step 1000时A2比A1低10.14，step 2000时A2高14.72，step 3000时A2低
+4.31。A2全系列平均score 37.22与A1的37.13几乎相同；两系列各自峰值的成功率都为0.389，A2峰值
+score 43.47仍略低于A1峰值45.56。
 
-1. 首轮A1不追加3000步以后训练；
-2. 保留ckpt-1000作为当前候选，不用ckpt-3000自动覆盖；
-3. 下一轮A1/A2仍保存250/500步间隔供低成本权重分析，但**step 500不做仿真**；仿真的首个比较点
-   是step 1000，不以最终step单点下结论；
-4. 是否调整vision LR，依据下一轮step 1000的现有checkpoint diff和固定任务仿真共同判断，不能只
-   根据首轮A1的1000→2000退化直接修改LR。
+因此首轮SF的准确结论是：**它改变了训练轨迹，并把系列峰值从step 1000推迟到step 2000，但没有
+证明稳定的净仿真收益。** A2-2000确实优于同段A1-2000，不能把首轮SF概括成“所有checkpoint均
+退化”；但A2只在一个checkpoint领先，且全系列平均与A1持平，优势不稳定。三个任务中收益仍主要由
+stack_bowls主导，hang_mugs整体保持低成功率。
+
+这也说明下一轮只仿真step 1000可能误判A2。考虑仿真成本，下一轮训练保留step 1000和2000，先用
+权重diff和§9.1空间关系诊断选一个点，然后只对该步的A1/A2各做一次同段仿真；step 500不做仿真。
 
 ### 9.3 下一轮执行步骤与命令
 
@@ -346,10 +349,10 @@ grep -E '\[sf\] enter phase|sf_loss|sf_projector|vision_last|action_encoder|acti
   "$SF_ROOT/next-lr-smoke-A1.log" "$SF_ROOT/next-lr-smoke-A2.log"
 ```
 
-#### 9.3.4 正式跑1500步A1/A2
+#### 9.3.4 正式跑2000步A1/A2
 
 Smoke通过后删除或保留smoke目录均可，但正式训练必须使用新的输出目录。两组串行运行，先A1后A2；
-正式phase边界恢复为500步，保存250/500/750/1000/1250/1500六档checkpoint。
+正式phase边界恢复为500步，每250步保存，共保留到step 2000；仿真候选只考虑step 1000和2000。
 
 ```bash
 FORMAL_COMMON=(
@@ -358,7 +361,7 @@ FORMAL_COMMON=(
   --teacher_cache "$TEACHER_CACHE"
   --action_mode ee6d --target_domain 0 --seed 0
   --batch_size 4 --gradient_accumulation_steps 8 --num_workers 4
-  --iters 1500 --sf_phase1_steps 500 --sf_warmup_steps 100
+  --iters 2000 --sf_phase1_steps 500 --sf_warmup_steps 100
   --sf_loss_weight 0.1
   --sf_projector_lr 1e-4 --sf_projector_phase2_lr 1e-5
   --sf_vision_lr 1e-6
@@ -369,20 +372,20 @@ FORMAL_COMMON=(
 
 conda run -n xvla accelerate launch --num_processes 1 --mixed_precision bf16 \
   train_spatial_forcing.py "${FORMAL_COMMON[@]}" \
-  --output_dir "$SF_ROOT/next-lr-1500/A1" \
-  2>&1 | tee "$SF_ROOT/next-lr-1500-A1.log"
+  --output_dir "$SF_ROOT/next-lr-2000/A1" \
+  2>&1 | tee "$SF_ROOT/next-lr-2000-A1.log"
 
 conda run -n xvla accelerate launch --num_processes 1 --mixed_precision bf16 \
   train_spatial_forcing.py "${FORMAL_COMMON[@]}" --enable_sf \
-  --output_dir "$SF_ROOT/next-lr-1500/A2" \
-  2>&1 | tee "$SF_ROOT/next-lr-1500-A2.log"
+  --output_dir "$SF_ROOT/next-lr-2000/A2" \
+  2>&1 | tee "$SF_ROOT/next-lr-2000-A2.log"
 ```
 
 正式日志中，A1应始终为`projector_lr=0`；A2应在global step 500从`1e-4`切换到`1e-5`；
-两组`vision_lr`始终为`1e-6`。训练结束后先按§9.1分析各checkpoint；step 250/500/750只做日志和
-权重分析，**不进入仿真**。固定任务仿真先只评测step 1000；只有step 1000没有明确退化、且权重分析
-显示继续训练仍有机制价值时，才评测step 1500。本轮不根据训练loss单独追加步数，也不在中途改变
-LR；是否继续到3000步由已完成的权重分析和必要的仿真共同决定。
+两组`vision_lr`始终为`1e-6`。训练结束后按§9.1对step 1000和2000做现有权重diff和空间关系诊断，
+从两个点中选一个；随后只对选中step的A1/A2各做一次同段仿真。其余checkpoint只用于日志和权重
+定位，**不进入仿真**。本轮不根据训练loss单独追加步数，也不在中途改变LR；是否继续到3000步由
+已完成的离线分析和这一组同段仿真共同决定。
 
 ## 10. 分析产物与复现
 
@@ -393,3 +396,70 @@ LR；是否继续到3000步由已完成的权重分析和必要的仿真共同�
 - `diff_base_vs_A1.txt`、`diff_base_vs_A2.txt`、`diff_A1_vs_A2.txt` —— 三组权重 diff 报告
 - `stats_table.csv` —— base/A1/A2 权重统计表
 - `monitor.md` —— 全过程巡检与监控记录
+
+---
+
+## 11. 下一轮执行结果（next-lr-3000，2026-08-17）
+
+> 按 §9.3.4 受控方案执行，唯一调整：用户指示训练到 **3000 步**（非 2000），每 500 存档。
+> 产出目录 `$SF_ROOT/next-lr-3000/A1`、`A2`，12 档 ckpt 全部上传 HF `tianSeconds/finetunning/next-lr-3000/A1|A2/`。
+
+### 11.1 受控变量与执行确认
+
+| 项 | A1（对照） | A2（实验） | 日志确认 |
+|---|---|---|---|
+| 起点 | R1 ckpt-6000 | R1 ckpt-6000 | — |
+| `--enable_sf` | 不传 | 传入 | A2 `[sf] student_dim=1024 ...` |
+| vision LR | 1e-6 | 1e-6 | 全程 `lr_vlm` 分组的 vision_last 梯度非零 finite |
+| phase1 projector LR | 强制 0 | 1e-4 | A1 全程 `projector_lr=0`；A2 step0 `1.00e-04` |
+| phase2 projector LR | 强制 0 | 1e-5 | A2 step≥500 `[sf] enter phase 2 ... 1.00e-05` |
+| 步数/存档 | 3000 / 每 500 | 3000 / 每 500 | 各 6 档 ckpt 全齐 |
+| 完成 | 05:15 UTC（loss 0.1311） | 06:40 UTC（loss 0.1470） | rc=0 |
+
+### 11.2 Loss 曲线结果（plot_train_loss）
+
+| 指标 | A1 | A2 |
+|---|---|---|
+| loss 终值 | 0.1311（最低 0.0883@1300） | 0.1470（最低 0.1066@1300） |
+| gripper 终值 | 0.1134 | **0.1134（与 A1 完全一致）** |
+| position 终值 | 0.0141 | 0.0141 |
+| rotate6D 终值 | 0.0036 | 0.0036 |
+| sf 终值 | — | 0.0160（全程 0.010-0.022，稳定） |
+| grad_norm | min 0.08 / max 28.4 / cur 12.2 | min 0.08 / max 31.0 / cur 12.0 |
+
+A2 总分 loss 比 A1 高 ~0.016 ≈ sf_loss 项量级；action 分项终值与 A1 **逐项一致**。
+**15.9 项 1 ✓**：SF 加入后 action loss 无任何退化（gripper/position/rotate6D 均与 A1 相同）。
+
+### 11.3 权重 diff（checkpoint_diff full，threshold=3.0，bf16 roundtrip 噪声地板；domain 类 key 仅分析 domain=0 切片）
+
+**base(ckpt-6000) vs A1 / vs A2**：909 keys 中各自 **10 个实质更新**（非首轮的 2 个）：
+- `transformer.aux_visual_proj.weight`：ratio 54.0x / 53.8x，meanΔ 2.7e-04（唯一大幅更新）
+- **`vlm.vision_tower.blocks.3.0` 全部 8 个权重 key**：ratio 4.6-6.1x，meanΔ 6.2-7.6e-05 ← **本轮新变化**
+- `transformer.action_encoder.bias.weight@0`（domain=0 切片）：ratio 13.2x / 13.5x，meanΔ 5.0e-05
+
+**A1 vs A2**：909 keys 中仅 7 个实质更新 = **sf_projector 全部 6 个 key** + aux_visual_proj.weight(9.0x/4.5e-05)：
+- sf_projector.0.bias meanΔ=1.93e-02、0.weight=9.73e-03、1.bias=1.55e-02(772x)、1.weight=6.88e-03(338x)、
+  3.weight=4.94e-03(243x)、3.bias=2.44e-03(117x)
+
+### 11.4 核心结论：vision LR 提升已生效，但 SF 增量仍集中在 projector
+
+1. **vision_last LR 1e-6 使视觉主干开始实质更新**（对比首轮 1e-7 时 blocks.3.0 完全不动的结论，
+   §8/§9.2）。base→A1/A2 的 8 个 blocks.3.0 key 均超噪声阈值。§9.3.1 的"vision LR 过低"假设被验证。
+2. **但 A1/A2 中这些更新幅度几乎相同**（ratio 4.6-5.5x vs 4.9-6.1x，meanΔ 6.2-6.9e-05 vs 6.6-7.6e-05）
+   ——A1（无 SF）的视觉更新同样存在，说明这部分主要是 **action loss 反向**驱动，不是 SF 独有。
+3. **SF 的额外增量仍被 projector 吸收**：A1 vs A2 直接对比中，blocks.3.0 的 8 个 key 仅在
+   threshold=1.5 时才勉强超阈值（ratio 1.5-2.6x，meanΔ 2-3e-05），显著差异（100-770x）只出现在
+   sf_projector。即 **SF 对齐信号仍未有效传导到 student 视觉主干**，projector 仍作为捷径吸收对齐任务。
+4. **domain=0 切片**（stat_action_dims --per-dim --domain 0，base/A1/A2 三列）：action_decoder.fc/bias、
+   action_encoder.fc、soft_prompt_hub 的 domain0 段在 6 位小数内逐位一致（abs_mean 差异 ≤1e-6）→
+   本轮 action/soft_prompt domain 权重仍未被实质更新；仅 action_encoder.bias@0 微动（5e-05）。
+
+### 11.5 对下一步的建议
+
+本轮验证了「vision LR 提升 → 视觉权重开始动」这一方向的正确性，但 SF 对视觉的**额外增量**仍微弱。
+下一步受控实验建议（单选变量）：
+- **进一步压缩 projector 捷径**：phase2 projector LR 1e-5 → **1e-6**（降低 projector 吸收能力），
+  vision LR 保持 1e-6 或升到 **1e-5**，观察 blocks.3.0 的 SF 增量 ratio 是否显著抬升；
+- 或直接对照：同 vision LR=1e-5 下「projector 1e-6」vs「projector 冻结」，验证对齐信号是否会改道注入视觉主干。
+- 若目标是从 SF 获益而非仅验证机制，需同时关注 action loss 是否随视觉表征改变而改善（本轮两版 action
+  分项完全一致，说明视觉表征更新尚未在 action 端体现收益）。
