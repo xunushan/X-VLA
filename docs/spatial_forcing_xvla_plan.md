@@ -723,3 +723,41 @@ action 梯度可比）。每个 checkpoint 用 `upload_checkpoints.sh` 上传到
 5. 仿真比较A1、A2、ckpt-6000和官方100K，优先看抓空、接触点、放置对齐漏斗；
 6. 训练结束后部署模型可删除训练专用 `sf_projector` 权重并清除config中的 `sf_*` 字段；
    projector不参与 `generate_actions`，即使保留也不会增加forward计算。
+
+### 15.10 正式A1/A2训练结论（2026-08-17 记录）
+
+**执行**：A1/A2 串行，各 3000 steps（`--iters 3000`，每 500 存档），起点 R1 ckpt-6000，seed 0，
+bf16，有效 batch 32，RTX 3090 ~1.4s/it。两者均完成（rc=0，六档 ckpt 500-3000 全齐），
+A1/A2 全部 12 档已上传 HF `tianSeconds/finetunning` 的 `A1/`、`A2/` 目录。
+
+**15.9 检查清单核对**：
+- 项 1 ✓：A2 的 action loss 无连续恶化。终末 gripper 与 A1 **完全一致（0.1136）**，
+  position 0.0146 vs 0.0141（+0.0005）、rotate6D 均 0.0036；A2 总分 loss 高 ~0.015 ≈ sf_loss 量级。
+- 项 2 ✓：A2 全程 `grad_norm_preclip_vision_last`（9.3e-02-1.9e-01）与
+  `grad_norm_preclip_sf_projector`（3.9e-03-2.0e-02）非零且 finite，nonzero ratio 1.000。
+- 项 3 ✓：A1/A2 相同组 LR 与采样比例一致，action 梯度量级可比。
+
+**权重分析（checkpoint_diff + stat_action_dims，基准=ckpt-6000）**：
+- baseline vs A1 / vs A2：909 keys 中**仅 2 个"实质更新"**，其中 `final_logits_bias` 为
+  roundtrip=0 的 infx 误报（diff 实际为 0）；**唯一真实更新只有 `aux_visual_proj.weight`
+  （ratio 59x，diff 2.99e-4）**。其余 901 keys 均为 bf16 精度噪声量级。
+- A1 vs A2：**除 `sf_projector` 全部 6 个 key（ratio 214x~infx）外，其余 901 keys 完全一致**
+  → SF loss 没有对 vision/action/transformer 产生区别于 A1 的更新。
+- A1 的 `sf_projector` 保持纯初始化（LayerNorm weight=1/bias=0，stat 判定 random），
+  印证 A1 未启用 SF、从未训练该投影；A2 的 `sf_projector` 已训练（LayerNorm weight 0.9962±0.0147，
+  Linear std 0.018→0.020）。
+
+**根因：phase2 LR 过低，权重未实质移动（R1c 结论复现）**。`train_spatial_forcing.py` 默认 LR
+（runner 未覆盖）：`sf_projector=1e-4`、`sf_vision=1e-7`、`sf_transformer=5e-7`、`sf_aux=5e-6`、
+`sf_aux_bias=1e-7`、`sf_action=2e-6`、`sf_soft_prompt=2.5e-7`。日志确认 phase2 全程
+`lr_core=5e-7` 恒定、`lr_vlm=0`（VLM 组冻结）。在 3000 步内，除 A2 的 sf_projector（1e-4）
+与 aux_visual_proj（5e-6）外，vision/action/transformer 的权重移动量低于 bf16 噪声阈值
+→ **SF 对齐机制生效（sf_loss 确实下降、梯度非零 finite），但未实质传导到主干网络**。
+与 R1c（commit 40e9873："机制生效但权重未动（Adam 尺度不变性），下一步应调 LR"）一致。
+
+**下一步建议**：下一轮把 vision/transformer/action 相关组 LR 提高 1-2 个量级
+（如 `--sf_vision_lr 1e-5~1e-4`、`--sf_transformer_lr 1e-5~1e-4`、`--sf_action_lr 2e-5~1e-4`，
+并恢复 `--sf_aux_lr` 到可动量级），重跑 A1/A2 后再以 checkpoint diff 验证主干权重是否被
+SF 实质更新。本轮分析产物在本地 `outputs/sf/`（`a1_loss.png`、`a2_loss.png`、
+`diff_base_vs_A1.txt`、`diff_base_vs_A2.txt`、`diff_A1_vs_A2.txt`、`stats_table.csv`，
+过程结论在 `outputs/sf/monitor.md`）。
