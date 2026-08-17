@@ -463,14 +463,16 @@ A2 总分 loss 比 A1 高 ~0.016 ≈ sf_loss 项量级；action 分项终值与 
 
 1. **vision_last LR 1e-6 生效**：base→A1/A2 的 8 个 blocks.3.0 权重均超噪声阈值（首轮 1e-7 时完全
    不动）。§9.3.1 的"vision LR 过低"假设被验证。
-2. **SF 的空间结构传导真实存在**（§11.4）：A2 的 raw student token 关系三档均优于 A1 且单调增强——
-   对齐信号已进入视觉主干几何结构，**不只是在 projector 学习**。这回答了 §11.5(旧) 的第一个未决问题。
+2. **SF 的空间结构传导在现有cache训练帧上真实存在**（§11.4）：A2的raw student token关系三档
+   均优于A1且单调增强——对齐信号已影响视觉主干几何结构，**不只是在projector学习**。该结论是
+   机制诊断，不代表未见场景泛化，也不直接代表动作效果改善；
 3. **绝对权重 diff 仍微弱**：A1 vs A2 的 blocks.3.0 绝对移动仅 1.5-2.6x（threshold 1.5 才超阈值），
    显著绝对更新（100-770x）仍在 sf_projector。说明当前 LR 下 SF 的传导是"方向性结构调整"（对
    49-token 相对内积敏感的小幅更新）而非大权重重排。
 4. **domain=0 切片**（stat_action_dims --per-dim --domain 0）：action_decoder.fc/bias、action_encoder.fc、
    soft_prompt_hub 的 domain0 段三档逐位一致（≤1e-6），仅 action_encoder.bias@0 微动（5e-05）。
-5. **action loss 无退化（限训练诊断）**（§11.2）：A1/A2 分项终值完全一致；等价于仿真无退化。
+5. **action loss未观察到退化（仅限训练诊断）**（§11.2）：A1/A2分项终值完全一致，但这**不等价于
+   仿真无退化**；空间结构变化是否对动作有用仍必须由下一步同段仿真判断。
 
 ### 11.6 决策与仿真选点
 
@@ -482,10 +484,13 @@ A2 总分 loss 比 A1 高 ~0.016 ≈ sf_loss 项量级；action 分项终值与 
 > 分批运行（每次 R1 + 同段 A1/A2），R1 基线三次完全相同（seed=0 同列表、结果逐位一致 0.246729），
 > 与"R1 只加载一次"在数值上等价，结论可比。
 
-**后续受控实验方向**（视仿真结果而定）：
-- 若仿真有收益 → 继续优化：phase2 projector LR 1e-5 → **1e-6**（减慢 projector 适配，迫使后续
-  SF loss 下降依赖 student 变化），vision 保持 1e-6 或升 **1e-5**；
-- 若仿真无收益 → 停止当前 SF 路线。
-- 注意（用户提示）：把 projector LR 降到 1e-6 只会减慢 projector 参数更新，**不会直接放大同一个
-  backward 中传给 student feature 的梯度**；phase2 冻结的作用是阻止 projector 继续适配，使后续
-  SF loss 若要下降只能依赖 student 变化，但前提是 phase1 得到的 projector 映射已足够可用。
+**仿真后的处理：**
+
+- 若A2-3000相对A1-3000有稳定收益：本轮SF机制和行为效果同时通过，可以直接保留当前配置；是否
+  继续调LR属于可选优化，不在仿真结果出来前预设；
+- 若A2-3000没有收益：说明“空间关系更接近VGGT”没有转化成当前任务的动作收益，停止当前SF路线，
+  不再仅凭离线MSE继续降低projector LR或提高vision LR；
+- 若后续确实还要做机制消融，一次只改一个变量。优先保持vision LR=1e-6，仅把phase2 projector
+  从1e-5改为0；不要同时把projector改为1e-6并把vision提高到1e-5，否则无法归因。projector冻结
+  不会放大同一个backward传给student的梯度，它只阻止projector继续适配；前提仍是phase1映射已经
+  足够可用。
