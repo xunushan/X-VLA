@@ -302,6 +302,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         frame_info: bool = False,
         use_frame_weight: bool = False,
         sample_allowlist: set[tuple[int, int]] | None = None,
+        multi_view_image_transform=None,
         **kwargs,
     ) -> Iterable[dict]:
         ep_idx = self.meta["datalist"][traj_idx]
@@ -402,11 +403,19 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             if training and lang_aug_map and ins in lang_aug_map:
                 ins_sample = random.choice(lang_aug_map[ins])
 
-            imgs = []
-            for v in range(n_views):
-                # pyav 输出 [H,W,C] uint8；image_aug 的 ToTensor 只接受 PIL/ndarray，
-                # 转 PIL 走现有链路（Resize -> ColorJitter -> ToTensor(/255) -> Normalize）。
-                imgs.append(image_aug(Image.fromarray(videos[v][idx])))
+            pil_images = [Image.fromarray(videos[v][idx]).convert("RGB") for v in range(n_views)]
+            if multi_view_image_transform is not None:
+                # The joint transform samples one environment-lighting draw
+                # for this timestep, then applies it consistently to all
+                # synchronized views.  Output order must equal camera order.
+                imgs = multi_view_image_transform(pil_images)
+                if len(imgs) != n_views:
+                    raise ValueError(
+                        f"multi_view_image_transform returned {len(imgs)} views; expected {n_views}"
+                    )
+            else:
+                # Historical path: each view independently calls ColorJitter.
+                imgs = [image_aug(image) for image in pil_images]
             while len(imgs) < self.num_views:
                 imgs.append(torch.zeros_like(imgs[0]))
 

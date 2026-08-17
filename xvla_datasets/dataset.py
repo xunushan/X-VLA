@@ -50,6 +50,7 @@ class InfiniteDataReader(IterableDataset):
                  return_frame_info: bool = False,
                  sample_allowlist: set[tuple[int, int]] | None = None,
                  image_transform=None,
+                 multi_view_image_transform=None,
                  ):
         self.num_views = num_views
         self.training = training
@@ -59,6 +60,9 @@ class InfiniteDataReader(IterableDataset):
         self.use_frame_weight = use_frame_weight
         self.return_frame_info = return_frame_info
         self.sample_allowlist = sample_allowlist
+        # Opt-in transform receiving all synchronized views at once.  Keeping
+        # this None preserves the historical per-view image_aug path exactly.
+        self.multi_view_image_transform = multi_view_image_transform
         self.metas: Dict[str, dict] = {}
         print("use action mode:", action_mode)
         if fileio.isdir(metas_path):
@@ -127,6 +131,7 @@ class InfiniteDataReader(IterableDataset):
             ep_kwargs.update(
                 frame_info=self.return_frame_info,
                 sample_allowlist=self.sample_allowlist,
+                multi_view_image_transform=self.multi_view_image_transform,
             )
         for traj_idx in traj_indices:
                 for sample in handler.iter_episode(

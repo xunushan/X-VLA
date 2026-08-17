@@ -34,6 +34,7 @@ def create_dataloader(batch_size: int,
                       disable_image_augmentation: bool = False,
                       return_frame_info: bool = False,
                       sample_allowlist=None,
+                      multi_view_image_transform=None,
                       ):
     return DataLoader(
         InfiniteDataReader(
@@ -42,10 +43,11 @@ def create_dataloader(batch_size: int,
             disable_image_augmentation=disable_image_augmentation,
             return_frame_info=return_frame_info,
             sample_allowlist=sample_allowlist,
+            multi_view_image_transform=multi_view_image_transform,
         ),
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=True,
         worker_init_fn=worker_init_fn,
-        persistent_workers=True
+        persistent_workers=num_workers > 0
     )
