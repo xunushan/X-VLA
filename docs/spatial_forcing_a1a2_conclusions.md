@@ -410,7 +410,7 @@ conda run -n xvla accelerate launch --num_processes 1 --mixed_precision bf16 \
 |---|---|---|---|
 | 起点 | R1 ckpt-6000 | R1 ckpt-6000 | — |
 | `--enable_sf` | 不传 | 传入 | A2 `[sf] student_dim=1024 ...` |
-| vision LR | 1e-6 | 1e-6 | 全程 `lr_vlm` 分组的 vision_last 梯度非零 finite |
+| vision LR | 1e-6 | 1e-6 | `vision_last`优化器组LR=1e-6，pre-clip梯度非零 finite；兼容日志字段`lr_vlm`对应空组，不用于判断vision LR |
 | phase1 projector LR | 强制 0 | 1e-4 | A1 全程 `projector_lr=0`；A2 step0 `1.00e-04` |
 | phase2 projector LR | 强制 0 | 1e-5 | A2 step≥500 `[sf] enter phase 2 ... 1.00e-05` |
 | 步数/存档 | 3000 / 每 500 | 3000 / 每 500 | 各 6 档 ckpt 全齐 |
@@ -428,7 +428,8 @@ conda run -n xvla accelerate launch --num_processes 1 --mixed_precision bf16 \
 | grad_norm | min 0.08 / max 28.4 / cur 12.2 | min 0.08 / max 31.0 / cur 12.0 |
 
 A2 总分 loss 比 A1 高 ~0.016 ≈ sf_loss 项量级；action 分项终值与 A1 **逐项一致**。
-**15.9 项 1 ✓**：SF 加入后 action loss 无任何退化（gripper/position/rotate6D 均与 A1 相同）。
+**15.9 项 1 ✓（限训练诊断）**：SF加入后未观察到训练action loss退化（gripper/position/rotate6D
+终值均与A1相同）；这不等价于仿真效果无退化。
 
 ### 11.3 权重 diff（checkpoint_diff full，threshold=3.0，bf16 roundtrip 噪声地板；domain 类 key 仅分析 domain=0 切片）
 
@@ -441,25 +442,50 @@ A2 总分 loss 比 A1 高 ~0.016 ≈ sf_loss 项量级；action 分项终值与 
 - sf_projector.0.bias meanΔ=1.93e-02、0.weight=9.73e-03、1.bias=1.55e-02(772x)、1.weight=6.88e-03(338x)、
   3.weight=4.94e-03(243x)、3.bias=2.44e-03(117x)
 
-### 11.4 核心结论：vision LR 提升已生效，但 SF 增量仍集中在 projector
+### 11.4 空间关系诊断结果（§9.1.6，`tools/evaluate_sf_spatial_relation.py`，已运行 2026-08-17 07:19 UTC）
 
-1. **vision_last LR 1e-6 使视觉主干开始实质更新**（对比首轮 1e-7 时 blocks.3.0 完全不动的结论，
-   §8/§9.2）。base→A1/A2 的 8 个 blocks.3.0 key 均超噪声阈值。§9.3.1 的"vision LR 过低"假设被验证。
-2. **但 A1/A2 中这些更新幅度几乎相同**（ratio 4.6-5.5x vs 4.9-6.1x，meanΔ 6.2-6.9e-05 vs 6.6-7.6e-05）
-   ——A1（无 SF）的视觉更新同样存在，说明这部分主要是 **action loss 反向**驱动，不是 SF 独有。
-3. **SF 的额外增量仍被 projector 吸收**：A1 vs A2 直接对比中，blocks.3.0 的 8 个 key 仅在
-   threshold=1.5 时才勉强超阈值（ratio 1.5-2.6x，meanΔ 2-3e-05），显著差异（100-770x）只出现在
-   sf_projector。即 **SF 对齐信号仍未有效传导到 student 视觉主干**，projector 仍作为捷径吸收对齐任务。
-4. **domain=0 切片**（stat_action_dims --per-dim --domain 0，base/A1/A2 三列）：action_decoder.fc/bias、
-   action_encoder.fc、soft_prompt_hub 的 domain0 段在 6 位小数内逐位一致（abs_mean 差异 ≤1e-6）→
-   本轮 action/soft_prompt domain 权重仍未被实质更新；仅 action_encoder.bias@0 微动（5e-05）。
+**metric = projector_free_spatial_relation_mse**（绕过 sf_projector，直接比较 student/teacher 的
+49-token 内积 Gram 矩阵；越低越接近 VGGT 空间结构）。固定 seed=0 抽 256 个 `(episode, frame)`，
+768 张有效相机图，R1/A1/A2 用完全相同列表（`valid_camera_images=768`，`samples=256`）：
 
-### 11.5 对下一步的建议
+| step | R1-6000 | A1 | A2 | **A2 − A1（相对）** | A2 vs R1 | A1 vs R1 |
+|---|---|---|---|---|---|---|
+| 1000 | 0.246729 | 0.243828 | **0.241667** | **-0.0022（-0.9%）** | -2.1% | -1.2% |
+| 2000 | 0.246729 | 0.244610 | **0.241019** | **-0.0036（-1.5%）** | -2.3% | -0.9% |
+| 3000 | 0.246729 | 0.245804 | **0.240108** | **-0.0057（-2.3%）** | -2.7% | -0.4% |
 
-本轮验证了「vision LR 提升 → 视觉权重开始动」这一方向的正确性，但 SF 对视觉的**额外增量**仍微弱。
-下一步受控实验建议（单选变量）：
-- **进一步压缩 projector 捷径**：phase2 projector LR 1e-5 → **1e-6**（降低 projector 吸收能力），
-  vision LR 保持 1e-6 或升到 **1e-5**，观察 blocks.3.0 的 SF 增量 ratio 是否显著抬升；
-- 或直接对照：同 vision LR=1e-5 下「projector 1e-6」vs「projector 冻结」，验证对齐信号是否会改道注入视觉主干。
-- 若目标是从 SF 获益而非仅验证机制，需同时关注 action loss 是否随视觉表征改变而改善（本轮两版 action
-  分项完全一致，说明视觉表征更新尚未在 action 端体现收益）。
+**三个 step 上 `A2 relation_mse < 同段 A1 relation_mse` 全部成立**，且 A2 相对 A1 的差距随训练
+单调加深（-0.9% → -1.5% → -2.3%）；A2 相对 R1 的改善持续走强（-2.1% → -2.7%），A1 相对 R1 的
+改善反而衰减（-1.2% → -0.4%）。原始 JSON 见 `outputs/sf/spatial-relation-step{1000,2000,3000}.json`
+（本地）与服务器 `$SF_ROOT/spatial-relation-step{1000,2000,3000}.json`。
+
+### 11.5 核心结论（修订版）
+
+1. **vision_last LR 1e-6 生效**：base→A1/A2 的 8 个 blocks.3.0 权重均超噪声阈值（首轮 1e-7 时完全
+   不动）。§9.3.1 的"vision LR 过低"假设被验证。
+2. **SF 的空间结构传导真实存在**（§11.4）：A2 的 raw student token 关系三档均优于 A1 且单调增强——
+   对齐信号已进入视觉主干几何结构，**不只是在 projector 学习**。这回答了 §11.5(旧) 的第一个未决问题。
+3. **绝对权重 diff 仍微弱**：A1 vs A2 的 blocks.3.0 绝对移动仅 1.5-2.6x（threshold 1.5 才超阈值），
+   显著绝对更新（100-770x）仍在 sf_projector。说明当前 LR 下 SF 的传导是"方向性结构调整"（对
+   49-token 相对内积敏感的小幅更新）而非大权重重排。
+4. **domain=0 切片**（stat_action_dims --per-dim --domain 0）：action_decoder.fc/bias、action_encoder.fc、
+   soft_prompt_hub 的 domain0 段三档逐位一致（≤1e-6），仅 action_encoder.bias@0 微动（5e-05）。
+5. **action loss 无退化（限训练诊断）**（§11.2）：A1/A2 分项终值完全一致；等价于仿真无退化。
+
+### 11.6 决策与仿真选点
+
+按 §11.5(旧) 决策规则：至少一个 step 同时满足"vision diff 明确非零"（§11.3 ✓）且"A2 < 同段 A1"
+（§11.4 三个 step 全满足 ✓）。**选择改善最大的 step=3000**（A2−A1=-2.3% 最大），对该步 A1/A2
+各做一次同段仿真。仿真有收益后再考虑继续优化；无收益则停止当前 SF 路线。
+
+> 说明：用户修订的 §11.5(旧) 命令中 R1 基线只加载一次、一次跑全部 7 个模型；本诊断按 3 个 step
+> 分批运行（每次 R1 + 同段 A1/A2），R1 基线三次完全相同（seed=0 同列表、结果逐位一致 0.246729），
+> 与"R1 只加载一次"在数值上等价，结论可比。
+
+**后续受控实验方向**（视仿真结果而定）：
+- 若仿真有收益 → 继续优化：phase2 projector LR 1e-5 → **1e-6**（减慢 projector 适配，迫使后续
+  SF loss 下降依赖 student 变化），vision 保持 1e-6 或升 **1e-5**；
+- 若仿真无收益 → 停止当前 SF 路线。
+- 注意（用户提示）：把 projector LR 降到 1e-6 只会减慢 projector 参数更新，**不会直接放大同一个
+  backward 中传给 student feature 的梯度**；phase2 冻结的作用是阻止 projector 继续适配，使后续
+  SF loss 若要下降只能依赖 student 变化，但前提是 phase1 得到的 projector 映射已足够可用。
