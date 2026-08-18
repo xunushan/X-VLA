@@ -6,12 +6,16 @@ import argparse
 import json
 import random
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+# 自包含：以脚本所在仓库根为 sys.path[0]，无需手动设 PYTHONPATH
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import pyarrow.parquet as pq
 import numpy as np
-from xvla_datasets.utils import ee16_to_xvla20
+from xvla_datasets.utils import ee16_to_xvla20, load_episode_indices
 
 
 def balanced_take(groups, total, rng):
@@ -60,10 +64,30 @@ def select_records(all_records, samples, sampling_mode, rng):
     raise ValueError(f"unknown sampling_mode={sampling_mode!r}")
 
 
+def resolve_allowed_eps(meta_episodes, split_path, split_key):
+    """限定训练集 episode：优先用 splits 文件的指定划分，其次退回 meta.episodes。
+
+    split 显式传入是训练集对齐的权威来源（避免依赖 meta.json 是否已 apply_split_to_meta）。
+    二者都给出时取交集（防止 split 与 meta 不一致导致训练集外 episode 混入）。
+    """
+    split_eps = set(load_episode_indices(split_path, split=split_key)) if split_path else None
+    meta_eps = set(meta_episodes) if meta_episodes else None  # 空列表视为"全部"（与原实现一致）
+    if split_eps is not None and meta_eps is not None:
+        return sorted(split_eps & meta_eps), "split_and_meta"
+    if split_eps is not None:
+        return sorted(split_eps), "split"
+    if meta_eps is not None:
+        return sorted(meta_eps), "meta"
+    return None, "all"
+
+
 def main(args):
     meta = json.loads(Path(args.meta).read_text())
     root = Path(meta["root_path"])
-    allowed_eps = set(meta.get("episodes", [])) or None
+    allowed_eps, eps_source = resolve_allowed_eps(
+        meta.get("episodes"), args.split, args.split_key
+    )
+    allowed_eps = set(allowed_eps) if allowed_eps is not None else None
     episode_rows = {}
     for path in sorted(root.glob("meta/episodes/**/file-*.parquet")):
         table = pq.read_table(path).to_pylist()
@@ -151,6 +175,8 @@ def main(args):
     print(json.dumps({
         "output": str(out),
         "sampling_mode": args.sampling_mode,
+        "episode_source": eps_source,
+        "allowed_episodes": len(allowed_eps) if allowed_eps is not None else "all",
         "eligible_samples": len(all_records),
         "eligible_key_ratio": eligible_key / max(1, len(all_records)),
         "samples": len(records),
@@ -186,5 +212,15 @@ if __name__ == "__main__":
         default="natural",
         help=("natural=uniform over all train-eligible frames; "
               "key_regular_1to1=legacy task-balanced 50/50 pool"),
+    )
+    p.add_argument(
+        "--split",
+        default=None,
+        help="Optional splits JSON. When set, only episodes in the named split are eligible.",
+    )
+    p.add_argument(
+        "--split-key",
+        default="train",
+        help="Split key to keep when --split is set (default train).",
     )
     main(p.parse_args())
