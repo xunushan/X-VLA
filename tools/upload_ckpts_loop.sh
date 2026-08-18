@@ -32,6 +32,13 @@ while true; do
     # 已完成 / 正在上传 的跳过
     [ -f "$OUTPUT_DIR/upload_$name.done" ] && continue
     if pgrep -f "hf upload .* $SUBDIR/$name" >/dev/null; then continue; fi
+    # 上传进程已退出但 log 显示成功（如手动启动的上传）→ 补 done，避免重传
+    if [ -s "$OUTPUT_DIR/upload_$name.log" ] \
+       && grep -qiE 'Upload finished|Finished upload|Commit:|commit [0-9a-f]{7,}' "$OUTPUT_DIR/upload_$name.log"; then
+      touch "$OUTPUT_DIR/upload_$name.done"
+      echo "[$(date '+%H:%M:%S')] upload verified (from log): $name"
+      continue
+    fi
     [ -f "$ck/model.safetensors" ] || continue   # 权重未写完整
 
     # 并发闸门
