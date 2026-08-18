@@ -6,14 +6,16 @@ Inputs
 1. ``--models``: one or more X-VLA checkpoint directories. The first checkpoint
    is the comparison baseline (normally R1 ckpt-6000). ``sf_projector`` is never
    called by this script.
-2. ``--train_metas_path``: the same LeRobot v3 ``meta.json`` used for training.
-   It is needed because the VGGT SQLite cache stores features, not RGB images;
-   X-VLA student features must be recomputed from the original three videos.
+2. ``--val_metas_path``: the LeRobot v3 ``meta.json`` for the reserved
+   validation episodes.  It is needed because the VGGT SQLite cache stores
+   features, not RGB images; X-VLA student features must be recomputed from the
+   original three validation videos.
 3. ``--teacher_cache``: the existing SF SQLite cache. For each
    ``(episode_index, frame_index)`` it supplies VGGT teacher features with shape
    ``[V=3, N=49, D_teacher=2048]`` (dimensions are validated from metadata).
 4. ``--samples``/``--seed``: a deterministic subset of keys already present in
-   the cache. This is not a held-out split and does not alter training data.
+   the cache.  ``val`` describes the intended use, but the script deliberately
+   does not enforce whether the supplied meta belongs to a train or val split.
 
 For the exact same cache keys, each X-VLA checkpoint receives images processed
 by the normal SF/X-VLA path: ColorJitter disabled, bicubic Resize(224, 224),
@@ -102,7 +104,7 @@ def make_loader(args, selected):
     # training=False and disable_image_augmentation=True reproduce the SF image
     # geometry deterministically: 224 square + ImageNet Normalize, no jitter.
     reader = InfiniteDataReader(
-        args.train_metas_path,
+        args.val_metas_path,
         num_actions=args.num_actions,
         num_views=3,
         training=False,
@@ -111,6 +113,9 @@ def make_loader(args, selected):
         disable_image_augmentation=True,
         return_frame_info=True,
         sample_allowlist=set(selected),
+        # Cache keys are authoritative.  In particular, do not lose a cached
+        # validation image to a second action-static floating-point threshold.
+        skip_static_samples=False,
     )
     return DataLoader(
         reader,
@@ -220,7 +225,10 @@ def parse_args():
         help="X-VLA checkpoint dirs; first is the baseline for reported deltas",
     )
     p.add_argument("--labels", nargs="+", default=None, help="Optional label per --models entry")
-    p.add_argument("--train_metas_path", required=True, help="Training LeRobot v3 meta.json")
+    p.add_argument(
+        "--val_metas_path", required=True,
+        help="LeRobot v3 meta.json containing the samples represented by --teacher_cache",
+    )
     p.add_argument("--teacher_cache", required=True, help="Existing VGGT SF SQLite cache")
     p.add_argument("--output", required=True, help="Destination JSON report")
     p.add_argument("--samples", type=int, default=256, help="Deterministic cache samples to evaluate")
@@ -254,8 +262,8 @@ def main(args):
         )
     if int(feature_shape[0]) != 3:
         raise ValueError(f"expected three cached camera views, got shape={feature_shape}")
-    train_meta = json.loads(Path(args.train_metas_path).read_text())
-    camera_order = list(train_meta.get("camera_keys", DEFAULT_CAMERA_KEYS))[:3]
+    val_meta = json.loads(Path(args.val_metas_path).read_text())
+    camera_order = list(val_meta.get("camera_keys", DEFAULT_CAMERA_KEYS))[:3]
     cached_camera_order = list(cache.metadata.get("camera_order", []))
     if camera_order != cached_camera_order:
         raise ValueError(

@@ -142,6 +142,24 @@ def test_static_segment_skipped(fake_video, fast_image_aug):
     fake_video._read_state = orig_state
 
 
+def test_static_segment_can_be_kept_for_offline_image_cache(fake_video, fast_image_aug):
+    """Teacher cache manifests are authoritative even at the static threshold."""
+    ep = fake_video.episodes[0]
+    orig_state = fake_video._read_state
+    fake_video._read_state = lambda ep: np.tile(
+        np.arange(20, dtype=np.float32), (int(ep["length"]), 1))
+    samples = list(fake_video.iter_episode(
+        0,
+        num_actions=30,
+        training=False,
+        image_aug=fast_image_aug,
+        sample_allowlist={(0, 0)},
+        skip_static_samples=False,
+    ))
+    assert len(samples) == 1
+    fake_video._read_state = orig_state
+
+
 def test_16d_to_20d(fake_video):
     """16 维 -> 20 维：rotate6d(scalar_first=True) + gripper 反转。"""
     rng = np.random.default_rng(1)

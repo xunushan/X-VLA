@@ -50,6 +50,7 @@ class InfiniteDataReader(IterableDataset):
                  return_frame_info: bool = False,
                  sample_allowlist: set[tuple[int, int]] | None = None,
                  sample_blocklist: set[tuple[int, int]] | None = None,
+                 skip_static_samples: bool = True,
                  image_transform=None,
                  multi_view_image_transform=None,
                  ):
@@ -62,6 +63,10 @@ class InfiniteDataReader(IterableDataset):
         self.return_frame_info = return_frame_info
         self.sample_allowlist = sample_allowlist
         self.sample_blocklist = sample_blocklist
+        # Training keeps the historical action-static filter.  Offline image
+        # caches may disable it because their manifest has already selected the
+        # exact episode/frame keys and every selected image must be emitted.
+        self.skip_static_samples = skip_static_samples
         # Opt-in transform receiving all synchronized views at once.  Keeping
         # this None preserves the historical per-view image_aug path exactly.
         self.multi_view_image_transform = multi_view_image_transform
@@ -134,6 +139,7 @@ class InfiniteDataReader(IterableDataset):
                 frame_info=self.return_frame_info,
                 sample_allowlist=self.sample_allowlist,
                 sample_blocklist=self.sample_blocklist,
+                skip_static_samples=self.skip_static_samples,
                 multi_view_image_transform=self.multi_view_image_transform,
             )
         for traj_idx in traj_indices:

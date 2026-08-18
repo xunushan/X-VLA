@@ -177,18 +177,18 @@ SF loss 的直接反向路径为：
 
    **输入：**
 
-   - teacher输入来自现有`vggt-natural-60k.sqlite`。对一个`(episode_index, frame_index)`，
+   - teacher输入来自用预留评估集单独生成的小型VGGT cache。对一个`(episode_index, frame_index)`，
      `FeatureCacheReader.get()`直接读取VGGT生成并已保存的BF16特征，shape为
      `[3路相机, 49个空间token, 2048]`。这就是teacher feature；检查时不再加载或运行VGGT；
    - student输入来自待分析的X-VLA checkpoint，例如R1 ckpt-6000、下一轮A1 ckpt-1000和A2
      ckpt-1000。SQLite没有保存student feature，也没有保存图像，因此必须根据相同的
-     `(episode_index, frame_index)`从原训练数据视频解码三路图像，使用SF训练时相同的X-VLA图像
+     `(episode_index, frame_index)`从预留评估集视频解码三路图像，使用SF训练时相同的X-VLA图像
      预处理（关闭ColorJitter，Resize 224×224、ToTensor、ImageNet Normalize），再运行一次X-VLA
      图像编码器。`model._sf_student_features`原始shape为`[B, 3, 50, 1024]`；按
      `image_feature_source`去掉`spatial_avg_pool`对应的1个全局token后，得到
      `[B, 3, 49, 1024]`。这就是student feature；
    - 从cache键中固定抽一份较小列表，例如固定seed选择256个`(episode, frame)`。R1、A1、A2必须
-     使用完全相同的列表。这不是held-out，也不改变训练数据，只是保证三个checkpoint可比较。
+     使用完全相同的预留评估列表，保证三个checkpoint可比较。
 
    **每张图、每路相机的计算：**
 
@@ -201,18 +201,44 @@ SF loss 的直接反向路径为：
       更接近VGGT；若没有下降，则即使训练日志中的SF loss下降，也仍可能只是projector在学习。
 
    这个计算完全绕过`sf_projector`，也不要求1024维student和2048维teacher直接相乘。它仍然只
-   是训练数据上的机制诊断，不能证明仿真一定提升。只读脚本已实现为
-   `tools/evaluate_sf_spatial_relation.py`，不修改训练代码或checkpoint。示例命令：
+   是预留评估数据上的机制诊断，不能证明仿真一定提升。只读脚本已实现为
+   `tools/evaluate_sf_spatial_relation.py`，不修改训练代码或checkpoint。当前版本要求先从预留评估集
+   生成独立VGGT cache，再使用对应的meta和cache进行诊断。`--val_metas_path`只是参数语义，代码不
+   强制判断数据划分；若用户明确要在训练集上诊断，也可以传训练meta及其对应cache。示例命令：
 
    ```bash
+   export VAL_META=/data/data/lerobot_v30_ee_6d/val_meta.json
+   export VAL_SELECTION="$SF_ROOT/validation-spatial-relation-256.jsonl"
+   export VAL_TEACHER_CACHE="$SF_ROOT/vggt-validation-spatial-relation-256.sqlite"
+
+   # 1. 只在预留评估集的可用帧中自然抽取256帧。
+   python tools/build_sf_sample_manifest.py \
+     --meta "$VAL_META" \
+     --output "$VAL_SELECTION" \
+     --samples 256 --sampling_mode natural --seed 0
+
+   # 2. 只为上述256个评估帧生成VGGT teacher cache。
+   python -u tools/cache_vggt_features.py \
+     --val_metas_path "$VAL_META" \
+     --selection "$VAL_SELECTION" \
+     --output "$VAL_TEACHER_CACHE" \
+     --vggt_repo "$VGGT_REPO" \
+     --vggt_checkpoint "$VGGT_CKPT" \
+     --target_token_grid 7 7 --teacher_layer -1 --teacher_image_size 518 \
+     --num_actions 30 --action_mode ee6d --device cuda \
+     --batch_size 4 --num_workers 4
+
+   python tools/inspect_sf_cache.py --cache "$VAL_TEACHER_CACHE"
+
+   # 3. 所有checkpoint读取同一批评估图像并与同一份VGGT cache比较。
    export A1_CKPT1000="$SF_ROOT/next-lr-2000/A1/ckpt-1000"
    export A2_CKPT1000="$SF_ROOT/next-lr-2000/A2/ckpt-1000"
 
    python tools/evaluate_sf_spatial_relation.py \
      --models "$R1_CKPT6000" "$A1_CKPT1000" "$A2_CKPT1000" \
      --labels R1-6000 A1-1000 A2-1000 \
-     --train_metas_path "$TRAIN_META" \
-     --teacher_cache "$TEACHER_CACHE" \
+     --val_metas_path "$VAL_META" \
+     --teacher_cache "$VAL_TEACHER_CACHE" \
      --samples 256 --seed 0 --batch_size 8 --num_workers 4 \
      --device cuda --dtype bf16 \
      --output "$SF_ROOT/spatial-relation-step1000.json"

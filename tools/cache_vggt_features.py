@@ -59,7 +59,7 @@ def main(args):
     if args.batch_size <= 0 or args.num_workers < 0 or args.prefetch_factor <= 0:
         raise ValueError("batch_size/prefetch_factor must be positive and num_workers non-negative")
     selection = load_selection(args.selection)
-    meta = json.loads(Path(args.train_metas_path).read_text())
+    meta = json.loads(Path(args.metas_path).read_text())
     camera_order = list(meta.get("camera_keys", DEFAULT_CAMERA_KEYS))[:3]
     if len(camera_order) != 3:
         raise ValueError(f"SF requires exactly three configured camera keys, got {camera_order}")
@@ -85,9 +85,14 @@ def main(args):
         transforms.ToTensor(),
     ])
     reader = InfiniteDataReader(
-        args.train_metas_path, num_actions=args.num_actions, num_views=3,
+        args.metas_path, num_actions=args.num_actions, num_views=3,
         training=False, action_mode=args.action_mode,
         return_frame_info=True, sample_allowlist=set(selection),
+        # The manifest is authoritative.  Do not repeat the handler's
+        # floating-point static-action threshold here: NumPy manifest creation
+        # and Torch action construction can disagree for boundary values and
+        # otherwise leave a valid selected image missing from the cache.
+        skip_static_samples=False,
         image_transform=teacher_transform,
     )
     loader_kwargs = dict(
@@ -176,7 +181,15 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--train_metas_path", required=True)
+    meta_group = p.add_mutually_exclusive_group(required=True)
+    meta_group.add_argument(
+        "--train_metas_path", dest="metas_path",
+        help="Training meta.json (retained for existing training-cache commands)",
+    )
+    meta_group.add_argument(
+        "--val_metas_path", dest="metas_path",
+        help="Reserved validation meta.json for a validation-only teacher cache",
+    )
     p.add_argument("--selection", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--vggt_repo", required=True)

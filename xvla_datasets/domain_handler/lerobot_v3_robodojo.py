@@ -303,6 +303,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         use_frame_weight: bool = False,
         sample_allowlist: set[tuple[int, int]] | None = None,
         sample_blocklist: set[tuple[int, int]] | None = None,
+        skip_static_samples: bool = True,
         multi_view_image_transform=None,
         **kwargs,
     ) -> Iterable[dict]:
@@ -404,7 +405,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             seq = torch.tensor(L(q)).float()  # [num_actions+1, 20]
 
             # 跳过双臂完全静止段
-            if (seq[1] - seq[0]).abs().max() < 1e-5:
+            if skip_static_samples and (seq[1] - seq[0]).abs().max() < 1e-5:
                 continue
 
             ins_sample = ins
