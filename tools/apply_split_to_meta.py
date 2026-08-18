@@ -20,8 +20,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+# 自包含：以脚本所在仓库根为 sys.path[0]，无需手动设 PYTHONPATH
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from xvla_datasets.utils import load_episode_indices
 
