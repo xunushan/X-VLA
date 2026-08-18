@@ -676,6 +676,12 @@ cosine；应接近1。正式150K以smoke中不OOM的最大batch启动，并根�
 
 ### 15.8 Step 6：正式A1/A2成对训练
 
+> 2026-08-18最终试验补充：最新执行口径见
+> `docs/revised_full_training_execution_plan.md`第5节。最终版本使用100K cache、50% cache / 50%
+> 非缓存自然帧、`sf_loss_weight=0.2`和`transformer_core LR=1e-6`。若起点是仿真确认有效的
+> Random-Aug checkpoint，仅对非缓存action-only自然分支传
+> `--sf_natural_augmentation_rehearsal`；cache/teacher分支始终不增强。若回退三路Base则不传该参数。
+
 A1不传 `--enable_sf`；A2传入。二者均使用同一个自然分布缓存池并关闭ColorJitter。
 两组都不传 `--frame_weight_sampling`，因此缓存中每一帧等概率进入训练。日志中的
 `KEY_RATIO` 应在随机波动范围内接近清单生成时的 `selected_key_ratio`。

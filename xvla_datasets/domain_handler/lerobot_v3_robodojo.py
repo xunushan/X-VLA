@@ -302,6 +302,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         frame_info: bool = False,
         use_frame_weight: bool = False,
         sample_allowlist: set[tuple[int, int]] | None = None,
+        sample_blocklist: set[tuple[int, int]] | None = None,
         multi_view_image_transform=None,
         **kwargs,
     ) -> Iterable[dict]:
@@ -357,6 +358,13 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         # 5. 候选帧：与参考 range(0, T-5) 一致，保留 episode 尾部候选（不足 qdur 完整窗口的
         #    样本不排除，由下方 clamp 到末帧 + 插值压缩处理，语义 = "减速收尾、停在末姿态"）
         idxs = requested if requested is not None else list(range(max(0, T - 5)))
+        if sample_blocklist is not None:
+            idxs = [
+                idx for idx in idxs
+                if (int(ep_idx), int(idx)) not in sample_blocklist
+            ]
+            if not idxs:
+                return
         if training and use_frame_weight:
             # frame_weight 有放回采样：直接对全部候选帧按 frame_weight 归一化概率抽样。
             # 高权重帧不会静止，无需预过滤静止候选（省去对每个候选预计算 seq 的开销）；

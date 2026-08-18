@@ -29,11 +29,11 @@
 
 先完成`next-lr-3000`的A1-3000/A2-3000同段仿真，再只选择一个基座：
 
-| 仿真结果 | 随机增强基座 |
-|---|---|
+| 仿真结果                                 | 随机增强基座                      |
+| ---------------------------------------- | --------------------------------- |
 | A2-3000优于A1-3000，且不低于R1 ckpt-6000 | A2-3000（保留已验证有用的SF表征） |
-| A2无收益，但A1-3000优于R1 | A1-3000 |
-| A1/A2都不优于R1 | R1 ckpt-6000 |
+| A2无收益，但A1-3000优于R1                | A1-3000                           |
+| A1/A2都不优于R1                          | R1 ckpt-6000                      |
 
 随机增强阶段不再启用SF loss，也不同时改变projector。若基座来自A2，checkpoint中保留
 `sf_projector`权重没有影响：推理和随机增强训练均不访问它。
@@ -103,12 +103,12 @@ ColorJitter之上重复叠加。先对同一sample采样一组brightness/contras
 
 建议强度分布：
 
-| 样本 | 概率 |
-|---|---:|
-| 无增强 | 50% |
-| 中等颜色/光照 | 30% |
-| 较强变化 | 15% |
-| 接近极端 random 场景 | 5% |
+| 样本                 | 概率 |
+| -------------------- | ---: |
+| 无增强               |  50% |
+| 中等颜色/光照        |  30% |
+| 较强变化             |  15% |
+| 接近极端 random 场景 |   5% |
 
 极端增强必须人工抽样检查，确保目标仍可识别，不能通过大面积过曝、欠曝或色彩裁剪制造无意义样本。
 
@@ -182,10 +182,10 @@ ColorJitter之上重复叠加。先对同一sample采样一组brightness/contras
 
 本轮只新增一个训练模型，不再同时训练R0/R1/R2：
 
-| 模型 | 处理 | 是否新增训练 |
-|---|---|---:|
-| Base | §2.1选出的最终候选基座 | 否，直接使用已有评测 |
-| Random-Aug | 从Base继续训练；50%严格原图，50%三路同步photometric/轻度成像增强 | 是 |
+| 模型       | 处理                                                             |         是否新增训练 |
+| ---------- | ---------------------------------------------------------------- | -------------------: |
+| Base       | §2.1选出的最终候选基座                                           | 否，直接使用已有评测 |
+| Random-Aug | 从Base继续训练；50%严格原图，50%三路同步photometric/轻度成像增强 |                   是 |
 
 Random-Aug直接和训练前Base比较。这样无法完全分离“增加训练步数”和“增强”的贡献，但只需要评测
 一个新模型，符合一天时限；本轮目标是争取最终random性能，不做完整消融。没有可靠segmentation时
@@ -195,11 +195,11 @@ Random-Aug直接和训练前Base比较。这样无法完全分离“增加训练
 
 推荐每个 effective batch 的期望组成：
 
-| 来源 | 比例 |
-|---|---:|
-| 原始无增强 | 50% |
-| 三路同步颜色/光照增强 | 40% |
-| 同步全局增强 + 各相机轻度独立传感器噪声 | 10% |
+| 来源                                    | 比例 |
+| --------------------------------------- | ---: |
+| 原始无增强                              |  50% |
+| 三路同步颜色/光照增强                   |  40% |
+| 同步全局增强 + 各相机轻度独立传感器噪声 |  10% |
 
 本轮不启用背景纹理或clutter合成；未来只有获得可靠segmentation/三视角几何约束后再单独加入。
 
@@ -257,14 +257,14 @@ consistency作为未来独立变量。
 
 建议学习率：
 
-| 参数组 | LR |
-|---|---:|
-| vision last | `1e-6` |
-| aux projection weight | `5e-6` |
-| aux projection bias | `1e-7` |
-| action encoder/decoder | `2e-6` |
-| soft prompt | `2.5e-7` |
-| Transformer blocks | `5e-7` |
+| 参数组                 |       LR |
+| ---------------------- | -------: |
+| vision last            |   `1e-6` |
+| aux projection weight  |   `5e-6` |
+| aux projection bias    |   `1e-7` |
+| action encoder/decoder |   `2e-6` |
+| soft prompt            | `2.5e-7` |
+| Transformer blocks     |   `5e-7` |
 
 这些LR沿用已完成的`next-lr-3000`受控实验，不在随机增强首轮再次调参。随机增强是本轮唯一新增变量。
 
@@ -299,10 +299,10 @@ consistency作为未来独立变量。
 
 至少比较：
 
-| 模型 | Standard | layout-only | appearance-clutter | real-obstacle |
-|---|---:|---:|---:|---:|
-| Base | 使用已有结果；必要时补同seed | 可选诊断 | 必测 | 可选负对照 |
-| Random-Aug-3000 | 必测 | 可选诊断 | 必测 | 可选负对照 |
+| 模型            |                     Standard | layout-only | appearance-clutter | real-obstacle |
+| --------------- | ---------------------------: | ----------: | -----------------: | ------------: |
+| Base            | 使用已有结果；必要时补同seed |    可选诊断 |               必测 |    可选负对照 |
+| Random-Aug-3000 |                         必测 |    可选诊断 |               必测 |    可选负对照 |
 
 使用相同 task/layout/policy seeds 做成对比较，固定 prompt、camera、denoising steps 和 `actions_per_chunk=30`。短执行窗口实验是另一变量，不与增强主结果混合。
 
@@ -402,26 +402,26 @@ Random-Aug必须同时满足：
 每个训练sample只采样一次类别，三路相机共享类别。比例是长期sample期望值，不要求每个micro-batch
 精确满足，避免引入额外sampler：
 
-| 类别 | 概率 | 三路共享内容 | 单相机独立内容 |
-|---|---:|---|---|
-| `identity` | 0.50 | 无photometric变化 | 无 |
-| `sync_global` | 0.40 | 同一组brightness/contrast/saturation/hue/gamma/色温参数及同一变换顺序 | 无 |
-| `sync_plus_sensor` | 0.10 | 与`sync_global`相同 | 很小的曝光偏差与Gaussian sensor noise |
+| 类别               | 概率 | 三路共享内容                                                          | 单相机独立内容                        |
+| ------------------ | ---: | --------------------------------------------------------------------- | ------------------------------------- |
+| `identity`         | 0.50 | 无photometric变化                                                     | 无                                    |
+| `sync_global`      | 0.40 | 同一组brightness/contrast/saturation/hue/gamma/色温参数及同一变换顺序 | 无                                    |
+| `sync_plus_sensor` | 0.10 | 与`sync_global`相同                                                   | 很小的曝光偏差与Gaussian sensor noise |
 
 三类最后都执行完全相同的`Resize(224,224) → ToTensor → ImageNet Normalize`。`identity`不是跳过
 预处理，而是严格不做颜色随机化。
 
 首轮建议参数范围：
 
-| 参数 | 范围 |
-|---|---:|
-| brightness | `[0.6, 1.4]` |
-| contrast | `[0.7, 1.3]` |
-| saturation | `[0.6, 1.4]` |
-| hue | `[-0.05, 0.05]` |
-| gamma | `[0.75, 1.35]` |
-| 色温强度`t` | `[-0.15, 0.15]`，RGB gain约为`[1+t, 1, 1-t]` |
-| 独立曝光偏差（仅10%类） | 每路`[0.95,1.05]` |
+| 参数                      |                                               范围 |
+| ------------------------- | -------------------------------------------------: |
+| brightness                |                                       `[0.6, 1.4]` |
+| contrast                  |                                       `[0.7, 1.3]` |
+| saturation                |                                       `[0.6, 1.4]` |
+| hue                       |                                    `[-0.05, 0.05]` |
+| gamma                     |                                     `[0.75, 1.35]` |
+| 色温强度`t`               |       `[-0.15, 0.15]`，RGB gain约为`[1+t, 1, 1-t]` |
+| 独立曝光偏差（仅10%类）   |                                  每路`[0.95,1.05]` |
 | Gaussian noise（仅10%类） | 每路独立`σ∈[0.003,0.015]`，ToTensor后的`[0,1]`尺度 |
 
 所有global参数和photometric操作顺序每个sample只采样一次，再复制到三路。独立噪声在global变换后、
@@ -455,15 +455,15 @@ for v in range(n_views):
 `train_random_augmentation.py`训练3000步：优化器LR使用固定100-step warmup，随后保持；输入增强
 强度独立使用500-step warmup，不能把两种warmup混为一个参数。
 
-| 参数组 | LR |
-|---|---:|
-| `vision_last` | `1e-6` |
-| `aux_visual_weight` | `5e-6` |
-| `aux_visual_bias` | `1e-7` |
-| `action_encoder/decoder` | `2e-6` |
-| `soft_prompt` | `2.5e-7` |
-| `transformer_core` | `5e-7` |
-| 其余VLM、`sf_projector` | `0` |
+| 参数组                   |       LR |
+| ------------------------ | -------: |
+| `vision_last`            |   `1e-6` |
+| `aux_visual_weight`      |   `5e-6` |
+| `aux_visual_bias`        |   `1e-7` |
+| `action_encoder/decoder` |   `2e-6` |
+| `soft_prompt`            | `2.5e-7` |
+| `transformer_core`       |   `5e-7` |
+| 其余VLM、`sf_projector`  |      `0` |
 
 这些值沿用`next-lr-3000`已验证配置；本轮唯一新增变量是输入增强。实际入口参数为：
 
@@ -557,7 +557,7 @@ accelerate launch --num_processes 1 --mixed_precision bf16 \
   --augmentation_warmup_steps 500 \
   --augmentation_start_scale 0.25 \
   --random_aug_lr_warmup_steps 100 \
-  --random_aug_vision_lr 1e-6 \
+  --random_aug_vision_lr 2e-6 \
   --random_aug_aux_lr 5e-6 \
   --random_aug_aux_bias_lr 1e-7 \
   --random_aug_action_lr 2e-6 \

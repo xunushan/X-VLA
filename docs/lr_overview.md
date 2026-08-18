@@ -91,28 +91,22 @@
 A1（无 SF）/ A2（有 SF）共用完全相同的配置，唯一差异是 A2 启用 SF head + `L_SF`。
 最后执行（`next-lr-3000`，2026-08-17）：训练 3000 步、每 500 存档，`--sf_phase1_steps 500` 分两阶段，`--sf_warmup_steps 100`、`--sf_loss_weight 0.1`。A1/A2 命令传相同的 LR 参数，projector 是否实际生效由 `--enable_sf` 区分（A1 强制 0）：
 
-| 参数组 | A1 实际 LR | A2 实际 LR |
-| --- | ---: | ---: |
-| `sf_projector`（phase1 / phase2） | 0 / 0（强制） | 1e-4 / 1e-5 |
+| 参数组                                       |       A1 实际 LR |       A2 实际 LR |
+| -------------------------------------------- | ---------------: | ---------------: |
+| `sf_projector`（phase1 / phase2）            |    0 / 0（强制） |      1e-4 / 1e-5 |
 | `sf_vision`（`vlm.vision_tower.blocks.3.0`） | 1e-6（两 phase） | 1e-6（两 phase） |
-| `sf_transformer` | 5e-7 | 5e-7 |
-| `sf_aux`（weight） | 5e-6 | 5e-6 |
-| `sf_aux_bias` | 1e-7 | 1e-7 |
-| `sf_action` | 2e-6 | 2e-6 |
-| `sf_soft_prompt` | 2.5e-7 | 2.5e-7 |
-| 其余 VLM / `vlm_proj` / `pos_emb` / norm | 0 | 0 |
+| `sf_transformer`                             |             5e-7 |             5e-7 |
+| `sf_aux`（weight）                           |             5e-6 |             5e-6 |
+| `sf_aux_bias`                                |             1e-7 |             1e-7 |
+| `sf_action`                                  |             2e-6 |             2e-6 |
+| `sf_soft_prompt`                             |           2.5e-7 |           2.5e-7 |
+| 其余 VLM / `vlm_proj` / `pos_emb` / norm     |                0 |                0 |
 
 阶段行为：
 
 - **Phase 1（前 500 步）**：A2 训练 SF projector（1e-4）与 vision `blocks.3.0`（1e-6）；A1 的 projector 强制 0；action/transformer/aux/soft-prompt 两组均冻结（LR=0），action loss 仍穿透梯度作 anchor；
 - **Phase 2（500–3000）**：其余组全部放开到各自 LR；A2 projector 降至 1e-5，A1 仍强制 0；vision 保持 1e-6。
 
-**机制结论**：首轮 vision 1e-7 时 projector 单独吸收对齐（负面）；`next-lr-3000` 调整为 vision 1e-6 + phase2 projector 1e-5 后，`blocks.3.0` 的 8 个权重 key 开始实质更新（超 BF16 噪声阈值），且 A2 的投影无关空间关系 MSE 在三个 step 均优于同段 A1 且单调增强（-0.9% → -1.5% → -2.3%），SF 空间结构传导成立；选 step=3000 进同段仿真。完整结论见 [`spatial_forcing_a1a2_conclusions.md`](./spatial_forcing_a1a2_conclusions.md)。
+**机制结论**：首轮 vision 1e-7 时 projector 单独吸收对齐（负面）；`next-lr-3000` 调整为 vision 1e-6 + phase2 projector 1e-5 后，`blocks.3.0` 的 8 个权重 key 开始实质更新（超 BF16 噪声阈值），且 A2 的投影无关空间关系 MSE 在三个 step 均优于同段 A1 且单调增强（-0.9% → -1.5% → -2.3%），SF 空间结构传导成立
 
-## 5. 横向要点
 
-1. **LR 数量级梯度（实际执行值）**：`soft prompt（2.5e-7~1e-6）< transformer（5e-7~2e-6）< vision（1e-6~2e-6）< action heads（2e-6~2e-5）< aux weight（5e-6~1e-4）< 新增小模块（SF projector phase1 / 冷启动 aux weight = 1e-4）`。冷启动的新增模块给最高 LR，已有主链路压小 LR 微调；SF projector 在 phase2 降至 1e-5。
-2. **方案间 LR 差异**：方案 2 与方案 3 实际执行共用大部分参数组 LR（aux 5e-6 / aux bias 1e-7 / action 2e-6 / soft prompt 2.5e-7 / transformer 5e-7），差异在 vision：方案 2 为 `2e-6`、方案 3 为 `1e-6`，且方案 3 额外有 SF projector（phase1 `1e-4` / phase2 `1e-5`，A1 强制 0）。
-3. **需注意的事实**：
-   - 方案 2 计划正文表格（vision 1e-6）与实际命令（2e-6）不同，实际执行以命令为准；
-   - 方案 3 首轮 vision 1e-7 时 projector 吸收对齐、机制未被验证；`next-lr-3000` 改 vision 1e-6 + phase2 projector 1e-5 后，`blocks.3.0` 权重实质更新、A2 空间关系 MSE 三档优于同段 A1，选 step=3000 进仿真。

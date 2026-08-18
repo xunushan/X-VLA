@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -111,6 +112,32 @@ def main(args):
                       "is_key_frame": int(bool(is_key)), "task": task}
             all_records.append(record)
 
+    excluded = set()
+    if args.exclude_selection:
+        excluded_records = [
+            json.loads(line)
+            for line in Path(args.exclude_selection).read_text().splitlines()
+            if line.strip()
+        ]
+        excluded.update({
+            (int(record["episode_index"]), int(record["frame_index"]))
+            for record in excluded_records
+        })
+        if len(excluded) != len(excluded_records):
+            raise ValueError("exclude selection contains duplicate episode/frame keys")
+    if args.exclude_cache:
+        with sqlite3.connect(f"file:{Path(args.exclude_cache).resolve()}?mode=ro", uri=True) as conn:
+            cache_keys = {
+                (int(episode), int(frame))
+                for episode, frame in conn.execute("SELECT episode, frame FROM features")
+            }
+        excluded.update(cache_keys)
+    if excluded:
+        all_records = [
+            record for record in all_records
+            if (int(record["episode_index"]), int(record["frame_index"])) not in excluded
+        ]
+
     rng = random.Random(args.seed)
     records = select_records(all_records, args.samples, args.sampling_mode, rng)
     out = Path(args.output)
@@ -131,6 +158,9 @@ def main(args):
         "regular": len(records) - selected_key,
         "selected_key_ratio": selected_key / max(1, len(records)),
         "selected_task_counts": task_counts,
+        "excluded_selection": args.exclude_selection,
+        "excluded_cache": args.exclude_cache,
+        "excluded_samples": len(excluded),
     }, indent=2, ensure_ascii=False))
 
 
@@ -140,6 +170,16 @@ if __name__ == "__main__":
     p.add_argument("--output", required=True)
     p.add_argument("--samples", type=int, default=150000)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--exclude_selection",
+        default=None,
+        help="Optional existing JSONL manifest whose episode/frame keys must not be selected.",
+    )
+    p.add_argument(
+        "--exclude_cache",
+        default=None,
+        help="Optional existing SF SQLite cache whose episode/frame keys must not be selected.",
+    )
     p.add_argument(
         "--sampling_mode",
         choices=("natural", "key_regular_1to1"),

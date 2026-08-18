@@ -18,12 +18,14 @@ from spatial_forcing.token_layout import select_spatial_tokens
 from xvla_datasets import worker_init_fn
 from xvla_datasets.dataset import InfiniteDataReader
 from xvla_datasets.domain_handler.lerobot_v3_robodojo import DEFAULT_CAMERA_KEYS
+from xvla_datasets.multiview_augmentation import MultiViewPhotometricAugmentation
 
 
 ARGS = None
 CACHE = None
 SF_START_STEP = 0
 _LAST_SF_PHASE = None
+_PRINTED_SF_SAMPLE_RATIO = False
 
 
 class CachedTeacherDataset(IterableDataset):
@@ -38,19 +40,91 @@ class CachedTeacherDataset(IterableDataset):
         for sample in self.reader:
             ep, frame = int(sample["episode_index"]), int(sample["frame_index"])
             sample["teacher_feature"] = self.cache.get(ep, frame)
+            sample["sf_sample_mask"] = torch.tensor(True)
             yield sample
+
+
+class MixedTeacherDataset(IterableDataset):
+    """Alternate cached SF samples and uncached natural action-only samples.
+
+    Inputs are two infinite X-VLA sample streams. Cached samples receive their
+    stored teacher feature and ``sf_sample_mask=True``. Natural samples receive
+    a zero placeholder of the same shape and ``sf_sample_mask=False`` so normal
+    DataLoader collation remains possible. The model excludes placeholders from
+    SF loss; both kinds always contribute the ordinary action loss.
+
+    With an even DataLoader batch size, deterministic alternation produces an
+    exact 50/50 ratio in every worker-local batch and therefore every effective
+    gradient-accumulation batch.
+    """
+    def __init__(self, cached_reader, natural_reader, cache_path, feature_shape):
+        self.cached_reader = cached_reader
+        self.natural_reader = natural_reader
+        self.cache_path = cache_path
+        self.feature_shape = tuple(int(value) for value in feature_shape)
+        self.cache = None
+        self.empty_teacher = torch.zeros(self.feature_shape, dtype=torch.bfloat16)
+
+    def __iter__(self):
+        if self.cache is None:
+            self.cache = FeatureCacheReader(self.cache_path)
+        cached = iter(self.cached_reader)
+        natural = iter(self.natural_reader)
+        while True:
+            cached_sample = next(cached)
+            ep = int(cached_sample["episode_index"])
+            frame = int(cached_sample["frame_index"])
+            cached_sample["teacher_feature"] = self.cache.get(ep, frame)
+            cached_sample["sf_sample_mask"] = torch.tensor(True)
+            yield cached_sample
+
+            natural_sample = next(natural)
+            natural_sample["teacher_feature"] = self.empty_teacher
+            natural_sample["sf_sample_mask"] = torch.tensor(False)
+            yield natural_sample
 
 
 def create_sf_dataloader(batch_size, metas_path, num_actions, training, action_mode,
                          num_workers=4, use_frame_weight=False):
-    reader = InfiniteDataReader(
+    cached_reader = InfiniteDataReader(
         metas_path, num_actions=num_actions, num_views=3, training=training,
         action_mode=action_mode, use_frame_weight=use_frame_weight,
         disable_image_augmentation=True, return_frame_info=True,
         sample_allowlist=CACHE.allowlist,
     )
+    if ARGS.sf_cache_fraction == 1.0:
+        dataset = CachedTeacherDataset(cached_reader, ARGS.teacher_cache)
+    else:
+        if ARGS.sf_cache_fraction != 0.5:
+            raise ValueError("current exact mixed sampler supports --sf_cache_fraction 0.5 or 1.0")
+        if batch_size % 2:
+            raise ValueError("50/50 SF mixed sampling requires an even --batch_size")
+        natural_transform = None
+        if ARGS.sf_natural_augmentation_rehearsal:
+            # This branch has no teacher target and receives only action loss,
+            # so replaying Random-Aug cannot create student/teacher mismatch.
+            # warmup_steps=0 means full strength immediately: the option is
+            # valid only when starting from an already validated R checkpoint.
+            natural_transform = MultiViewPhotometricAugmentation(
+                identity_prob=0.5,
+                sync_global_prob=0.4,
+                sync_sensor_prob=0.1,
+                warmup_steps=0,
+                start_scale=1.0,
+            )
+        natural_reader = InfiniteDataReader(
+            metas_path, num_actions=num_actions, num_views=3, training=training,
+            action_mode=action_mode, use_frame_weight=False,
+            disable_image_augmentation=True, return_frame_info=True,
+            sample_blocklist=CACHE.allowlist,
+            multi_view_image_transform=natural_transform,
+        )
+        dataset = MixedTeacherDataset(
+            cached_reader, natural_reader, ARGS.teacher_cache,
+            CACHE.metadata["feature_shape_per_sample"],
+        )
     return DataLoader(
-        CachedTeacherDataset(reader, ARGS.teacher_cache), batch_size=batch_size,
+        dataset, batch_size=batch_size,
         num_workers=num_workers, pin_memory=True, worker_init_fn=worker_init_fn,
         persistent_workers=num_workers > 0,
     )
@@ -162,10 +236,37 @@ def configure_sf_step(optimizer, step, args):
 _ORIGINAL_XVLA_FORWARD = XVLA.forward
 
 
-def sf_model_forward(self, teacher_feature=None, episode_index=None, frame_index=None, **inputs):
+def masked_sf_loss(per_token, valid_images, sf_sample_mask):
+    """Return SF cosine loss normalized over the complete mixed batch.
+
+    ``per_token`` is ``[B,V,N]``. ``valid_images`` is the regular X-VLA
+    ``image_mask[B,V]``. ``sf_sample_mask[B]`` marks samples backed by cached
+    teacher features. Natural samples contribute zero numerator but remain in
+    the denominator, making a 50/50 mixture halve the batch-level SF strength.
+    """
+    b, _, n = per_token.shape
+    sf_sample_mask = sf_sample_mask.bool().reshape(b)
+    if not sf_sample_mask.any():
+        raise ValueError("SF batch contains no cached teacher sample")
+    valid_images = valid_images.bool()
+    mask = (valid_images & sf_sample_mask.unsqueeze(1)).unsqueeze(-1).expand_as(per_token)
+    denominator = valid_images.sum().clamp_min(1) * n
+    return per_token.masked_select(mask).sum() / denominator
+
+
+def sf_model_forward(
+    self, teacher_feature=None, sf_sample_mask=None,
+    episode_index=None, frame_index=None, **inputs
+):
     """XVLA.forward wrapper installed only by this process/entry point."""
+    global _PRINTED_SF_SAMPLE_RATIO
     del episode_index, frame_index
     loss_dict = _ORIGINAL_XVLA_FORWARD(self, **inputs)
+    if sf_sample_mask is not None and not _PRINTED_SF_SAMPLE_RATIO:
+        cached = int(sf_sample_mask.bool().sum().item())
+        total = int(sf_sample_mask.numel())
+        print(f"[sf] first batch cache samples={cached}/{total} ratio={cached/max(1,total):.3f}")
+        _PRINTED_SF_SAMPLE_RATIO = True
     if not ARGS.enable_sf:
         return loss_dict
     student = self._sf_student_features
@@ -188,8 +289,13 @@ def sf_model_forward(self, teacher_feature=None, episode_index=None, frame_index
     projected = F.normalize(self.sf_projector(student), dim=-1)
     target = F.normalize(teacher, dim=-1)
     per_token = 1.0 - (projected * target).sum(dim=-1)
-    mask = inputs["image_mask"].bool().unsqueeze(-1).expand_as(per_token)
-    sf_loss = per_token.masked_select(mask).mean()
+    if sf_sample_mask is None:
+        sf_sample_mask = torch.ones(b, dtype=torch.bool, device=teacher.device)
+    valid_images = inputs["image_mask"].bool()
+    # Divide by all valid image-token positions, including natural samples.
+    # Therefore 50% cached samples multiply the batch-level SF contribution by
+    # 0.5; sf_loss_weight=0.2 preserves the old all-cache effective strength 0.1.
+    sf_loss = masked_sf_loss(per_token, valid_images, sf_sample_mask)
     local = max(0, ARGS._sf_current_step - SF_START_STEP)
     warmup = min(1.0, float(local + 1) / max(1, ARGS.sf_warmup_steps))
     loss_dict["sf_loss"] = sf_loss * ARGS.sf_loss_weight * warmup
@@ -203,9 +309,10 @@ def configure_and_track(optimizer, step, args):
 
 
 def main(args):
-    global ARGS, CACHE, SF_START_STEP, _LAST_SF_PHASE
+    global ARGS, CACHE, SF_START_STEP, _LAST_SF_PHASE, _PRINTED_SF_SAMPLE_RATIO
     ARGS = args
     _LAST_SF_PHASE = None
+    _PRINTED_SF_SAMPLE_RATIO = False
     lr_values = {
         "sf_projector_lr": args.sf_projector_lr,
         "sf_projector_phase2_lr": args.sf_projector_phase2_lr,
@@ -213,6 +320,17 @@ def main(args):
     }
     if any(value is not None and value < 0 for value in lr_values.values()):
         raise ValueError(f"SF learning rates must be non-negative: {lr_values}")
+    if args.sf_cache_fraction not in (0.5, 1.0):
+        raise ValueError("--sf_cache_fraction must be 0.5 (mixed) or 1.0 (legacy all-cache)")
+    if args.sf_natural_augmentation_rehearsal and args.sf_cache_fraction != 0.5:
+        raise ValueError(
+            "--sf_natural_augmentation_rehearsal requires --sf_cache_fraction 0.5"
+        )
+    if args.sf_natural_augmentation_rehearsal:
+        print(
+            "[sf] natural action-only branch uses Random-Aug rehearsal "
+            "(50% identity / 40% sync / 10% sensor); cached teacher branch remains deterministic"
+        )
     CACHE = FeatureCacheReader(args.teacher_cache)
     expected = CACHE.metadata
     if expected.get("color_jitter") is not False:
@@ -266,6 +384,19 @@ def parser():
     p.add_argument("--sf_phase1_steps", type=int, default=500)
     p.add_argument("--sf_warmup_steps", type=int, default=100)
     p.add_argument("--sf_loss_weight", type=float, default=0.1)
+    p.add_argument(
+        "--sf_cache_fraction", type=float, default=1.0,
+        help="1.0=legacy all-cache sampling; 0.5=exact cached/uncached natural alternation.",
+    )
+    p.add_argument(
+        "--sf_natural_augmentation_rehearsal",
+        action="store_true",
+        help=(
+            "Apply full-strength 50/40/10 synchronized Random-Aug only to the uncached "
+            "action-only half of a 50/50 mixed stream. Use only when SF starts from a "
+            "validated Random-Aug checkpoint; cached teacher samples are never augmented."
+        ),
+    )
     p.add_argument("--sf_hidden_dim", type=int, default=None)
     p.add_argument("--sf_projector_lr", type=float, default=1e-4)
     p.add_argument(
