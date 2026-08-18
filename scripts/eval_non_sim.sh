@@ -34,7 +34,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 服务器用 xvla；本机测 eval 用 lerobot（macOS 无 GPU 也能跑通全流程）
 CONDA_ENV="${XVLA_CONDA_ENV:-xvla}"
 MODEL="${XVLA_MODEL:-tianSeconds/goai/xvla-ee6d/002000}"
-SPLIT_FILE="${XVLA_SPLIT_FILE:-/data/splits/lerobot_v30_ee_6d_train90_seed42.json}"
+SPLIT_FILE="${XVLA_SPLIT_FILE:-/data/splits/lerobot_v30_ee_6d_train95_seed42.json}"
 DATA_ROOT="${XVLA_DATA_ROOT:-/data/data/lerobot_v30_ee_6d}"
 MODEL_NAME="$(basename "${MODEL}")"
 OUT_DIR="${XVLA_OUTPUT_DIR:-/data/outputs/${MODEL_NAME}_eval}"

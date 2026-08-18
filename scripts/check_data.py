@@ -136,7 +136,7 @@ def main() -> int:
     handler = LeRobotV3RoboDojoHandler(meta=meta, num_views=3)
     check("handler episodes 加载", len(handler.episodes) > 0, f"{len(handler.episodes)} episodes")
 
-    # 训练集过滤：meta.json 的 episodes 列表应过滤 handler 的 datalist（train90 划分 = 1080）
+    # 训练集过滤：meta.json 的 episodes 列表应过滤 handler 的 datalist（train95 划分 = 1140）
     eps_filter = meta.get("episodes")
     if eps_filter is not None:
         check("meta.episodes 训练集过滤生效",

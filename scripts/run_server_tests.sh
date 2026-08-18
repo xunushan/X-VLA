@@ -29,7 +29,7 @@ export PROJECT_ROOT   # 阶段子 shell 需要
 export CONDA_ENV="${XVLA_CONDA_ENV:-xvla}"
 export DATA_ROOT="${XVLA_DATA_ROOT:-/data/data/lerobot_v30_ee_6d}"      # 转换后 6d 数据（splits 引用此路径）
 export SRC_16="${XVLA_SRC_16:-/data/data/lerobot_v30_ee}"               # 服务器现有 16d 数据
-export SPLIT_FILE="${XVLA_SPLIT_FILE:-/data/splits/lerobot_v30_ee_6d_train90_seed42.json}"
+export SPLIT_FILE="${XVLA_SPLIT_FILE:-/data/splits/lerobot_v30_ee_6d_train95_seed42.json}"
 export META_JSON="${XVLA_META_JSON:-${DATA_ROOT}/meta.json}"
 export MODEL_DIR="${XVLA_MODEL_DIR:-/data/checkpoints/xvla/X-VLA-Pt}"
 export OUT_BASE="${XVLA_OUT_BASE:-${PROJECT_ROOT}/runnings/server_tests}"
@@ -174,12 +174,11 @@ eps = m.get("episodes")
 if eps is None:
     print("  [FAIL] meta.json episodes=None（训练未按训练集过滤）；检查 prepare_data.sh 的 splits 读取")
     raise SystemExit(1)
-print(f"  meta.json episodes: {len(eps)} 个（应为 1080，train90_seed42）")
-if len(eps) != 1080:
-    print("  [WARN] episodes 数量 != 1080，与 train90 划分不符，确认 splits 文件/字段")
-import sys as _s
-_s = json.load(open(split_file))["train"]
-assert eps == sorted(_s), "meta.json episodes != splits train 列表"
+_sp = json.load(open(split_file))["train"]
+print(f"  meta.json episodes: {len(eps)} 个（splits train 应为 {len(_sp)}）")
+if len(eps) != len(_sp):
+    print(f"  [WARN] episodes 数量 != {len(_sp)}，与 splits train 划分不符，确认 splits 文件/字段")
+assert eps == sorted(_sp), "meta.json episodes != splits train 列表"
 print("  [PASS] meta.json episodes 与 splits train 列表一致")
 PY
   echo "== 2-data done =="

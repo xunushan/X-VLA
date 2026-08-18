@@ -12,14 +12,14 @@
 # 用法：bash scripts/prepare_data.sh [SRC_ROOT] [DST_ROOT]
 #   SRC_ROOT 默认 /data/data/lerobot_v30_ee（服务器现有 16 维数据）
 #   DST_ROOT 默认 /data/data/lerobot_v30_ee_6d（splits 的 source_dataset.root）
-#   训练集索引文件：XVLA_SPLIT_FILE 覆盖（默认 /data/splits/lerobot_v30_ee_6d_train90_seed42.json）
+#   训练集索引文件：XVLA_SPLIT_FILE 覆盖（默认 /data/splits/lerobot_v30_ee_6d_train95_seed42.json）
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONDA_ENV="${XVLA_CONDA_ENV:-xvla}"
 SRC_ROOT="${1:-/data/data/lerobot_v30_ee}"
 DST_ROOT="${2:-/data/data/lerobot_v30_ee_6d}"
-SPLIT_FILE="${XVLA_SPLIT_FILE:-/data/splits/lerobot_v30_ee_6d_train90_seed42.json}"
+SPLIT_FILE="${XVLA_SPLIT_FILE:-/data/splits/lerobot_v30_ee_6d_train95_seed42.json}"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"

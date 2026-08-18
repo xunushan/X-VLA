@@ -14,7 +14,7 @@
 用法示例：
   python evaluation/evaluate.py --make-meta-only \
       --dataset-root /data/data/lerobot_v30_ee_6d \
-      --split-path /data/splits/lerobot_v30_ee_6d_train90_seed42.json \
+      --split-path /data/splits/lerobot_v30_ee_6d_train95_seed42.json \
       --split val --metas /data/outputs/eval/meta.json
   python evaluation/evaluate.py --model tianSeconds/goai/xvla-ee6d/002000 \
       --metas /data/outputs/eval/meta.json --output-dir /data/outputs/eval \
