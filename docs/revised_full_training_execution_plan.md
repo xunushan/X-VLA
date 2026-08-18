@@ -25,6 +25,8 @@
 cd /data/X-VLA
 export OFFICIAL_MODEL=/data/checkpoints/xvla/ckpt-100000_loadable
 export TRAIN_META=/data/data/lerobot_v30_ee_6d/meta.json
+export VAL_META=/data/data/lerobot_v30_ee_6d/meta.val95.json
+export SPLIT_FILE=/data/splits/lerobot_v30_ee_6d_train95_seed42.json
 export EXP_ROOT=/cloud/cloud-ssd1/xvla_revised
 export VGGT_REPO=/data/VGGT
 export VGGT_CKPT=/data/checkpoints/vggt/model.pt
@@ -34,7 +36,8 @@ mkdir -p "$EXP_ROOT"
 ### 1.1 数据对齐：95% 训练 / 5% 评估划分（本轮唯一差异）
 
 训练数据与历史 train90 划分不同，本轮按 **95% 训练 / 5% 评估**（task 分层、seed42）重划，
-所有阶段（T/R/S）共用同一份划分文件，后续评估只用其 `val`（60 个 episode），不再另做抽样：
+所有阶段（T/R/S）共用同一份划分文件，后续评估只用其 `val`（60 个 episode），不再另划episode；
+§5.6只在这60个episode内部固定抽取少量帧做离线诊断：
 
 - 划分文件：`splits/lerobot_v30_ee_6d_train95_seed42.json`
   - 服务器路径 `/data/splits/lerobot_v30_ee_6d_train95_seed42.json`（git 拉取后 `cp` 到该路径）
@@ -44,6 +47,18 @@ mkdir -p "$EXP_ROOT"
   `tools/apply_split_to_meta.py` 重写（`--split-key train --apply`）
 - 评估：`evaluation/evaluate.py --split-path <该文件> --split val` 使用同一份文件
 - 前置校验：`frame_weight` 列必须已存在于 6d 主表（`tools/add_frame_weight.py verify`）
+
+为离线空间关系诊断准备独立的val meta。它与`TRAIN_META`指向同一数据根目录和三路视频，只将
+`episodes`过滤为split中的60个val episode；已经准备好等价文件时跳过下面命令：
+
+```bash
+cp "$TRAIN_META" "$VAL_META"
+python tools/apply_split_to_meta.py \
+  --meta "$VAL_META" --split "$SPLIT_FILE" --split-key val --apply
+```
+
+不要用`--split-key val`改写`TRAIN_META`。训练仍只读取1140个train episode；`VAL_META`只用于§5.6
+的小型teacher cache和离线空间关系诊断。
 
 任何首次从上游Base启动的新实验都只传`--models`，不传`--resume`。只有中断后继续同一输出目录，
 或本文明确写出的R-2续训，才传`--resume latest`。
@@ -238,7 +253,6 @@ delta 数量不再是固定 40K，而是动态 `100000 - 过滤后剩余样本�
 ```bash
 export SF_ROOT="$EXP_ROOT/SF"
 export OLD_CACHE="$SF_ROOT/vggt-natural-60k.sqlite"
-export SPLIT_FILE=/data/splits/lerobot_v30_ee_6d_train95_seed42.json
 mkdir -p "$SF_ROOT"
 
 conda run -n xvla python tools/inspect_sf_cache.py "$OLD_CACHE"
@@ -434,6 +448,77 @@ conda run -n xvla accelerate launch --num_processes 1 --mixed_precision bf16 \
 
 分支B的A1/A2必须都传rehearsal参数，不能只给A2开启。分支A与B是替代关系，不应四组全部训练；选择
 一条分支后按同一分支完成A1/A2对照。
+
+### 5.6 用预留val集做SF空间关系诊断
+
+目的：在昂贵仿真前，用未参与训练的60个val episode检查SF是否让X-VLA原始视觉token的空间关系
+更接近VGGT。该诊断绕过`sf_projector`，但仍只是离线机制证据，不能替代仿真。
+
+训练用`vggt-natural-100k.sqlite`与本节val cache必须分离：
+
+- 100K训练cache只含train episode，传给`train_spatial_forcing.py`；
+- val cache只抽取少量val帧，只传给`evaluate_sf_spatial_relation.py`；
+- 不把val cache用于A1/A2训练。
+
+#### 5.6.1 从val集自然抽样并生成小型teacher cache
+
+下面以256帧为例。`VAL_SAMPLES`表示评估帧数，不是训练步数；三个checkpoint系列必须复用同一个
+manifest、cache、seed，不能分别抽样。
+
+```bash
+export VAL_SAMPLES=256
+export VAL_SELECTION="$SF_ROOT/selection-val-${VAL_SAMPLES}.jsonl"
+export VAL_TEACHER_CACHE="$SF_ROOT/vggt-val-${VAL_SAMPLES}.sqlite"
+
+python tools/build_sf_sample_manifest.py \
+  --meta "$VAL_META" \
+  --split "$SPLIT_FILE" --split-key val \
+  --output "$VAL_SELECTION" \
+  --samples "$VAL_SAMPLES" --sampling_mode natural --seed 0
+
+python -u tools/cache_vggt_features.py \
+  --val_metas_path "$VAL_META" \
+  --selection "$VAL_SELECTION" \
+  --output "$VAL_TEACHER_CACHE" \
+  --vggt_repo "$VGGT_REPO" \
+  --vggt_checkpoint "$VGGT_CKPT" \
+  --target_token_grid 7 7 --teacher_layer -1 --teacher_image_size 518 \
+  --num_actions 30 --action_mode ee6d \
+  --batch_size 4 --num_workers 4 --prefetch_factor 2 --device cuda
+
+conda run -n xvla python tools/inspect_sf_cache.py "$VAL_TEACHER_CACHE"
+```
+
+检查输出必须为`samples=256`、feature shape=`[3,49,2048]`、finite ratio=1。若输出文件已经存在，
+不要加`--overwrite`重跑；先检查现有cache是否完整。
+
+#### 5.6.2 同一批val帧比较Base、A1和A2
+
+以下一次加载5个模型，避免不同命令误用不同抽样。若只准备评估一个训练步点，可删掉另一个步点的
+A1/A2，但第一个`THREE_CAMERA_BASE`必须保留为共同基线。
+
+```bash
+python tools/evaluate_sf_spatial_relation.py \
+  --models \
+    "$THREE_CAMERA_BASE" \
+    "$SF_ROOT/A1-100k-4000/pretrained/ckpt-2000" \
+    "$SF_ROOT/A2-100k-4000/pretrained/ckpt-2000" \
+    "$SF_ROOT/A1-100k-4000/pretrained/ckpt-4000" \
+    "$SF_ROOT/A2-100k-4000/pretrained/ckpt-4000" \
+  --labels Base A1-2000 A2-2000 A1-4000 A2-4000 \
+  --val_metas_path "$VAL_META" \
+  --teacher_cache "$VAL_TEACHER_CACHE" \
+  --samples "$VAL_SAMPLES" --seed 0 \
+  --batch_size 8 --num_workers 4 --device cuda --dtype bf16 \
+  --output "$SF_ROOT/spatial-relation-val-${VAL_SAMPLES}.json"
+```
+
+只看同一步对照：`A2-2000`对`A1-2000`、`A2-4000`对`A1-4000`。`relation_mse`越低越接近VGGT；
+若A2低于同段A1且checkpoint分析确认`vision_last`有实质更新，说明SF信号确实传入视觉主干，可优先
+选择该步进入仿真。若A2没有低于同段A1，不因`sf_loss`下降就认定SF有效。
+
+参数名`--val_metas_path`不强制验证数据划分；代码也允许用户主动传训练meta及对应cache。但本文正式
+流程固定使用预留val集，避免把训练帧上的对齐改善误当成泛化证据。
 
 ## 6. 最终停止条件
 
