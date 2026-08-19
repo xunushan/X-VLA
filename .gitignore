@@ -220,3 +220,7 @@ demo.ipynb
 
 # 本地训练日志与图表（tools/plot_train_loss.py 产出）
 outputs/
+
+# 本地文档与 Claude 配置（不推送到远程仓库）
+docs/
+.claude/
