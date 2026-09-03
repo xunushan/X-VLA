@@ -46,6 +46,9 @@ class XVLAConfig(PretrainedConfig):
         max_len_seq: int = 512,
         use_hetero_proj: bool = False,
         soft_prompt_length: int = 32,
+        use_aux_view_gates: bool = False,
+        num_aux_views: int = 2,
+        aux_gate_init_logit: float = -4.0,
 
         # === Action & proprio ===
         max_action_dim: int = 20,  # Maximum action dimension for padding (used by "auto" action mode)
@@ -79,6 +82,9 @@ class XVLAConfig(PretrainedConfig):
         self.max_len_seq = max_len_seq
         self.use_hetero_proj = use_hetero_proj
         self.soft_prompt_length = soft_prompt_length
+        self.use_aux_view_gates = use_aux_view_gates
+        self.num_aux_views = num_aux_views
+        self.aux_gate_init_logit = aux_gate_init_logit
 
         # Action/proprioception settings
         self.num_actions = num_actions

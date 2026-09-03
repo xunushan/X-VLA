@@ -451,6 +451,7 @@ def get_group_lr(optim: torch.optim.Optimizer, name: str) -> float:
 
 
 _GRADIENT_MONITOR_GROUPS = {
+    "view_gates",
     "aux_visual_weight",
     "aux_visual_bias",
     "soft_prompt",
@@ -573,6 +574,24 @@ def configure_training_step(optim, step, args):
             set_group_lr(optim, name, new_lr)
 
 
+# Optional extension points used by specialized trainers.  Defaults preserve the
+# original train.py behavior exactly; entry points may replace them before main().
+def configure_model_config(config, args, *, is_resume: bool):
+    return config
+
+
+def prepare_batch_for_step(batch, step: int, args):
+    return batch
+
+
+def collect_training_logs(model, optim, step: int, args) -> Dict[str, float]:
+    return {}
+
+
+def should_force_checkpoint(step: int, args) -> bool:
+    return False
+
+
 # ============================================================
 # Main Training
 # ============================================================
@@ -618,6 +637,7 @@ def main(args):
                 f"--action_mode {args.action_mode} != checkpoint action_mode "
                 f"{config.action_mode}; using checkpoint config"
             )
+        config = configure_model_config(config, args, is_resume=True)
         logger.info(f"Resume from {weights_dir} (action_mode={config.action_mode})")
         model = XVLA.from_pretrained(weights_dir, config=config)
     else:
@@ -625,6 +645,7 @@ def main(args):
         if args.action_mode is not None:
             config.action_mode = args.action_mode
             logger.info(f"Override action_mode -> {config.action_mode}")
+        config = configure_model_config(config, args, is_resume=False)
         model = XVLA.from_pretrained(args.models, config=config)
     # resume 时 processor 也从权重目录加载（即训练时实际使用的配置），保持一致
     processor = (
@@ -736,6 +757,7 @@ def main(args):
             _t = time.time()
             batch = next(train_iter)
             data_s += time.time() - _t
+            batch = prepare_batch_for_step(batch, global_step, args)
 
             # key 帧占比统计：pop 掉 is_key_frame（只进日志不进模型），按 micro-batch 样本累计
             batch_key = batch.pop("is_key_frame", None)
@@ -863,6 +885,7 @@ def main(args):
                     logs[f"grad_tensors_{group_name}"] = stats["tensors_with_grad"]
                 logs["step"] = global_step
                 logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
+                logs.update(collect_training_logs(base_model, optim, global_step, args))
                 accelerator.log(logs, step=global_step)
 
                 if accelerator.is_main_process:
@@ -892,6 +915,12 @@ def main(args):
                         if "key_frame_ratio" in logs
                         else "NA"
                     )
+                    gate_parts = ""
+                    if "gate_left" in logs and "gate_right" in logs:
+                        gate_parts = (
+                            f"gate_left={logs['gate_left']:.4f} "
+                            f"gate_right={logs['gate_right']:.4f} "
+                        )
                     logger.info(
                         f"[{global_step}/{args.iters}] "
                         f"loss={logs['loss_total']:.4f} "
@@ -901,7 +930,8 @@ def main(args):
                         f"grad_norm={logs['grad_norm']:.4f} "
                         f"clip_coef={logs['grad_clip_coef']:.3e} "
                         f"lr_core={logs['lr_transformer_core']:.2e} "
-                        f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
+                        f"lr_vlm={logs['lr_vlm']:.2e} "
+                        f"{gate_parts}({dt:.2f}s/it) "
                         f"DATA_PCT={data_pct:.0f}% "
                         f"USED_CPU={cpu_mem:.2e} GB "
                         f"USED_GPU={gpu_mem:.2e} GB "
@@ -918,7 +948,11 @@ def main(args):
             effective_key_samples_local = 0
 
             # Checkpointing
-            if global_step == args.iters or global_step % args.save_interval == 0:
+            if (
+                global_step == args.iters
+                or global_step % args.save_interval == 0
+                or should_force_checkpoint(global_step, args)
+            ):
                 # 新布局：权重存 pretrained/ckpt-{N}（每 save_interval 一份，保留/上传用），
                 # 训练状态存 model_state/ckpt-{N}（optimizer + RNG，仅保留最近 K 个，由
                 # monitor-trainning skill 的 prune_checkpoints.py 每小时轮询清理）。
