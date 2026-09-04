@@ -138,6 +138,34 @@ def test_accumulated_loss_average():
     assert sum(losses).item() == pytest.approx(full.item(), rel=1e-6)
 
 
+def test_ee6d_gripper_target_entropy_metrics():
+    from train import compute_ee6d_gripper_target_metrics
+
+    action = torch.zeros(2, 3, 20)
+    action[..., 9] = 0.5
+    action[..., 19] = 1.0
+    metrics = compute_ee6d_gripper_target_metrics(action)
+
+    assert metrics["gripper_target_entropy_left"].item() == pytest.approx(
+        np.log(2.0), rel=1e-5
+    )
+    assert metrics["gripper_target_entropy_right"].item() == pytest.approx(0.0, abs=2e-5)
+    assert metrics["gripper_target_entropy"].item() == pytest.approx(
+        np.log(2.0) / 2.0, abs=1e-5
+    )
+    assert metrics["gripper_target_out_of_range_ratio"].item() == 0.0
+
+
+def test_ee6d_gripper_target_entropy_reports_invalid_bce_targets():
+    from train import compute_ee6d_gripper_target_metrics
+
+    action = torch.zeros(1, 2, 20)
+    action[0, 0, 9] = -0.1
+    action[0, 1, 19] = 1.1
+    metrics = compute_ee6d_gripper_target_metrics(action)
+    assert metrics["gripper_target_out_of_range_ratio"].item() == pytest.approx(0.5)
+
+
 # ---------------------------------------------------------------- checkpoint / resume
 def _make_complete_ckpt(base: Path, step: int) -> Path:
     """构造旧布局"完整" checkpoint（state.json + optimizer.pt + model.safetensors 同目录）。"""

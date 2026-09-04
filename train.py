@@ -592,6 +592,28 @@ def should_force_checkpoint(step: int, args) -> bool:
     return False
 
 
+def compute_ee6d_gripper_target_metrics(action: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Detached diagnostics matching EE6D BCE's two gripper target channels.
+
+    Entropy uses natural logarithms, as does BCEWithLogitsLoss.  Values outside
+    [0, 1] are reported before clamping so an invalid BCE target cannot hide.
+    """
+    if action.ndim != 3 or action.shape[-1] <= 19:
+        raise ValueError(f"Expected EE6D action [B,T,D>=20], got {tuple(action.shape)}")
+    target = action.detach()[..., (9, 19)].float()
+    out_of_range = ((target < 0) | (target > 1)).float().mean()
+    safe = target.clamp(1e-6, 1.0 - 1e-6)
+    entropy = -(safe * safe.log() + (1.0 - safe) * (1.0 - safe).log())
+    left = entropy[..., 0].mean()
+    right = entropy[..., 1].mean()
+    return {
+        "gripper_target_entropy_left": left,
+        "gripper_target_entropy_right": right,
+        "gripper_target_entropy": (left + right) * 0.5,
+        "gripper_target_out_of_range_ratio": out_of_range,
+    }
+
+
 # ============================================================
 # Main Training
 # ============================================================
@@ -741,6 +763,7 @@ def main(args):
     # batch mean，因此按真实 micro-batch 样本数加权；在 sync_gradients 边界再跨 rank
     # reduce，日志才对应完整 effective batch，而不是最后一个 micro-batch / 当前 rank。
     effective_loss_sums: Dict[str, torch.Tensor] = {}
+    effective_metric_sums: Dict[str, torch.Tensor] = {}
     effective_loss_total_sum: torch.Tensor | None = None
     effective_batch_samples_local = 0
     # key 帧占比统计：累计 key 帧数与带 key 信息的样本数（跨 micro-batch / rank 归并）
@@ -793,6 +816,14 @@ def main(args):
                     effective_loss_sums[name] += weighted
                 else:
                     effective_loss_sums[name] = weighted
+            if base_model.action_mode == "ee6d":
+                gripper_metrics = compute_ee6d_gripper_target_metrics(inputs["action"])
+                for name, value in gripper_metrics.items():
+                    weighted = value * micro_batch_samples
+                    if name in effective_metric_sums:
+                        effective_metric_sums[name] += weighted
+                    else:
+                        effective_metric_sums[name] = weighted
             weighted_total = loss.detach().float() * micro_batch_samples
             if effective_loss_total_sum is None:
                 effective_loss_total_sum = weighted_total
@@ -851,8 +882,10 @@ def main(args):
                 # 一次 collective 同时归并各 loss 分量、total、样本数和 key 帧计数。
                 # 除以全局真实样本数，得到本 optimizer update 对应的 effective-batch mean loss。
                 loss_names = tuple(effective_loss_sums)
+                metric_names = tuple(effective_metric_sums)
                 local_stats = torch.stack(
                     [effective_loss_sums[name] for name in loss_names]
+                    + [effective_metric_sums[name] for name in metric_names]
                     + [
                         effective_loss_total_sum,
                         effective_loss_total_sum.new_tensor(
@@ -871,7 +904,18 @@ def main(args):
                     name: float(global_stats[index].item() / denominator)
                     for index, name in enumerate(loss_names)
                 }
+                metric_offset = len(loss_names)
+                logs.update(
+                    {
+                        name: float(global_stats[metric_offset + index].item() / denominator)
+                        for index, name in enumerate(metric_names)
+                    }
+                )
                 logs["loss_total"] = float(global_stats[-4].item() / denominator)
+                if "gripper_loss" in logs and "gripper_target_entropy" in logs:
+                    logs["gripper_excess_bce"] = (
+                        logs["gripper_loss"] - logs["gripper_target_entropy"]
+                    )
                 logs["effective_batch_samples"] = effective_batch_samples_global
                 # 本 optimizer step 全量样本（跨 micro-batch / rank）的 key 帧占比
                 if key_samples_global > 0:
@@ -921,6 +965,15 @@ def main(args):
                             f"gate_left={logs['gate_left']:.4f} "
                             f"gate_right={logs['gate_right']:.4f} "
                         )
+                    gripper_parts = ""
+                    if "gripper_target_entropy" in logs:
+                        gripper_parts = (
+                            f"grip_H={logs['gripper_target_entropy']:.4f} "
+                            f"(L={logs['gripper_target_entropy_left']:.4f},"
+                            f"R={logs['gripper_target_entropy_right']:.4f}) "
+                            f"grip_excess_bce={logs['gripper_excess_bce']:.4f} "
+                            f"grip_target_oor={logs['gripper_target_out_of_range_ratio']:.3e} "
+                        )
                     logger.info(
                         f"[{global_step}/{args.iters}] "
                         f"loss={logs['loss_total']:.4f} "
@@ -931,6 +984,7 @@ def main(args):
                         f"clip_coef={logs['grad_clip_coef']:.3e} "
                         f"lr_core={logs['lr_transformer_core']:.2e} "
                         f"lr_vlm={logs['lr_vlm']:.2e} "
+                        f"{gripper_parts}"
                         f"{gate_parts}({dt:.2f}s/it) "
                         f"DATA_PCT={data_pct:.0f}% "
                         f"USED_CPU={cpu_mem:.2e} GB "
@@ -942,6 +996,7 @@ def main(args):
             # 无论本 step 是否打印，都必须在 optimizer step 边界清空，避免把多个
             # optimizer update 混到下一次日志中。
             effective_loss_sums = {}
+            effective_metric_sums = {}
             effective_loss_total_sum = None
             effective_batch_samples_local = 0
             effective_key_sum_local = 0.0
