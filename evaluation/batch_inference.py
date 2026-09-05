@@ -196,7 +196,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--denoise-steps", type=int, default=10)
     parser.add_argument("--num-views", type=int, default=3)
     parser.add_argument("--domain-id", type=int, default=None)
-    parser.add_argument("--invert-gripper", action=argparse.BooleanOptionalAction, default=True)
+    # 默认不反转：canonical EE16（指标/baseline 用）gripper 与 X-VLA 20 维原生极性一致，
+    # 反转只发生在 feeding 模型前的 ee16_to_xvla20（训练/推理输入侧），不在输出侧。
+    parser.add_argument("--invert-gripper", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 

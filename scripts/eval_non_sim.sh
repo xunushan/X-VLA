@@ -14,7 +14,9 @@ BATCH_SIZE="${XVLA_BATCH_SIZE:-8}"
 NUM_WORKERS="${XVLA_NUM_WORKERS:-0}"
 NUM_VIEWS="${XVLA_NUM_VIEWS:-3}"
 DOMAIN_ID="${XVLA_DOMAIN_ID:-}"
-INVERT_GRIPPER="${XVLA_INVERT_GRIPPER:-true}"
+# 指标口径用 canonical EE16，其 gripper 与 X-VLA 20 维原生极性一致（见 utils.xvla20_to_ee16
+# docstring：评估用默认不反转，baseline CSV 亦按此生成），故这里默认不反转。
+INVERT_GRIPPER="${XVLA_INVERT_GRIPPER:-false}"
 DTYPE="${XVLA_DTYPE:-auto}"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
