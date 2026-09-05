@@ -249,6 +249,8 @@ class EvalDataReader(IterableDataset):
         action_mode: str = "ee6d",
         frame_stride: int = 1,
         domain_id: int | None = None,
+        skip_static_samples: bool = True,
+        require_full_horizon: bool = False,
     ):
         base = InfiniteDataReader(
             metas_path,
@@ -266,6 +268,8 @@ class EvalDataReader(IterableDataset):
         self.frame_stride = max(1, int(frame_stride))
         # 覆盖所有 dataset 的 domain_id；None 时按 robot_type 查 DATA_DOMAIN_ID
         self.domain_id = int(domain_id) if domain_id is not None else None
+        self.skip_static_samples = bool(skip_static_samples)
+        self.require_full_horizon = bool(require_full_horizon)
 
     def __iter__(self):
         # num_workers>0 时每个 worker 独立运行 __iter__：按 worker id 切分 episode，
@@ -288,6 +292,8 @@ class EvalDataReader(IterableDataset):
             domain_id = torch.tensor(did)
 
             for traj_idx in _shard_indices(len(meta["datalist"]), n_workers, worker_id):
+                episode_index = int(meta["datalist"][traj_idx])
+                episode_length = int(handler.episodes[episode_index]["length"])
                 for sample in handler.iter_episode(
                     traj_idx,
                     num_actions=self.num_actions,
@@ -296,8 +302,11 @@ class EvalDataReader(IterableDataset):
                     lang_aug_map=meta.get("lang_aug_map"),
                     frame_info=True,  # handler opt-in：携带 episode_index/frame_index
                     action_mode=self.action_mode,
+                    skip_static_samples=self.skip_static_samples,
                 ):
                     idx = int(sample["frame_index"])
+                    if self.require_full_horizon and idx + self.num_actions >= episode_length:
+                        continue
                     if idx % self.frame_stride != 0:
                         continue
                     idx_for_delta = sample.pop("idx_for_delta", [])

@@ -28,7 +28,7 @@ from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-# 允许从仓库任意位置 import（与 evaluation/evaluate.py 相同模式）。
+# 允许从仓库任意位置 import。
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -187,8 +187,8 @@ class RoboDojoPolicyClient:
         return ordered
 
     def _load_model(self):
-        """加载 X-VLA 模型 + processor（HF repo 或本地权重目录），复用 evaluate.load_model。"""
-        from evaluation.evaluate import load_model
+        """加载 X-VLA 模型 + processor（HF repo 或本地权重目录）。"""
+        from evaluation.batch_inference import load_model
 
         return load_model(self.model_id, self.device, self.dtype)
 

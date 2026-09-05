@@ -216,7 +216,7 @@ def compute_metrics_by_task(
 ) -> dict:
     """按 task_index 分组计算指标，返回 {task_index: metrics}。
 
-    df 必须含 task_index 列（评估由 episode_index 回溯生成，见 evaluate.py
+    df 必须含 task_index 列（评估由 episode_index 回溯生成，
     build_episode_task_index）。每个分组额外带 num_episodes / num_frames，
     便于按任务对比误差的同时对齐样本量。
     """
