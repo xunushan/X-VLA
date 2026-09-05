@@ -151,8 +151,15 @@ def write_predictions(
                 predicted = model.generate_actions(
                     **batch_inputs(processor, batch, device, dtype), steps=denoise_steps
                 )
-                predicted_ee = xvla20_to_ee16(
-                    predicted.float().cpu().numpy(), invert_gripper=invert_gripper
+                # xvla20_to_ee16 的旋转助手只接受单个前导维 (N, ...)；
+                # [B, H, 20] 拍平为 [B*H, 20] 再还原，行间转换互相独立故等价且保持向量化。
+                predicted_np = predicted.float().cpu().numpy()
+                flat_ee = xvla20_to_ee16(
+                    predicted_np.reshape(-1, predicted_np.shape[-1]),
+                    invert_gripper=invert_gripper,
+                )
+                predicted_ee = flat_ee.reshape(
+                    predicted_np.shape[0], predicted_np.shape[1], flat_ee.shape[-1]
                 )
                 for index, chunk in enumerate(predicted_ee):
                     writer.writerow(
