@@ -28,34 +28,38 @@ import pandas as pd
 
 LEAD_CURVE = "lead"
 EXEC_CURVE = "execution"
-# same metric set as evaluate_ee.py, stored per (stage, curve, step)
-METRIC_NAMES = (
-    "left_position_cm",
-    "right_position_cm",
-    "mean_position_cm",
-    "left_position_mse_cm2",
-    "right_position_mse_cm2",
-    "left_rotation_deg",
-    "right_rotation_deg",
-    "mean_rotation_deg",
-    "left_rotation_mse_deg2",
-    "right_rotation_mse_deg2",
-    "left_gripper_mae",
-    "right_gripper_mae",
-    "mean_gripper_mae",
-    "left_gripper_mse",
-    "right_gripper_mse",
-)
+# 精简后的节点字段集（与用户确认）：只留 mean 级位置/旋转误差 + MSE，gripper 统一 MSE。
+LEAD_STEPS = ("1", "10", "20", "30")
+EXEC_STEPS = ("10", "15", "30")
 
 
 def build_metrics_node(rows: pd.DataFrame) -> dict:
-    """Nest by_task rows into {stage: {curve: {step: {metric: value, comparisons}}}}."""
+    """Nest by_task rows into {stage: {curve: {step: {mean_* metric, comparisons}}}}.
+
+    lead 只保留 1/10/20/30，execution 只保留 10/15/30；mean_mse 由 evaluate 输出的
+    per-side (left/right) 平方误差取平均得到；数值四舍五入到 4 位小数省体积。
+    """
+    keep = {LEAD_CURVE: LEAD_STEPS, EXEC_CURVE: EXEC_STEPS}
     node: dict[str, dict] = {}
     for (stage, curve, step), group in rows.groupby(["stage", "curve", "step"], sort=True):
-        node.setdefault(stage, {}).setdefault(curve, {})[str(int(step))] = {
-            metric: float(group[metric].iloc[0])
-            for metric in METRIC_NAMES
-        } | {"comparisons": int(group["comparisons"].iloc[0])}
+        step_key = str(int(step))
+        if step_key not in keep.get(curve, ()):
+            continue
+        r = group.iloc[0]
+        node.setdefault(stage, {}).setdefault(curve, {})[step_key] = {
+            "comparisons": int(r["comparisons"]),
+            "mean_position_cm": round(float(r["mean_position_cm"]), 4),
+            "mean_position_mse_cm2": round(
+                (float(r["left_position_mse_cm2"]) + float(r["right_position_mse_cm2"])) / 2.0, 4
+            ),
+            "mean_rotation_deg": round(float(r["mean_rotation_deg"]), 4),
+            "mean_rotation_mse_deg2": round(
+                (float(r["left_rotation_mse_deg2"]) + float(r["right_rotation_mse_deg2"])) / 2.0, 4
+            ),
+            "mean_gripper_mse": round(
+                (float(r["left_gripper_mse"]) + float(r["right_gripper_mse"])) / 2.0, 6
+            ),
+        }
     return node
 
 
@@ -147,14 +151,12 @@ def write_flat_csv(db_path: str | Path, out_csv: str | Path | None) -> None:
             "num_predictions": n_pred,
         }
         all_stage = om.get("__all__", {})
-        for curve in (LEAD_CURVE, EXEC_CURVE):
+        for curve, prefix in ((LEAD_CURVE, "lead"), (EXEC_CURVE, "win")):
             steps = all_stage.get(curve, {}) or {}
-            for label in ("1", "5", "10", "20", "30"):
-                if label in steps:
-                    stem = f"{'lead' if curve == LEAD_CURVE else 'win'}{label}"
-                    flat[f"{stem}_pos_cm"] = round(steps[label]["mean_position_cm"], 3)
-                    flat[f"{stem}_rot_deg"] = round(steps[label]["mean_rotation_deg"], 3)
-                    flat[f"{stem}_grp_mae"] = round(steps[label]["mean_gripper_mae"], 4)
+            for step_key, node in steps.items():
+                flat[f"{prefix}{step_key}_pos_cm"] = node["mean_position_cm"]
+                flat[f"{prefix}{step_key}_rot_deg"] = node["mean_rotation_deg"]
+                flat[f"{prefix}{step_key}_grp_mse"] = node["mean_gripper_mse"]
         inf = r.get("inference", {})
         for key in ("batch_size", "n_batches", "total_s", "per_batch_s", "gpu_peak_gb"):
             if key in inf:

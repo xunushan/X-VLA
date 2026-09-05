@@ -9,7 +9,8 @@ MODEL_ID="${XVLA_MODEL_ID:-X0}"
 CHECKPOINT_ID="${XVLA_CHECKPOINT_ID:-$(basename "${MODEL}")}"
 SPLIT_FILE="${XVLA_SPLIT_FILE:-/data/splits/train_val_split.json}"
 DATA_ROOT="${XVLA_DATA_ROOT:-/data/data/lerobot_v30_ee_6d}"
-OUTPUT_CSV="${XVLA_OUTPUT_CSV:-/data/outputs/${MODEL_ID}_${CHECKPOINT_ID}_predictions.csv}"
+# 默认输出目录按模型独立成夹：/data/outputs/<MODEL_ID>_<CHECKPOINT_ID>/{predictions.csv, *_inference_stats.json, ...}
+OUTPUT_CSV="${XVLA_OUTPUT_CSV:-/data/outputs/${MODEL_ID}_${CHECKPOINT_ID}/predictions.csv}"
 # 默认 batch_size=192：RTX 3090 24GB 实测（见 skill）——GPU 100%、显存峰值 ~21.4GB、
 # ~10.2s/batch 墙钟；B=256 会 OOM。其它 GPU 请先用探针确认上限再覆盖。
 BATCH_SIZE="${XVLA_BATCH_SIZE:-192}"
