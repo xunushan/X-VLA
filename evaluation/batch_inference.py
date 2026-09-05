@@ -177,7 +177,7 @@ def write_predictions(
                 if batch_index % 10 == 0:
                     stream.flush()
                     print(f"[batch_inference] batches={batch_index} predictions={count}")
-    return count
+    return count, batch_index
 
 
 def parse_args() -> argparse.Namespace:
@@ -189,11 +189,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-file", required=True)
     parser.add_argument("--output-csv", required=True)
     parser.add_argument("--meta", default=None)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=192, help="RTX 3090 24GB 建议 192（GPU 100%、峰值 ~21.4GB、~10.2s/batch；256 OOM）")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default=None)
     parser.add_argument("--dtype", choices=("auto", "float32", "bfloat16"), default="auto")
     parser.add_argument("--denoise-steps", type=int, default=10)
+    parser.add_argument(
+        "--stats-json",
+        default=None,
+        help="inference 统计 JSON 路径；默认 <output-csv 同名去掉 .csv>_inference_stats.json",
+    )
     parser.add_argument("--num-views", type=int, default=3)
     parser.add_argument("--domain-id", type=int, default=None)
     # 默认不反转：canonical EE16（指标/baseline 用）gripper 与 X-VLA 20 维原生极性一致，
@@ -220,6 +225,7 @@ def main() -> None:
         print(f"[batch_inference] validation episodes={len(meta['episodes'])}")
         started = time.time()
         model, processor = load_model(args.model, device, dtype)
+        load_s = time.time() - started
         reader = EvalDataReader(
             str(meta_path),
             num_actions=model.num_actions,
@@ -230,14 +236,36 @@ def main() -> None:
             skip_static_samples=False,
             require_full_horizon=True,
         )
-        count = write_predictions(
+        infer_started = time.time()
+        count, n_batches = write_predictions(
             model, processor, reader, args.output_csv, args.model_id, args.checkpoint_id,
             args.batch_size, args.num_workers, device, dtype, args.denoise_steps, args.invert_gripper,
         )
+        inference_s = time.time() - infer_started
+        total_s = time.time() - started
+        stats = {
+            "model_id": args.model_id,
+            "checkpoint_id": args.checkpoint_id,
+            "batch_size": args.batch_size,
+            "n_batches": int(n_batches),
+            "n_predictions": int(count),
+            "model_load_s": round(float(load_s), 2),
+            "inference_s": round(float(inference_s), 2),
+            "total_s": round(float(total_s), 2),
+            "per_batch_s": round(float(inference_s) / n_batches, 2) if n_batches else None,
+            "invert_gripper": bool(args.invert_gripper),
+        }
+        stats_path = Path(args.stats_json) if args.stats_json else Path(
+            str(args.output_csv)[: -len(".csv")] + "_inference_stats.json"
+        )
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"[batch_inference] wrote {count} rows to {args.output_csv} in {total_s:.1f}s "
+              f"(load {load_s:.1f}s + inference {inference_s:.1f}s / {n_batches} batches)")
+        print(f"[batch_inference] stats -> {stats_path}")
     finally:
         if temporary_meta is not None:
             temporary_meta.cleanup()
-    print(f"[batch_inference] wrote {count} rows to {args.output_csv} in {time.time() - started:.1f}s")
 
 
 if __name__ == "__main__":

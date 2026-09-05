@@ -6,9 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sqlite3
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -260,52 +258,12 @@ def aggregate_episode_macro(per_episode: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def write_sqlite(
-    db_path: str | Path,
-    model_id: str,
-    checkpoint_id: str,
-    predictions_csv: str | Path,
-    baseline_csv: str | Path,
-    split_file: str | Path,
-    metrics_json: str | Path,
-) -> None:
-    path = Path(db_path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS offline_evaluations (
-                model_id TEXT NOT NULL,
-                checkpoint_id TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                predictions_csv TEXT NOT NULL,
-                baseline_csv TEXT NOT NULL,
-                split_file TEXT NOT NULL,
-                metrics_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (model_id, checkpoint_id)
-            )"""
-        )
-        conn.execute(
-            """INSERT OR REPLACE INTO offline_evaluations VALUES (?, ?, 'ee', ?, ?, ?, ?, ?)""",
-            (
-                model_id,
-                checkpoint_id,
-                str(Path(predictions_csv).resolve()),
-                str(Path(baseline_csv).resolve()),
-                str(Path(split_file).resolve()),
-                str(Path(metrics_json).resolve()),
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            ),
-        )
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-csv", required=True)
     parser.add_argument("--split-file", required=True)
     parser.add_argument("--predictions-csv", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--sqlite", default=None)
     return parser.parse_args()
 
 
@@ -337,11 +295,6 @@ def main() -> None:
         "task_metrics_csv": str(task_path.resolve()),
     }
     metrics_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    if args.sqlite:
-        write_sqlite(
-            args.sqlite, model_id, checkpoint_id, args.predictions_csv,
-            args.baseline_csv, args.split_file, metrics_path,
-        )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
