@@ -79,8 +79,8 @@ def _validate_args(args: argparse.Namespace) -> None:
                 raise ValueError(f"stage{stage}_{name}_lr must be non-negative")
     if args.stage1_gate_lr != 0 or args.stage1_aux_weight_lr != 0 or args.stage1_aux_bias_lr != 0:
         raise ValueError("Stage A must freeze gates and the auxiliary projection")
-    if args.stage1_transformer_lr != 0 or args.stage1_vlm_lr != 0:
-        raise ValueError("Stage A must freeze Transformer blocks and VLM")
+    if args.stage1_transformer_lr <= 0 or args.stage1_vlm_lr != 0:
+        raise ValueError("Stage A must train Transformer blocks and freeze VLM")
     if args.stage2_gate_lr <= 0 or args.stage2_aux_weight_lr <= 0:
         raise ValueError("Stage B must train gates and aux_visual_proj.weight")
     if args.stage2_transformer_lr != 0 or args.stage2_vlm_lr != 0 or args.stage3_vlm_lr != 0:
@@ -232,7 +232,14 @@ def configure_x2_step(optimizer, step: int, args) -> None:
     previous = {name: 0.0 for name in targets} if stage == 1 else _stage_targets(args, stage - 1)
     warmup = getattr(args, f"stage{stage}_warmup_steps")
     alpha = min(1.0, float(offset + 1) / warmup) if warmup else 1.0
-    lrs = {name: previous[name] + alpha * (target - previous[name]) for name, target in targets.items()}
+    lrs = {
+        name: (
+            0.0
+            if target == 0
+            else previous[name] + alpha * (target - previous[name])
+        )
+        for name, target in targets.items()
+    }
 
     seen = set()
     for group in optimizer.param_groups:
@@ -241,8 +248,9 @@ def configure_x2_step(optimizer, step: int, args) -> None:
             raise KeyError(f"Unexpected optimizer group {name!r}")
         seen.add(name)
         group["lr"] = lrs[name]
-        # A group remains trainable during a downward transition if either endpoint is non-zero.
-        trainable = previous[name] > 0 or targets[name] > 0
+        # A target LR of zero is a hard freeze at the stage boundary. Positive
+        # targets may warm up from zero or transition from the preceding LR.
+        trainable = targets[name] > 0
         for parameter in group["params"]:
             parameter.requires_grad = trainable
     missing = set(lrs) - seen
