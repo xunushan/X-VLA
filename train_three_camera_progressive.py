@@ -141,6 +141,15 @@ def build_x2_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
             "X2 requires non-zero Foundation aux_visual_proj.weight; refusing gate/projection deadlock"
         )
 
+    # HF `from_pretrained` re-initializes parameters that are absent from the loaded
+    # checkpoint, overwriting the config-driven `torch.full(logit=-4)` in __init__ with
+    # ~0/arbitrary values. On a fresh run the gates must start near-closed (sigmoid(-4)
+    # ~ 0.018) so stage B opens the wrist views gradually; re-assert the init here.
+    # On resume the logits come from the checkpoint and must not be touched.
+    if getattr(_ARGS, "resume", None) is None:
+        with torch.no_grad():
+            model.aux_view_gate_logits.fill_(float(_ARGS.aux_gate_init_logit))
+
     domain_parameters = {
         "soft_prompt": transformer.soft_prompt_hub.weight,
         "action_encoder_fc": transformer.action_encoder.fc.weight,

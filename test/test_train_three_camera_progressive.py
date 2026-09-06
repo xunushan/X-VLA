@@ -120,6 +120,25 @@ def test_optimizer_keeps_foundation_aux_weights_and_guards_domain_rows():
     assert torch.count_nonzero(prompt_grad[2]) == 0
 
 
+def test_gate_logits_reasserted_to_init_on_fresh_but_kept_on_resume():
+    # HF from_pretrained re-inits params missing from the checkpoint (gate logits come out
+    # ~0/arbitrary instead of the config -4). Fresh runs must re-assert -4 so stage B opens
+    # wrist views from ~0.018; resume must keep whatever the checkpoint stored.
+    model = TinyModel()
+    with torch.no_grad():
+        model.aux_view_gate_logits.fill_(0.0)
+    trainer._ARGS = _args()
+    trainer.build_x2_optimizer(model, 1e-4, 0.0)
+    assert torch.allclose(model.aux_view_gate_logits, torch.full((2,), -4.0))
+
+    model = TinyModel()
+    with torch.no_grad():
+        model.aux_view_gate_logits.fill_(123.0)
+    trainer._ARGS = _args(resume="latest")
+    trainer.build_x2_optimizer(model, 1e-4, 0.0)
+    assert torch.allclose(model.aux_view_gate_logits, torch.full((2,), 123.0))
+
+
 def test_stage_groups_warmups_and_boundaries():
     model = TinyModel()
     args = _args()
