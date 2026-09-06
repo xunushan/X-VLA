@@ -85,6 +85,20 @@ def test_stage_a_masks_wrists_without_mutating_source_batch():
     assert torch.all(trainer.prepare_x2_batch(source, 10, args)["image_mask"])
 
 
+@pytest.mark.parametrize(
+    "stage1_end,stage2_end,iters",
+    [
+        (8000, 8000, 8000),
+        (6000, 18000, 18000),
+        (8000, 18000, 30000),
+    ],
+)
+def test_stage_by_stage_boundaries_are_valid(stage1_end, stage2_end, iters):
+    trainer._validate_args(
+        _args(stage1_end=stage1_end, stage2_end=stage2_end, iters=iters)
+    )
+
+
 def test_optimizer_keeps_foundation_aux_weights_and_guards_domain_rows():
     model = TinyModel()
     original = model.transformer.aux_visual_proj.weight.detach().clone()

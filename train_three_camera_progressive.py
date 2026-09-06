@@ -52,8 +52,12 @@ def get_args_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if not 0 < args.stage1_end < args.stage2_end < args.iters:
-        raise ValueError("Require 0 < stage1_end < stage2_end < iters")
+    # Equality is intentional for stage-by-stage launches: an A-only run uses
+    # stage1_end == stage2_end == iters, while an A+B run uses
+    # stage2_end == iters.  A later full-state resume can then extend `iters`
+    # without executing even one update from the next stage prematurely.
+    if not 0 < args.stage1_end <= args.stage2_end <= args.iters:
+        raise ValueError("Require 0 < stage1_end <= stage2_end <= iters")
     stage_lengths = (
         args.stage1_end,
         args.stage2_end - args.stage1_end,
@@ -61,7 +65,9 @@ def _validate_args(args: argparse.Namespace) -> None:
     )
     for stage, length in enumerate(stage_lengths, start=1):
         warmup = getattr(args, f"stage{stage}_warmup_steps")
-        if not 0 <= warmup <= length:
+        # A zero-length future stage is valid in a stage-by-stage launch; its
+        # warmup is retained in the command for the later resume invocation.
+        if length > 0 and not 0 <= warmup <= length:
             raise ValueError(
                 f"stage{stage}_warmup_steps={warmup} outside stage length {length}"
             )
