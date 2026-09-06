@@ -30,6 +30,9 @@ METRIC_NAMES = (
     "right_gripper_mse",
 )
 
+LEAD_STEPS = (1, 10, 20, 30)
+EXECUTION_WINDOW = 30
+
 
 def split_metadata(path: str | Path) -> tuple[set[int], dict[int, int], dict[int, str]]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -102,13 +105,6 @@ def add_error(accumulator: dict, key: tuple, error: dict[str, float]) -> None:
         cell[name] += value
 
 
-def add_error_sum(accumulator: dict, key: tuple, sums: dict[str, float], count: int) -> None:
-    cell = accumulator[key]
-    cell["comparisons"] += count
-    for name, value in sums.items():
-        cell[name] += value
-
-
 def load_inputs(
     baseline_csv: str | Path, split_file: str | Path, predictions_csv: str | Path
 ) -> tuple[pd.DataFrame, pd.DataFrame, str, str, int, dict[int, str]]:
@@ -128,7 +124,11 @@ def load_inputs(
     if baseline["task_index"].isna().any():
         raise ValueError("some validation rows have no task_index")
     baseline["task_index"] = baseline["task_index"].astype(int)
-    baseline["stage"] = baseline["stage"].astype(str) if "stage" in baseline else "__all__"
+    if "stage" in baseline:
+        baseline["stage"] = baseline["stage"].fillna("__unlabeled__").astype(str)
+        baseline.loc[baseline["stage"].str.strip() == "", "stage"] = "__unlabeled__"
+    else:
+        baseline["stage"] = "__all__"
     baseline["action_array"] = baseline["action"].map(lambda value: parse_vector(value, 16))
 
     predictions = pd.read_csv(predictions_csv)
@@ -149,6 +149,10 @@ def load_inputs(
     if len(model_ids) != 1 or len(checkpoint_ids) != 1 or len(horizons) != 1:
         raise ValueError("one prediction CSV must contain one model, checkpoint, and action_horizon")
     horizon = int(horizons[0])
+    if horizon < EXECUTION_WINDOW:
+        raise ValueError(
+            f"action_horizon={horizon} is shorter than execution_window={EXECUTION_WINDOW}"
+        )
     predictions["episode_index"] = predictions["episode_index"].astype(int)
     predictions["frame_index"] = predictions["frame_index"].astype(int)
     if not set(predictions["episode_index"]) <= validation:
@@ -176,6 +180,10 @@ def load_inputs(
 
 
 def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    if horizon < EXECUTION_WINDOW:
+        raise ValueError(
+            f"action_horizon={horizon} is shorter than execution_window={EXECUTION_WINDOW}"
+        )
     accumulator = defaultdict(lambda: defaultdict(float))
     base_by_episode = {
         int(episode): group.set_index("frame_index")
@@ -191,31 +199,26 @@ def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: i
             anchor = int(row.frame_index)
             if anchor not in expert_rows.index:
                 raise ValueError(f"prediction anchor missing from baseline: episode={episode} frame={anchor}")
-            stage = str(expert_rows.loc[anchor, "stage"])
             predicted = row.prediction_array
-            errors_by_lead = []
-            for lead in range(1, horizon + 1):
+            execution_errors = []
+            for lead in range(1, EXECUTION_WINDOW + 1):
                 target = anchor + lead
-                if target not in expert_rows.index:
-                    break
                 error = ee_errors(predicted[lead - 1], expert_rows.loc[target, "action_array"])
-                errors_by_lead.append(error)
-                for stage_key in {"__all__", stage}:
+                target_stage = str(expert_rows.loc[target, "stage"])
+                execution_errors.append((error, target_stage))
+                if lead not in LEAD_STEPS:
+                    continue
+                for stage_key in {"__all__", target_stage}:
                     add_error(accumulator, (episode, task_index, "lead", lead, stage_key), error)
 
-            prefix = {name: 0.0 for name in METRIC_NAMES}
-            for window, error in enumerate(errors_by_lead, start=1):
-                for name in METRIC_NAMES:
-                    prefix[name] += error[name]
-                if anchor % window != 0:
-                    continue
-                for stage_key in {"__all__", stage}:
-                    add_error_sum(
-                        accumulator,
-                        (episode, task_index, "execution", window, stage_key),
-                        prefix,
-                        window,
-                    )
+            if anchor % EXECUTION_WINDOW == 0:
+                for error, target_stage in execution_errors:
+                    for stage_key in {"__all__", target_stage}:
+                        add_error(
+                            accumulator,
+                            (episode, task_index, "execution", EXECUTION_WINDOW, stage_key),
+                            error,
+                        )
 
     records = []
     for (episode, task, curve, step, stage), values in accumulator.items():
@@ -237,25 +240,34 @@ def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: i
 
 def aggregate_episode_macro(per_episode: pd.DataFrame) -> pd.DataFrame:
     keys = ["task_index", "stage", "curve", "step"]
-    rows = []
+    task_rows = []
     for key, group in per_episode.groupby(keys, sort=True):
         record = dict(zip(keys, key, strict=True))
+        record["aggregation_level"] = "task"
+        record["macro_unit"] = "episode"
         record["num_episodes"] = int(group["episode_index"].nunique())
+        record["num_tasks"] = 1
         record["comparisons"] = int(group["comparisons"].sum())
         for metric in METRIC_NAMES:
             record[metric] = float(group[metric].mean())
-            record[f"{metric}_episode_std"] = float(group[metric].std(ddof=0))
-        rows.append(record)
+            record[f"{metric}_std"] = float(group[metric].std(ddof=0))
+        task_rows.append(record)
+
+    by_task = pd.DataFrame(task_rows)
     overall_keys = ["stage", "curve", "step"]
-    for key, group in per_episode.groupby(overall_keys, sort=True):
+    overall_rows = []
+    for key, group in by_task.groupby(overall_keys, sort=True):
         record = {"task_index": -1, **dict(zip(overall_keys, key, strict=True))}
-        record["num_episodes"] = int(group["episode_index"].nunique())
+        record["aggregation_level"] = "overall"
+        record["macro_unit"] = "task"
+        record["num_episodes"] = int(group["num_episodes"].sum())
+        record["num_tasks"] = int(group["task_index"].nunique())
         record["comparisons"] = int(group["comparisons"].sum())
         for metric in METRIC_NAMES:
             record[metric] = float(group[metric].mean())
-            record[f"{metric}_episode_std"] = float(group[metric].std(ddof=0))
-        rows.append(record)
-    return pd.DataFrame(rows)
+            record[f"{metric}_std"] = float(group[metric].std(ddof=0))
+        overall_rows.append(record)
+    return pd.concat([by_task, pd.DataFrame(overall_rows)], ignore_index=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -286,6 +298,10 @@ def main() -> None:
         "checkpoint_id": checkpoint_id,
         "action_type": "ee",
         "action_horizon": horizon,
+        "lead_steps": list(LEAD_STEPS),
+        "execution_window": EXECUTION_WINDOW,
+        "aggregation": ["frame", "episode", "task", "overall"],
+        "stage_assignment": "target_frame",
         "validation_episodes": int(per_episode["episode_index"].nunique()),
         "task_names": task_names,
         "baseline_csv": str(Path(args.baseline_csv).resolve()),

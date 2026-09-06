@@ -128,7 +128,7 @@ def write_predictions(
     dtype: torch.dtype,
     denoise_steps: int,
     invert_gripper: bool,
-) -> int:
+) -> tuple[int, int]:
     loader_options = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -143,11 +143,13 @@ def write_predictions(
     output = Path(output_csv)
     output.parent.mkdir(parents=True, exist_ok=True)
     count = 0
+    batch_count = 0
     with output.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
         writer.writeheader()
         with torch.inference_mode():
             for batch_index, batch in enumerate(loader, start=1):
+                batch_count = batch_index
                 predicted = model.generate_actions(
                     **batch_inputs(processor, batch, device, dtype), steps=denoise_steps
                 )
@@ -177,7 +179,7 @@ def write_predictions(
                 if batch_index % 10 == 0:
                     stream.flush()
                     print(f"[batch_inference] batches={batch_index} predictions={count}")
-    return count, batch_index
+    return count, batch_count
 
 
 def parse_args() -> argparse.Namespace:

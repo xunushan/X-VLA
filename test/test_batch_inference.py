@@ -50,12 +50,13 @@ def test_validation_episodes_goai_split(tmp_path):
 
 def test_write_predictions_streams_canonical_csv(tmp_path):
     output = tmp_path / "predictions.csv"
-    count = write_predictions(
+    count, batch_count = write_predictions(
         FakeModel(), FakeProcessor(), Reader(), output, "X0", "ckpt-10",
         batch_size=2, num_workers=0, device=torch.device("cpu"), dtype=torch.float32,
         denoise_steps=1, invert_gripper=False,
     )
     assert count == 3
+    assert batch_count == 2
     with output.open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert rows[0]["model_id"] == "X0"

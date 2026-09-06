@@ -30,13 +30,13 @@ LEAD_CURVE = "lead"
 EXEC_CURVE = "execution"
 # 精简后的节点字段集（与用户确认）：只留 mean 级位置/旋转误差 + MSE，gripper 统一 MSE。
 LEAD_STEPS = ("1", "10", "20", "30")
-EXEC_STEPS = ("10", "15", "30")
+EXEC_STEPS = ("30",)
 
 
 def build_metrics_node(rows: pd.DataFrame) -> dict:
     """Nest by_task rows into {stage: {curve: {step: {mean_* metric, comparisons}}}}.
 
-    lead 只保留 1/10/20/30，execution 只保留 10/15/30；mean_mse 由 evaluate 输出的
+    lead 只保留 1/10/20/30，execution 只保留 30；mean_mse 由 evaluate 输出的
     per-side (left/right) 平方误差取平均得到；数值四舍五入到 4 位小数省体积。
     """
     keep = {LEAD_CURVE: LEAD_STEPS, EXEC_CURVE: EXEC_STEPS}
