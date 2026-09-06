@@ -45,7 +45,7 @@ def _args(**overrides):
     }
     stage_values = {
         1: (0, 0, 0, 1e-5, 1e-4, 1e-4, 0),
-        2: (3e-4, 5e-5, 1e-6, 2e-6, 2e-5, 0, 0),
+        2: (3e-4, 5e-5, 1e-6, 2e-6, 2e-5, 1e-5, 0),
         3: (5e-5, 2e-5, 5e-7, 2e-6, 2e-5, 5e-6, 0),
     }
     for stage, row in stage_values.items():
@@ -156,11 +156,12 @@ def test_stage_groups_warmups_and_boundaries():
     assert _lrs(optimizer)["view_gates"] == pytest.approx(1.5e-4)
     assert _lrs(optimizer)["action_encoder"] == pytest.approx(6e-5)
     assert model.aux_view_gate_logits.requires_grad
-    assert not model.transformer.blocks[0].weight.requires_grad
+    assert _lrs(optimizer)["transformer_core"] == pytest.approx(5.5e-5)
+    assert model.transformer.blocks[0].weight.requires_grad
 
     trainer.configure_x2_step(optimizer, 20, args)
     assert _lrs(optimizer)["view_gates"] == pytest.approx(1.75e-4)
-    assert _lrs(optimizer)["transformer_core"] == pytest.approx(2.5e-6)
+    assert _lrs(optimizer)["transformer_core"] == pytest.approx(7.5e-6)
     assert model.transformer.blocks[0].weight.requires_grad
 
     trainer.configure_x2_step(optimizer, 21, args)

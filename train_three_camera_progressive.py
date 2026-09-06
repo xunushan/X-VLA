@@ -83,8 +83,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Stage A must train Transformer blocks and freeze VLM")
     if args.stage2_gate_lr <= 0 or args.stage2_aux_weight_lr <= 0:
         raise ValueError("Stage B must train gates and aux_visual_proj.weight")
-    if args.stage2_transformer_lr != 0 or args.stage2_vlm_lr != 0 or args.stage3_vlm_lr != 0:
-        raise ValueError("X2 v1 freezes Transformer in B and VLM in every stage")
+    if args.stage2_transformer_lr <= 0:
+        raise ValueError("Stage B must keep Transformer blocks trainable")
+    if args.stage2_vlm_lr != 0 or args.stage3_vlm_lr != 0:
+        raise ValueError("X2 v1 freezes VLM in every stage")
     if args.stage3_transformer_lr <= 0:
         raise ValueError("Stage C must open Transformer blocks with a positive LR")
     if args.aux_projection_init != "foundation":
