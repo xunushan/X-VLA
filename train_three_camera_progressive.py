@@ -48,6 +48,16 @@ def get_args_parser() -> argparse.ArgumentParser:
             "vlm",
         ):
             parser.add_argument(f"--stage{stage}_{name}_lr", type=float, required=True)
+    parser.add_argument(
+        "--stage3_vlm_vision_last_blocks",
+        type=int,
+        default=2,
+        help=(
+            "In stage C, train only the last N residual blocks in DaViT forward "
+            "order, spanning stage boundaries when needed. All other Florence2/VLM "
+            "parameters remain hard-frozen."
+        ),
+    )
     return parser
 
 
@@ -85,8 +95,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Stage B must train gates and aux_visual_proj.weight")
     if args.stage2_transformer_lr <= 0:
         raise ValueError("Stage B must keep Transformer blocks trainable")
-    if args.stage2_vlm_lr != 0 or args.stage3_vlm_lr != 0:
-        raise ValueError("X2 v1 freezes VLM in every stage")
+    if args.stage2_vlm_lr != 0:
+        raise ValueError("X2 stages A/B must freeze the complete VLM")
+    if args.stage3_vlm_lr <= 0:
+        raise ValueError("Stage C must train the selected final vision blocks with a positive VLM LR")
+    if args.stage3_vlm_vision_last_blocks <= 0:
+        raise ValueError("stage3_vlm_vision_last_blocks must be positive")
     if args.stage3_transformer_lr <= 0:
         raise ValueError("Stage C must open Transformer blocks with a positive LR")
     if args.aux_projection_init != "foundation":
@@ -128,6 +142,43 @@ def _group(name: str, params, *, weight_decay=0.0, monitor_domain=None) -> dict:
     return group
 
 
+def _mark_stage3_vision_parameters(model, last_blocks: int) -> tuple[list[str], int, int]:
+    """Mark only the final residual blocks in Florence2/DaViT forward order.
+
+    The optimizer continues to own every VLM parameter so an A/B full-state
+    checkpoint can be resumed without changing optimizer group membership.
+    Stage C uses this marker solely to toggle ``requires_grad`` selectively.
+    """
+    vision_tower = getattr(model.vlm, "vision_tower", None)
+    stages = getattr(vision_tower, "blocks", None)
+    if stages is None or len(stages) == 0:
+        raise ValueError("Florence2 VLM does not expose vision_tower.blocks")
+    residual_blocks = []
+    for stage_index, stage in enumerate(stages):
+        residual_blocks.extend(
+            (f"vision_tower.blocks.{stage_index}.{block_index}", block)
+            for block_index, block in enumerate(stage.children())
+        )
+    if not residual_blocks:
+        raise ValueError("Florence2 DaViT contains no residual blocks")
+    if last_blocks > len(residual_blocks):
+        raise ValueError(
+            f"Requested {last_blocks} final vision blocks, but DaViT contains "
+            f"only {len(residual_blocks)} residual blocks"
+        )
+
+    for parameter in model.vlm.parameters():
+        parameter._x2_stage3_vlm_trainable = False
+    selected = []
+    selected_names = []
+    for block_name, block in residual_blocks[-last_blocks:]:
+        selected_names.append(block_name)
+        for parameter in block.parameters():
+            parameter._x2_stage3_vlm_trainable = True
+            selected.append(parameter)
+    return selected_names, len(selected), sum(parameter.numel() for parameter in selected)
+
+
 def build_x2_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=1.0):
     del lr, lr_coef_soft
     if _ARGS is None:
@@ -162,6 +213,10 @@ def build_x2_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
     for name, parameter in domain_parameters.items():
         _mask_domain_row(parameter, _ARGS.target_domain, name)
 
+    vision_block_names, vision_parameter_tensors, vision_parameter_count = (
+        _mark_stage3_vision_parameters(model, _ARGS.stage3_vlm_vision_last_blocks)
+    )
+
     groups = [
         _group("view_gates", [model.aux_view_gate_logits]),
         _group("aux_visual_weight", [aux.weight]),
@@ -195,7 +250,9 @@ def build_x2_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
     gates = torch.sigmoid(model.aux_view_gate_logits.detach().float()).tolist()
     print(
         f"[x2] optimizer selected {selected:,}/{total:,} parameters; "
-        f"target_domain={_ARGS.target_domain}; aux_projection_init=foundation; gates={gates}"
+        f"target_domain={_ARGS.target_domain}; aux_projection_init=foundation; gates={gates}; "
+        f"stage3_vision_blocks={vision_block_names}; "
+        f"stage3_vision_params={vision_parameter_count:,} ({vision_parameter_tensors} tensors)"
     )
     return optimizer
 
@@ -254,7 +311,12 @@ def configure_x2_step(optimizer, step: int, args) -> None:
         # targets may warm up from zero or transition from the preceding LR.
         trainable = targets[name] > 0
         for parameter in group["params"]:
-            parameter.requires_grad = trainable
+            if name == "vlm":
+                parameter.requires_grad = trainable and bool(
+                    getattr(parameter, "_x2_stage3_vlm_trainable", False)
+                )
+            else:
+                parameter.requires_grad = trainable
     missing = set(lrs) - seen
     if missing:
         raise KeyError(f"Missing optimizer groups: {sorted(missing)}")

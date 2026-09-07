@@ -27,7 +27,15 @@ class TinyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.transformer = TinyTransformer()
-        self.vlm = nn.Linear(4, 4)
+        self.vlm = nn.Module()
+        self.vlm.vision_tower = nn.Module()
+        self.vlm.vision_tower.blocks = nn.ModuleList(
+            [
+                nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4), nn.Linear(4, 4)),
+                nn.Sequential(nn.Linear(4, 4)),
+            ]
+        )
+        self.vlm.language_model = nn.Linear(4, 4)
         self.aux_view_gate_logits = nn.Parameter(torch.full((2,), -4.0))
 
 
@@ -42,11 +50,12 @@ def _args(**overrides):
         "stage3_warmup_steps": 2,
         "aux_gate_init_logit": -4.0,
         "aux_projection_init": "foundation",
+        "stage3_vlm_vision_last_blocks": 2,
     }
     stage_values = {
         1: (0, 0, 0, 1e-5, 1e-4, 1e-4, 0),
         2: (3e-4, 5e-5, 1e-6, 2e-6, 2e-5, 1e-5, 0),
-        3: (5e-5, 2e-5, 5e-7, 2e-6, 2e-5, 5e-6, 0),
+        3: (3e-4, 2e-5, 5e-7, 5e-6, 5e-5, 3e-5, 1e-6),
     }
     for stage, row in stage_values.items():
         for name, value in zip(trainer._LR_NAMES, row):
@@ -160,13 +169,21 @@ def test_stage_groups_warmups_and_boundaries():
     assert model.transformer.blocks[0].weight.requires_grad
 
     trainer.configure_x2_step(optimizer, 20, args)
-    assert _lrs(optimizer)["view_gates"] == pytest.approx(1.75e-4)
-    assert _lrs(optimizer)["transformer_core"] == pytest.approx(7.5e-6)
+    assert _lrs(optimizer)["view_gates"] == pytest.approx(3e-4)
+    assert _lrs(optimizer)["transformer_core"] == pytest.approx(2e-5)
+    assert _lrs(optimizer)["vlm"] == pytest.approx(5e-7)
+    penultimate_stage = model.vlm.vision_tower.blocks[-2]
+    final_stage = model.vlm.vision_tower.blocks[-1]
+    assert not penultimate_stage[1].weight.requires_grad
+    assert penultimate_stage[2].weight.requires_grad
+    assert final_stage[0].weight.requires_grad
+    assert not model.vlm.language_model.weight.requires_grad
     assert model.transformer.blocks[0].weight.requires_grad
 
     trainer.configure_x2_step(optimizer, 21, args)
-    assert _lrs(optimizer)["view_gates"] == pytest.approx(5e-5)
-    assert _lrs(optimizer)["transformer_core"] == pytest.approx(5e-6)
+    assert _lrs(optimizer)["view_gates"] == pytest.approx(3e-4)
+    assert _lrs(optimizer)["transformer_core"] == pytest.approx(3e-5)
+    assert _lrs(optimizer)["vlm"] == pytest.approx(1e-6)
 
 
 def test_forced_boundary_checkpoints_and_config_setup():
@@ -187,6 +204,8 @@ def test_invalid_x2_contract_fails_fast():
         trainer._validate_args(_args(stage1_gate_lr=1e-4))
     with pytest.raises(ValueError, match="Stage C must open Transformer"):
         trainer._validate_args(_args(stage3_transformer_lr=0))
+    with pytest.raises(ValueError, match="final vision blocks"):
+        trainer._validate_args(_args(stage3_vlm_lr=0))
     with pytest.raises(ValueError, match="does not have"):
         trainer.configure_x2_model_config(
             SimpleNamespace(use_aux_view_gates=False, num_aux_views=2),
