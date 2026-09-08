@@ -37,7 +37,6 @@ def _args(**overrides):
         continuation_warmup_steps=0,
         _continuation_warmup_start=None,
         resume=None,
-        keep_aux_init=False,
     )
     values.update(overrides)
     return Namespace(**values)

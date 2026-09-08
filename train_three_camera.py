@@ -47,11 +47,6 @@ def get_args_parser() -> argparse.ArgumentParser:
             "steps starting at the restored global step. Full-state resume does not restart warmup."
         ),
     )
-    parser.add_argument(
-        "--keep_aux_init",
-        action="store_true",
-        help="Do not zero aux_visual_proj.weight on a fresh run (debug/ablation only).",
-    )
     return parser
 
 
@@ -131,10 +126,11 @@ def build_three_camera_optimizer(
         )
 
     # build_optimizer is called after pretrained weights are loaded and before
-    # optimizer-state restore.  Zero only for a new fine-tuning run.
+    # optimizer-state restore. A fresh X1 run always starts with a zero auxiliary
+    # projection weight; this is an invariant, not a user-facing switch.
     model_id = id(model)
     if model_id not in _INITIALIZED_MODEL_IDS:
-        if not _ARGS.resume and not _ARGS.keep_aux_init:
+        if not _ARGS.resume:
             with torch.no_grad():
                 aux.weight.zero_()
         _INITIALIZED_MODEL_IDS.add(model_id)
@@ -208,7 +204,7 @@ def build_three_camera_optimizer(
     print(
         f"[three-camera] optimizer selected {selected:,}/{total:,} parameters; "
         f"target_domain={_ARGS.target_domain}; aux_zeroed="
-        f"{not _ARGS.resume and not _ARGS.keep_aux_init}"
+        f"{not _ARGS.resume}"
     )
     return optimizer
 
