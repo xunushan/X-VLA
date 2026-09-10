@@ -121,35 +121,10 @@ class EE6DActionSpace(BaseActionSpace):
     ROT_IDX_1 = (3, 4, 5, 6, 7, 8)
     ROT_IDX_2 = (13, 14, 15, 16, 17, 18)
 
-    # 逐 action step 位置损失权重（step 从 1 计数）→ (lo_step, hi_step, weight)。
-    # 强调 action chunk 近端步：前 10 步 2.0、11-15 步 1.5、16-30 步 1.0；>30 步默认 1.0。
-    STEP_WEIGHTS = ((1, 10, 2.0), (11, 15, 1.5), (16, 30, 1.0))
-
     def __init__(self):
         super().__init__()
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
-
-    def _step_weights(self, T: int, device, dtype) -> torch.Tensor:
-        """构造逐 step 权重（[T]，归一化到均值 1.0）。
-
-        归一化后开启加权时 loss 量级与现状相当（仅重新分配 step 间权重）：
-        各段实际权重 = 2.0/1.5/1.0 ÷ mean([2.0]*10+[1.5]*5+[1.0]*15) ≈ 1.41/1.06/0.71。
-        权重全 1 时除以均值恒为 1 → 结果与无加权逐 bit 一致。
-        """
-        w = torch.ones(T, device=device, dtype=dtype)
-        for lo, hi, val in self.STEP_WEIGHTS:
-            a, b = max(0, lo - 1), min(T, hi)
-            if b > a:
-                w[a:b] = val
-        return w / w.mean()
-
-    def _weighted_step_mse(self, pred, target, idx) -> torch.Tensor:
-        """按 step 加权的 MSE：se[b,t,c] * w[t] 后整体 mean（w 已归一化到均值 1）。"""
-        T = pred.shape[1]
-        se = (pred[:, :, idx] - target[:, :, idx]) ** 2
-        w = self._step_weights(T, pred.device, pred.dtype).view(1, T, 1)
-        return (se * w).mean()
 
     def compute_loss(self, pred, target):
         assert pred.shape == target.shape, "pred/target shapes must match"
@@ -161,17 +136,10 @@ class EE6DActionSpace(BaseActionSpace):
         gripper_loss = sum(g_losses) / len(self.gripper_idx) * self.GRIPPER_SCALE
 
         # XYZ position
-        if getattr(self, "use_step_weights", False):
-            # 按 action step 加权（近端步更高权重，归一化到均值 1 保持量级）
-            pos_loss = (
-                self._weighted_step_mse(pred, target, self.POS_IDX_1) +
-                self._weighted_step_mse(pred, target, self.POS_IDX_2)
-            ) * self.XYZ_SCALE
-        else:
-            pos_loss = (
-                self.mse(pred[:, :, self.POS_IDX_1], target[:, :, self.POS_IDX_1]) +
-                self.mse(pred[:, :, self.POS_IDX_2], target[:, :, self.POS_IDX_2])
-            ) * self.XYZ_SCALE
+        pos_loss = (
+            self.mse(pred[:, :, self.POS_IDX_1], target[:, :, self.POS_IDX_1]) +
+            self.mse(pred[:, :, self.POS_IDX_2], target[:, :, self.POS_IDX_2])
+        ) * self.XYZ_SCALE
 
         # Rotation 6D
         rot_loss = (
