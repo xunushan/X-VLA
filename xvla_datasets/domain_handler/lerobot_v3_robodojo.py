@@ -77,7 +77,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         self.meta.setdefault("datalist", self.build_datalist(meta))
         self.episodes: Dict[int, dict] = self._load_episodes()
         self._pq_cache: Dict[str, dict] = {}
-        # frame_weight 列缺失告警（per-handler 一次；DataLoader 每 worker 一个 handler 实例）
+        # frame_weight_sampling 列缺失告警（per-handler 一次；DataLoader 每 worker 一个 handler 实例）
         self._warned_missing_frame_weight = False
 
     # ------------------------------------------------------------------ meta 加载
@@ -133,14 +133,14 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         return np.stack(data["observation.state"][lo:hi]).astype(np.float32)
 
     def _read_frame_weight(self, ep: dict) -> np.ndarray | None:
-        """读取该 episode 的 frame_weight（与 observation.state 同行对齐，逐帧采样权重）。
+        """读取该 episode 的 frame_weight_sampling（与 observation.state 同行对齐，逐帧采样权重）。
 
-        与 _read_state 同一定位方式（同表同 [lo:hi] 切片）；主表无 frame_weight 列时返回
-        None（旧数据），调用方负责兜底。
+        与 _read_state 同一定位方式（同表同 [lo:hi] 切片）；主表无 frame_weight_sampling
+        列时返回 None，调用方负责兜底。
         """
         ci, fi = int(ep["data/chunk_index"]), int(ep["data/file_index"])
         data = self._read_parquet(f"chunk-{ci:03d}/file-{fi:03d}.parquet")
-        fw = data.get("frame_weight")
+        fw = data.get("frame_weight_sampling")
         if fw is None:
             return None
         lo, hi = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
@@ -149,16 +149,16 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
     def _read_is_key_frame(self, ep: dict) -> np.ndarray | None:
         """读取该 episode 的 is_key_frame（0/1，与 observation.state 同行对齐）。
 
-        与 _read_frame_weight 同一定位方式。主表无 is_key_frame 列时从 frame_weight
-        推导（fw > 1.0 视为 key 帧，与 tools/add_frame_weight.py 的 key 阈值一致）；
-        两列都缺失返回 None（旧数据），调用方跳过该字段。
+        与 _read_frame_weight 同一定位方式。主表无 is_key_frame 列时从
+        frame_weight_sampling 推导（fw > 1.0 视为 key 帧，与 tools/add_frame_weight.py
+        的 key 阈值一致）；两列都缺失返回 None，调用方跳过该字段。
         """
         ci, fi = int(ep["data/chunk_index"]), int(ep["data/file_index"])
         data = self._read_parquet(f"chunk-{ci:03d}/file-{fi:03d}.parquet")
         lo, hi = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
         is_key = data.get("is_key_frame")
         if is_key is None:
-            fw = data.get("frame_weight")
+            fw = data.get("frame_weight_sampling")
             if fw is None:
                 return None
             return (np.asarray(fw[lo:hi], dtype=np.float64) > 1.0).astype(np.int64)
@@ -367,14 +367,14 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             if not idxs:
                 return
         if training and use_frame_weight:
-            # frame_weight 有放回采样：直接对全部候选帧按 frame_weight 归一化概率抽样。
+            # frame_weight_sampling 有放回采样：直接对全部候选帧按权重归一化概率抽样。
             # 高权重帧不会静止，无需预过滤静止候选（省去对每个候选预计算 seq 的开销）；
             # 权重落到的静止帧由下方现有判据 inline skip（低权重帧，影响可忽略）。
             # 抽取次数 = 候选数，样本总量≈现状。帧权重与 state 同表同行，截断到公共长度 T 后索引对齐。
             fw = self._read_frame_weight(ep)
             if fw is None:
                 raise RuntimeError(
-                    f"--frame_weight_sampling requires a valid 'frame_weight' column; "
+                    f"--frame_weight_sampling requires a valid 'frame_weight_sampling' column; "
                     f"missing for episode {ep_idx}. Run tools/add_frame_weight.py verify first."
                 )
             else:
@@ -383,14 +383,15 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                 w = np.asarray([fw[i] for i in idxs], dtype=np.float64)
                 if not np.isfinite(w).all() or (w <= 0).any():
                     raise ValueError(
-                        f"Invalid frame_weight for episode {ep_idx}: values must be finite and > 0"
+                        f"Invalid frame_weight_sampling for episode {ep_idx}: "
+                        f"values must be finite and > 0"
                     )
                 w = np.clip(w, 1e-8, None)  # 防全 0 / 非正权重
                 idxs = np.random.choice(idxs, size=len(idxs), replace=True, p=w / w.sum()).tolist()
         elif training:
             random.shuffle(idxs)
 
-        # 逐帧 key 标记（0/1）：与 frame_weight 同源同表，随样本输出供统计 batch key 帧占比
+        # 逐帧 key 标记（0/1）：与 frame_weight_sampling 同源同表，随样本输出供统计 batch key 帧占比
         key_status = self._read_is_key_frame(ep)
 
         ins = self._instruction(ep)
@@ -436,7 +437,7 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                 "abs_trajectory": seq,
             }
             # is_key_frame 随样本输出（batch key 帧占比统计用）：主表无 is_key_frame 列时
-            # 由 _read_is_key_frame 从 frame_weight 推导兜底，两列都缺失才不携带该字段
+            # 由 _read_is_key_frame 从 frame_weight_sampling 推导兜底，两列都缺失才不携带该字段
             if key_status is not None:
                 sample["is_key_frame"] = int(key_status[idx])
             # frame_info 为评估用 opt-in：训练路径不传（默认 False）→ 样本 dict 不变

@@ -58,7 +58,7 @@ class InfiniteDataReader(IterableDataset):
         self.training = training
         self.num_actions = num_actions
         self.action_mode = action_mode
-        # lerobot v3.0 逐帧采样权重（data/*.parquet frame_weight 列）：开启后高权重帧有放回过采样
+        # lerobot v3.0 逐帧采样权重（data/*.parquet frame_weight_sampling 列）：开启后高权重帧有放回过采样
         self.use_frame_weight = use_frame_weight
         self.return_frame_info = return_frame_info
         self.sample_allowlist = sample_allowlist
@@ -130,7 +130,7 @@ class InfiniteDataReader(IterableDataset):
         else: robot_type = dataset_name
         Handler = get_handler_cls(robot_type)
         handler = Handler(meta=meta, num_views=self.num_views)
-        # frame_weight 采样是 lerobot v3.0 专属能力（其他 handler 的 iter_episode 未必带
+        # frame_weight_sampling 采样是 lerobot v3.0 专属能力（其他 handler 的 iter_episode 未必带
         # **kwargs，不能全局透传），仅在 v3.0 数据集上转发
         ep_kwargs = {"use_frame_weight": self.use_frame_weight} \
             if meta.get("codebase_version") == "v3.0" else {}

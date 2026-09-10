@@ -1,16 +1,16 @@
 #!/usr/bin/env python
-"""给 lerobot v3.0 主表 parquet 添加逐帧采样权重列 `frame_weight` 与 `is_key_frame`（K1 用）。
+"""给 lerobot v3.0 主表 parquet 添加逐帧采样权重列 `frame_weight_sampling` 与 `is_key_frame`。
 
 背景（docs/k1_k2_postprocessing_plan.md）：
   K1 关键帧重采样通过 `--frame_weight_sampling` 开启，数据侧要求主表
   `data/chunk-{ci:03d}/file-{fi:03d}.parquet`（与 observation.state 同表同行）
-  存在 `frame_weight` 列。本脚本从 CSV（默认 /data/data/lerobot_v30_ee.csv）
+  存在 `frame_weight_sampling` 列。本脚本从 CSV（默认 /data/data/lerobot_v30_ee.csv）
   读取逐帧权重并写入训练数据集（默认 /data/data/lerobot_v30_ee_6d）的主表。
-  同时写入 `is_key_frame` 列（0/1，key 帧 = frame_weight 超过普通帧权重阈值），
+  同时写入 `is_key_frame` 列（0/1，key 帧 = frame_weight_sampling 超过普通帧权重阈值），
   供 handler 随样本输出 batch key 帧占比统计（训练日志用）。
 
 CSV 支持两种来源列（按存在性自动识别，优先级从高到低）：
-  1. `frame_weight` 列：直接作为该帧权重（nan/<=0 按告警钳到 1e-8）
+  1. `frame_weight_sampling` 列：直接作为该帧权重（nan/<=0 按告警钳到 1e-8）
   2. `key`/`is_key`/`key_frame` 列（0/1 或 True/False）：key 帧取 2.0、普通帧取 1.0
      （可用 --weight-key / --weight-normal 覆盖）
 
@@ -23,7 +23,7 @@ CSV 支持两种来源列（按存在性自动识别，优先级从高到低）�
       --csv /data/data/lerobot_v30_ee.csv \
       --data-root /data/data/lerobot_v30_ee_6d
 
-  # 2) apply：写 frame_weight 列（默认先 dry-run 打印统计，--apply 才落盘）
+  # 2) apply：写 frame_weight_sampling 列（默认先 dry-run 打印统计，--apply 才落盘）
   python tools/add_frame_weight.py apply \
       --csv /data/data/lerobot_v30_ee.csv \
       --data-root /data/data/lerobot_v30_ee_6d [--apply] \
@@ -36,7 +36,7 @@ CSV 支持两种来源列（按存在性自动识别，优先级从高到低）�
 
 说明：
   - 不依赖 pandas；CSV 用标准库 csv，parquet 用 pyarrow。
-  - 主表已有 frame_weight 列时 apply 会先删除再重写（幂等）。
+  - 主表已有 frame_weight_sampling 列时 apply 会先删除再重写（幂等）。
   - 视频、meta 其他文件一律不动。
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ def parse_args() -> argparse.ArgumentParser:
     p_inspect.add_argument("--limit", type=int, default=5, help="打印前 N 行")
 
     p_apply = sub.add_parser("apply", parents=[common],
-                             help="把 CSV 权重写入主表 frame_weight 列")
+                             help="把 CSV 权重写入主表 frame_weight_sampling 列")
     p_apply.add_argument("--weight-key", type=float, default=2.0,
                          help="key 帧权重（CSV 用 key 布尔列时）")
     p_apply.add_argument("--weight-normal", type=float, default=1.0,
@@ -77,7 +77,7 @@ def parse_args() -> argparse.ArgumentParser:
                          help="落盘；缺省只 dry-run 打印统计")
 
     p_verify = sub.add_parser("verify", parents=[common],
-                              help="验证主表 frame_weight 列")
+                              help="验证主表 frame_weight_sampling 列")
     return parser
 
 
@@ -103,7 +103,7 @@ def detect_columns(header: list[str]) -> dict:
     """识别 episode / frame / 权重列。"""
     ep_col = pick_col(["episode_index", "episode"], header)
     fr_col = pick_col(["frame_index", "frame", "idx"], header)
-    fw_col = pick_col(["frame_weight", "weight"], header)
+    fw_col = pick_col(["frame_weight_sampling", "weight"], header)
     key_col = pick_col(["key", "is_key", "key_frame", "is_key_frame"], header)
     return {"ep": ep_col, "fr": fr_col, "fw": fw_col, "key": key_col}
 
@@ -181,14 +181,14 @@ def main() -> int:
         for path in files:
             t = pq.read_table(str(path))
             if "is_key_frame" not in t.column_names:
-                n_missing_key += 1  # 旧数据无此列，handler 从 frame_weight 推导，不判失败
-            if "frame_weight" not in t.column_names:
+                n_missing_key += 1  # 无此列时 handler 从 frame_weight_sampling 推导，不判失败
+            if "frame_weight_sampling" not in t.column_names:
                 n_missing_col += 1
                 continue
-            fw = t.column("frame_weight").to_numpy(zero_copy_only=False)
+            fw = t.column("frame_weight_sampling").to_numpy(zero_copy_only=False)
             if len(fw) != t.num_rows or np.isnan(fw).any() or (fw <= 0).any():
                 n_bad += 1
-        print(f"  main-table files: {len(files):,}  missing frame_weight: {n_missing_col}  "
+        print(f"  main-table files: {len(files):,}  missing frame_weight_sampling: {n_missing_col}  "
               f"bad (nan/<=0/len-mismatch): {n_bad}  missing is_key_frame: {n_missing_key}")
         if not files or n_missing_col or n_bad:
             print("[add_frame_weight] VERIFY FAILED", file=sys.stderr)
@@ -200,7 +200,7 @@ def main() -> int:
     layout = load_episode_layout(data_root)
     csv_eps = {int(float(r[cols["ep"]])) for r in rows}
     if cols["fw"] is None and cols["key"] is None:
-        print("[add_frame_weight] ERROR: csv has no 'frame_weight' or 'key' column "
+        print("[add_frame_weight] ERROR: csv has no 'frame_weight_sampling' or 'key' column "
               "to derive weights from; inspect first", file=sys.stderr)
         return 1
 
@@ -210,7 +210,7 @@ def main() -> int:
         def w_of(r):
             v = float(r[cols["fw"]])
             if v != v or v <= 0:  # nan
-                print(f"[add_frame_weight] WARN nan/non-positive frame_weight at "
+                print(f"[add_frame_weight] WARN nan/non-positive frame_weight_sampling at "
                       f"ep={r[cols['ep']]} fr={r[cols['fr']]}; clip 1e-8")
                 return 1e-8
             return v
@@ -260,11 +260,11 @@ def main() -> int:
         print(f"  {path.relative_to(data_root)} rows={n:,} "
               f"key>normal: {n_key:,} ({(n_key / n * 100):.1f}%)")
         if args.apply:
-            for drop_col in ("frame_weight", "is_key_frame"):
+            for drop_col in ("frame_weight_sampling", "is_key_frame"):
                 if drop_col in table.column_names:
                     table = table.drop([drop_col])
             table = table.append_column(
-                "frame_weight", pa.array(col.astype(np.float32)))
+                "frame_weight_sampling", pa.array(col.astype(np.float32)))
             table = table.append_column(
                 "is_key_frame", pa.array(key_mask.astype(np.int8)))
             pq.write_table(table, path)

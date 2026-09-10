@@ -131,7 +131,7 @@ def get_args_parser():
         action="store_true",
         default=False,
         help="Enable per-frame importance sampling for lerobot v3.0 datasets: frames with higher "
-        "frame_weight (main table column) are over-sampled with replacement during training",
+        "frame_weight_sampling (main table column) are over-sampled with replacement during training",
     )
     parser.add_argument(
         "--position_step_weighting",

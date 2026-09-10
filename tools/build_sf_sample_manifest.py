@@ -103,7 +103,7 @@ def main(args):
         data_path = root / "data" / f"chunk-{ci:03d}" / f"file-{fi:03d}.parquet"
         if data_path not in parquet_cache:
             parquet_cache[data_path] = pq.read_table(
-                data_path, columns=[c for c in ("is_key_frame", "frame_weight", "observation.state")
+                data_path, columns=[c for c in ("is_key_frame", "frame_weight_sampling", "observation.state")
                                    if c in pq.read_schema(data_path).names]
             ).to_pydict()
         data = parquet_cache[data_path]
@@ -115,15 +115,15 @@ def main(args):
         )
         if "is_key_frame" in data:
             flags = data["is_key_frame"][lo:lo + usable]
-        elif "frame_weight" in data:
-            flags = [float(x) > 1.0 for x in data["frame_weight"][lo:lo + usable]]
+        elif "frame_weight_sampling" in data:
+            flags = [float(x) > 1.0 for x in data["frame_weight_sampling"][lo:lo + usable]]
         elif args.sampling_mode == "natural":
             # Natural sampling never consumes key-frame labels (uniform rng.sample),
             # so a dataset without them is fine; report everything as regular.
             flags = [False] * usable
         else:
             raise RuntimeError(
-                f"{data_path} has neither is_key_frame nor frame_weight; "
+                f"{data_path} has neither is_key_frame nor frame_weight_sampling; "
                 "key_regular_1to1 requires key-frame labels"
             )
         task = (row.get("tasks") or ["unknown"])[0]
