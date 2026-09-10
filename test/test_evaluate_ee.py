@@ -132,6 +132,36 @@ def test_label_bucket_belongs_to_target_frame_not_anchor():
     assert by_label["place"] == 11
 
 
+def test_lead_looks_back_from_target_to_exact_anchor():
+    frames = 51
+    baseline = pd.DataFrame({
+        "episode_index": [0] * frames,
+        "frame_index": list(range(frames)),
+        "task_index": [0] * frames,
+        "labels": [()] * 20 + [("critical",)] + [()] * 30,
+        "action_array": [np.asarray(action(float(frame))) for frame in range(frames)],
+    })
+    # 只有 anchor=10 对 target=20 的 lead10 预测正确；anchor=20 自身的
+    # chunk 故意填入错误值，确保实现不是站在关键帧向未来统计。
+    predictions = pd.DataFrame({
+        "episode_index": [0, 0],
+        "frame_index": [10, 20],
+        "prediction_array": [
+            np.asarray([action(float(11 + offset)) for offset in range(30)]),
+            np.asarray([action(-999.0) for _ in range(30)]),
+        ],
+    })
+
+    metrics = compute_curves(baseline, predictions, horizon=30)
+    row = metrics[
+        (metrics["curve"] == "lead")
+        & (metrics["step"] == 10)
+        & (metrics["label"] == "critical")
+    ].iloc[0]
+    assert row["comparisons"] == 1
+    assert row["mean_position_cm"] == pytest.approx(0)
+
+
 def test_multilabel_frame_counts_in_every_label():
     labels = [()] * 10 + [("grasp_pen", "place_pen")] * 21
     metrics = curves_for_labels(labels)

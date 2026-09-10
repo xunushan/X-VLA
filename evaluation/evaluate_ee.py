@@ -238,6 +238,29 @@ def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: i
             continue
         expert_rows = base_by_episode[episode]
         task_index = int(expert_rows["task_index"].iloc[0])
+
+        # lead 指标以“待评价的目标帧”为中心：对于目标帧 t 和提前量 L，
+        # 严格取 anchor=t-L 的 action chunk 中第 L 步预测。这样关键帧标签天然
+        # 属于当前被预测的目标帧，而不是属于发起预测的 anchor。
+        predictions_by_anchor = {
+            int(row.frame_index): row.prediction_array
+            for row in rows.itertuples(index=False)
+        }
+        for target in expert_rows.index:
+            target = int(target)
+            target_keys = bucket_keys(expert_rows.loc[target, "labels"])
+            expert_action = expert_rows.loc[target, "action_array"]
+            for lead in LEAD_STEPS:
+                anchor = target - lead
+                predicted = predictions_by_anchor.get(anchor)
+                if predicted is None:
+                    continue
+                error = ee_errors(predicted[lead - 1], expert_action)
+                for label_key in target_keys:
+                    add_error(accumulator, (episode, task_index, "lead", lead, label_key), error)
+
+        # execution 指标保持部署时的执行逻辑：每 30 帧推理一次，并评价该
+        # anchor 的前 30 个实际执行动作；每一步仍按其目标帧标签归类。
         for row in rows.itertuples(index=False):
             anchor = int(row.frame_index)
             if anchor not in expert_rows.index:
@@ -250,10 +273,6 @@ def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: i
                 # 桶按“目标帧”（预测第 L 步对齐的专家帧 f+L）的标签归属，与 anchor 无关
                 target_keys = bucket_keys(expert_rows.loc[target, "labels"])
                 execution_errors.append((error, target_keys))
-                if lead not in LEAD_STEPS:
-                    continue
-                for label_key in target_keys:
-                    add_error(accumulator, (episode, task_index, "lead", lead, label_key), error)
 
             if anchor % EXECUTION_WINDOW == 0:
                 for error, target_keys in execution_errors:
