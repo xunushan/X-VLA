@@ -7,10 +7,21 @@ import argparse
 import json
 import math
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# 逐帧关键帧标签列：新数据集用 keyframe_label（多标签，'|' 分隔），旧数据集的单串 stage 仍兼容。
+LABEL_COLUMN = "keyframe_label"
+LEGACY_LABEL_COLUMN = "stage"
+LABEL_SEPARATOR = "|"
+# 非关键帧的标签取值（不计入任何标签桶，但仍计入 __all__）
+KEYFRAME_NONE_LABEL = "none"
+# 桶名：__all__ = 全部帧；__keyframe__ = 目标帧是关键帧（label != 'none'）。
+ALL_BUCKET = "__all__"
+KEYFRAME_BUCKET = "__keyframe__"
 
 METRIC_NAMES = (
     "left_position_cm",
@@ -98,6 +109,29 @@ def ee_errors(predicted: np.ndarray, expert: np.ndarray) -> dict[str, float]:
     }
 
 
+def parse_labels(value) -> tuple[str, ...]:
+    """把一个多标签单元格拆成去重保序的标签元组；'none'/空 表示非关键帧。"""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return ()
+    labels = []
+    for part in str(value).split(LABEL_SEPARATOR):
+        label = part.strip()
+        if label and label != KEYFRAME_NONE_LABEL:
+            labels.append(label)
+    return tuple(dict.fromkeys(labels))
+
+
+@lru_cache(maxsize=None)
+def bucket_keys(labels: tuple[str, ...]) -> tuple[str, ...]:
+    """目标帧命中的所有标签桶 + 关键帧桶 + __all__。
+
+    多标签帧（如 'grasp_pen|place_pen'）在每个标签桶里各计一次。
+    """
+    if not labels:
+        return (ALL_BUCKET,)
+    return (ALL_BUCKET, KEYFRAME_BUCKET, *labels)
+
+
 def add_error(accumulator: dict, key: tuple, error: dict[str, float]) -> None:
     cell = accumulator[key]
     cell["comparisons"] += 1
@@ -107,12 +141,18 @@ def add_error(accumulator: dict, key: tuple, error: dict[str, float]) -> None:
 
 def load_inputs(
     baseline_csv: str | Path, split_file: str | Path, predictions_csv: str | Path
-) -> tuple[pd.DataFrame, pd.DataFrame, str, str, int, dict[int, str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, str, str, int, dict[int, str], str | None]:
     validation, episode_to_task, task_names = split_metadata(split_file)
     header = pd.read_csv(baseline_csv, nrows=0).columns
+    if LABEL_COLUMN in header:
+        label_column = LABEL_COLUMN
+    elif LEGACY_LABEL_COLUMN in header:
+        label_column = LEGACY_LABEL_COLUMN
+    else:
+        label_column = None
     columns = ["episode_index", "frame_index", "action", "task_index"]
-    if "stage" in header:
-        columns.append("stage")
+    if label_column is not None:
+        columns.append(label_column)
     baseline = pd.read_csv(baseline_csv, usecols=columns)
     baseline = baseline[baseline["episode_index"].astype(int).isin(validation)].copy()
     if baseline.empty:
@@ -124,11 +164,10 @@ def load_inputs(
     if baseline["task_index"].isna().any():
         raise ValueError("some validation rows have no task_index")
     baseline["task_index"] = baseline["task_index"].astype(int)
-    if "stage" in baseline:
-        baseline["stage"] = baseline["stage"].fillna("__unlabeled__").astype(str)
-        baseline.loc[baseline["stage"].str.strip() == "", "stage"] = "__unlabeled__"
+    if label_column is not None:
+        baseline["labels"] = baseline[label_column].map(parse_labels)
     else:
-        baseline["stage"] = "__all__"
+        baseline["labels"] = [() for _ in range(len(baseline))]
     baseline["action_array"] = baseline["action"].map(lambda value: parse_vector(value, 16))
 
     predictions = pd.read_csv(predictions_csv)
@@ -176,7 +215,11 @@ def load_inputs(
                 f"prediction frame coverage mismatch for episode {episode}: "
                 f"missing={missing[:10]} extra={extra[:10]}"
             )
-    return baseline, predictions, str(model_ids[0]), str(checkpoint_ids[0]), horizon, task_names
+    baseline = baseline.drop(columns=["action"])
+    return (
+        baseline, predictions, str(model_ids[0]), str(checkpoint_ids[0]), horizon,
+        task_names, label_column,
+    )
 
 
 def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: int) -> pd.DataFrame:
@@ -204,29 +247,30 @@ def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: i
             for lead in range(1, EXECUTION_WINDOW + 1):
                 target = anchor + lead
                 error = ee_errors(predicted[lead - 1], expert_rows.loc[target, "action_array"])
-                target_stage = str(expert_rows.loc[target, "stage"])
-                execution_errors.append((error, target_stage))
+                # 桶按“目标帧”（预测第 L 步对齐的专家帧 f+L）的标签归属，与 anchor 无关
+                target_keys = bucket_keys(expert_rows.loc[target, "labels"])
+                execution_errors.append((error, target_keys))
                 if lead not in LEAD_STEPS:
                     continue
-                for stage_key in {"__all__", target_stage}:
-                    add_error(accumulator, (episode, task_index, "lead", lead, stage_key), error)
+                for label_key in target_keys:
+                    add_error(accumulator, (episode, task_index, "lead", lead, label_key), error)
 
             if anchor % EXECUTION_WINDOW == 0:
-                for error, target_stage in execution_errors:
-                    for stage_key in {"__all__", target_stage}:
+                for error, target_keys in execution_errors:
+                    for label_key in target_keys:
                         add_error(
                             accumulator,
-                            (episode, task_index, "execution", EXECUTION_WINDOW, stage_key),
+                            (episode, task_index, "execution", EXECUTION_WINDOW, label_key),
                             error,
                         )
 
     records = []
-    for (episode, task, curve, step, stage), values in accumulator.items():
+    for (episode, task, curve, step, label), values in accumulator.items():
         count = int(values["comparisons"])
         record = {
             "episode_index": episode,
             "task_index": task,
-            "stage": stage,
+            "label": label,
             "curve": curve,
             "step": step,
             "comparisons": count,
@@ -235,11 +279,11 @@ def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: i
         records.append(record)
     if not records:
         raise ValueError("no aligned prediction/expert comparisons")
-    return pd.DataFrame(records).sort_values(["task_index", "episode_index", "stage", "curve", "step"])
+    return pd.DataFrame(records).sort_values(["task_index", "episode_index", "label", "curve", "step"])
 
 
 def aggregate_episode_macro(per_episode: pd.DataFrame) -> pd.DataFrame:
-    keys = ["task_index", "stage", "curve", "step"]
+    keys = ["task_index", "label", "curve", "step"]
     task_rows = []
     for key, group in per_episode.groupby(keys, sort=True):
         record = dict(zip(keys, key, strict=True))
@@ -254,10 +298,11 @@ def aggregate_episode_macro(per_episode: pd.DataFrame) -> pd.DataFrame:
         task_rows.append(record)
 
     by_task = pd.DataFrame(task_rows)
-    overall_keys = ["stage", "curve", "step"]
+    # overall 只做 __all__ 桶的任务宏平均：标签/关键帧各任务口径不同，不跨任务统计
+    overall_keys = ["curve", "step"]
     overall_rows = []
-    for key, group in by_task.groupby(overall_keys, sort=True):
-        record = {"task_index": -1, **dict(zip(overall_keys, key, strict=True))}
+    for key, group in by_task[by_task["label"] == ALL_BUCKET].groupby(overall_keys, sort=True):
+        record = {"task_index": -1, "label": ALL_BUCKET, **dict(zip(overall_keys, key, strict=True))}
         record["aggregation_level"] = "overall"
         record["macro_unit"] = "task"
         record["num_episodes"] = int(group["num_episodes"].sum())
@@ -268,6 +313,32 @@ def aggregate_episode_macro(per_episode: pd.DataFrame) -> pd.DataFrame:
             record[f"{metric}_std"] = float(group[metric].std(ddof=0))
         overall_rows.append(record)
     return pd.concat([by_task, pd.DataFrame(overall_rows)], ignore_index=True)
+
+
+def task_label_stats(baseline: pd.DataFrame) -> dict[str, dict]:
+    """逐任务的标签清单与关键帧占比（标签框定数据集/训练口径，便于核对）。"""
+    stats: dict[str, dict] = {}
+    for task_index, group in baseline.groupby("task_index", sort=True):
+        labels = sorted({label for row in group["labels"] for label in row})
+        keyframes = int(group["labels"].map(len).gt(0).sum())
+        stats[str(int(task_index))] = {
+            "labels": labels,
+            "keyframe_frames": keyframes,
+            "total_frames": int(len(group)),
+            "keyframe_fraction": round(keyframes / len(group), 4) if len(group) else 0.0,
+        }
+    return stats
+
+
+def bucket_episode_counts(per_episode: pd.DataFrame) -> dict[str, dict[str, int]]:
+    """逐任务各标签桶实际覆盖的验证 episode 数（多标签帧在各标签桶里各计一次）。"""
+    counts: dict[str, dict[str, int]] = {}
+    for task_index, group in per_episode.groupby("task_index", sort=True):
+        counts[str(int(task_index))] = {
+            str(label): int(rows["episode_index"].nunique())
+            for label, rows in group.groupby("label", sort=True)
+        }
+    return counts
 
 
 def parse_args() -> argparse.Namespace:
@@ -281,7 +352,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    baseline, predictions, model_id, checkpoint_id, horizon, task_names = load_inputs(
+    baseline, predictions, model_id, checkpoint_id, horizon, task_names, label_column = load_inputs(
         args.baseline_csv, args.split_file, args.predictions_csv
     )
     per_episode = compute_curves(baseline, predictions, horizon)
@@ -301,7 +372,14 @@ def main() -> None:
         "lead_steps": list(LEAD_STEPS),
         "execution_window": EXECUTION_WINDOW,
         "aggregation": ["frame", "episode", "task", "overall"],
-        "stage_assignment": "target_frame",
+        "label_column": label_column,
+        "label_assignment": "target_frame",
+        "bucket_keys": {"all": ALL_BUCKET, "keyframe": KEYFRAME_BUCKET},
+        "keyframe_definition": f"{LABEL_COLUMN} != '{KEYFRAME_NONE_LABEL}'",
+        "multilabel_policy": "a frame carrying several labels counts in every one of them",
+        "overall_buckets": [ALL_BUCKET],
+        "task_labels": task_label_stats(baseline),
+        "bucket_episodes": bucket_episode_counts(per_episode),
         "validation_episodes": int(per_episode["episode_index"].nunique()),
         "task_names": task_names,
         "baseline_csv": str(Path(args.baseline_csv).resolve()),

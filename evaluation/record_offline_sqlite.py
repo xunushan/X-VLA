@@ -34,19 +34,21 @@ EXEC_STEPS = ("30",)
 
 
 def build_metrics_node(rows: pd.DataFrame) -> dict:
-    """Nest by_task rows into {stage: {curve: {step: {mean_* metric, comparisons}}}}.
+    """Nest by_task rows into {label: {curve: {step: {mean_* metric, comparisons}}}}.
 
+    label 即 evaluate_ee.py 的桶名：`__all__`（全部帧）、`__keyframe__`（目标帧是关键帧，
+    仅任务层有）、以及该任务各自的 keyframe_label 标签（多标签帧在各标签桶各计一次）。
     lead 只保留 1/10/20/30，execution 只保留 30；mean_mse 由 evaluate 输出的
     per-side (left/right) 平方误差取平均得到；数值四舍五入到 4 位小数省体积。
     """
     keep = {LEAD_CURVE: LEAD_STEPS, EXEC_CURVE: EXEC_STEPS}
     node: dict[str, dict] = {}
-    for (stage, curve, step), group in rows.groupby(["stage", "curve", "step"], sort=True):
+    for (label, curve, step), group in rows.groupby(["label", "curve", "step"], sort=True):
         step_key = str(int(step))
         if step_key not in keep.get(curve, ()):
             continue
         r = group.iloc[0]
-        node.setdefault(stage, {}).setdefault(curve, {})[step_key] = {
+        node.setdefault(label, {}).setdefault(curve, {})[step_key] = {
             "comparisons": int(r["comparisons"]),
             "mean_position_cm": round(float(r["mean_position_cm"]), 4),
             "mean_position_mse_cm2": round(
@@ -89,11 +91,19 @@ def build_results_json(
         "dataset": dataset,
         "validation_episodes": int(summary["validation_episodes"]),
         "num_predictions": int(num_predictions or int(overall.loc[
-            (overall["stage"] == "__all__") & (overall["curve"] == LEAD_CURVE) & (overall["step"] == 1),
+            (overall["label"] == "__all__") & (overall["curve"] == LEAD_CURVE) & (overall["step"] == 1),
             "comparisons",
         ].iloc[0])),
         "inference": stats or {},
         "task_names": {k: v for k, v in summary.get("task_names", {}).items()},
+        # 桶口径自述，便于脱离代码解读 results_json 里的 __keyframe__ / 标签桶
+        "buckets": {
+            "label_column": summary.get("label_column"),
+            "keyframe_definition": summary.get("keyframe_definition"),
+            "multilabel_policy": summary.get("multilabel_policy"),
+            "overall_buckets": summary.get("overall_buckets"),
+            "task_labels": summary.get("task_labels", {}),
+        },
         "metrics": {
             "overall": {
                 "num_episodes": int(overall["num_episodes"].iloc[0]),
