@@ -164,6 +164,22 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             return (np.asarray(fw[lo:hi], dtype=np.float64) > 1.0).astype(np.int64)
         return np.asarray(is_key[lo:hi], dtype=np.int64)
 
+    def _read_frame_weight_loss(self, ep: dict) -> np.ndarray | None:
+        """读取该 episode 的 frame_weight_loss（与 observation.state 同行对齐）。
+
+        逐帧 loss 权重，供训练侧按未来 action step 加权（docs/dual_arm_tasks_failure_
+        and_keyframe_plan.md §5.3）；与 frame_weight_sampling（当前帧重采样权重）语义不同。
+        与 _read_state 同一定位方式（同表同 [lo:hi] 切片）；主表无该列时返回 None，
+        调用方不携带该字段（训练侧降级为不加权）。
+        """
+        ci, fi = int(ep["data/chunk_index"]), int(ep["data/file_index"])
+        data = self._read_parquet(f"chunk-{ci:03d}/file-{fi:03d}.parquet")
+        fw = data.get("frame_weight_loss")
+        if fw is None:
+            return None
+        lo, hi = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
+        return np.asarray(fw[lo:hi], dtype=np.float64)
+
     @staticmethod
     def _to_20d(arr: np.ndarray) -> np.ndarray:
         """16 维 → 20 维：每臂 [xyz, quat_wxyz, g] → [xyz, rot6d, g]（委托 utils.ee16_to_xvla20）。"""
@@ -356,6 +372,16 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
         lt = np.arange(T, dtype=np.float64) * (self.qdur / num_actions)
         L = interp1d(lt, state_T, axis=0, bounds_error=False, fill_value=(state_T[0], state_T[-1]))
 
+        # 4b. 未来 action 的逐 step loss 权重插值器：与 abs_trajectory 共用同一时间轴 lt 与
+        #     查询网格 q[1:]。episode 尾部时间压缩/钳位时 q 可能重复末帧时间，插值自然取到
+        #     同一个权重，不能机械读取 idx+1:idx+num_actions（doc §5.3）。列缺失时为 None。
+        fwl = self._read_frame_weight_loss(ep)
+        if fwl is not None:
+            fwl_T = fwl[:T]
+            Lw = interp1d(lt, fwl_T, bounds_error=False, fill_value=(fwl_T[0], fwl_T[-1]))
+        else:
+            Lw = None
+
         # 5. 候选帧：与参考 range(0, T-5) 一致，保留 episode 尾部候选（不足 qdur 完整窗口的
         #    样本不排除，由下方 clamp 到末帧 + 插值压缩处理，语义 = "减速收尾、停在末姿态"）
         idxs = requested if requested is not None else list(range(max(0, T - 5)))
@@ -404,6 +430,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
             # （自适应亚帧插值，终点收敛到末姿态；补 0 才是错的，见 docs/xvla_alignment_plan.md §4）
             q = np.linspace(cur, min(cur + self.qdur, float(lt[-1])), num_actions + 1, dtype=np.float32)
             seq = torch.tensor(L(q)).float()  # [num_actions+1, 20]
+            # 与 seq[1:]（未来 num_actions 步 action）严格同网格的逐 step loss 权重
+            fw_seq = None if Lw is None else torch.tensor(Lw(q[1:])).float()  # [num_actions]
 
             # 跳过双臂完全静止段
             if skip_static_samples and (seq[1] - seq[0]).abs().max() < 1e-5:
@@ -436,6 +464,10 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                 "image_mask": image_mask,
                 "abs_trajectory": seq,
             }
+            # frame_weight_loss 随样本输出（训练侧逐 step 加权，与 action 逐行对齐）：
+            # 主表无该列时不携带该字段，train.py 据此降级为不加权并告警
+            if fw_seq is not None:
+                sample["frame_weight_loss"] = fw_seq
             # is_key_frame 随样本输出（batch key 帧占比统计用）：主表无 is_key_frame 列时
             # 由 _read_is_key_frame 从 frame_weight_sampling 推导兜底，两列都缺失才不携带该字段
             if key_status is not None:

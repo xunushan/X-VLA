@@ -55,7 +55,7 @@ class BaseActionSpace(nn.Module):
     Each subclass defines:
       - `dim_action`: dimension of the action vector.
       - `gripper_idx`: indices of gripper channels.
-      - `compute_loss(pred, target)`: supervised loss for this space.
+      - `compute_loss(pred, target, frame_weight_loss)`: supervised loss for this space.
       - `preprocess(proprio, action, mode)`: pre-step modifications.
       - `postprocess(action)`: post-step corrections (e.g. apply sigmoid).
     """
@@ -70,12 +70,66 @@ class BaseActionSpace(nn.Module):
     # ---------------------------------------------------------------------
     # Core supervised loss
     # ---------------------------------------------------------------------
-    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def compute_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        frame_weight_loss: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        frame_weight_loss: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
         """Alias for compute_loss."""
-        return self.compute_loss(pred, target)
+        return self.compute_loss(pred, target, frame_weight_loss=frame_weight_loss)
+
+    # ---------------------------------------------------------------------
+    # Per-step loss weighting (frame_weight_loss, 见 docs/dual_arm_tasks_failure_
+    # and_keyframe_plan.md §5.3/§5.4)
+    # ---------------------------------------------------------------------
+    def _normalize_step_weights(
+        self,
+        frame_weight_loss: torch.Tensor | None,
+        like: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """[B, H] 逐 step 权重 → 在 batch 内归一化到均值 1；None 表示不加权。
+
+        不按单样本归一化：否则某个 chunk 整体处于关键阶段时权重效果会被完全抵消。
+        权重同为常数 c 时 c/mean 恒为 1.0（浮点除自身精确为 1）→ 结果与不加权逐 bit 一致。
+        权重含非有限值或均值非正时返回 None（该 batch 退化为不加权），由调用方决定告警。
+        """
+        if frame_weight_loss is None:
+            return None
+        w = frame_weight_loss.to(device=like.device, dtype=like.dtype)
+        if w.ndim != 2 or w.shape != like.shape[:2]:
+            raise ValueError(
+                f"frame_weight_loss must be [B, T]={tuple(like.shape[:2])} "
+                f"matching pred/target; got {tuple(w.shape)}"
+            )
+        mean = w.mean()
+        if not torch.isfinite(w).all() or not torch.isfinite(mean) or mean <= 0:
+            return None
+        return w / mean
+
+    def _step_mse(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        idx: Tuple[int, ...],
+        step_weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """按 step 加权的 MSE（先在 [B, H, K] 上加权再整体 mean，见 doc §5.3）。
+
+        step_weights=None 时与 `self.mse(pred[:, :, idx], target[:, :, idx])` 等价。
+        """
+        se = (pred[:, :, idx] - target[:, :, idx]) ** 2
+        if step_weights is None:
+            return se.mean()
+        return (se * step_weights.unsqueeze(-1)).mean()
 
     # ---------------------------------------------------------------------
     # Space-level hooks
@@ -103,6 +157,16 @@ def _ensure_indices_valid(D: int, idx: Iterable[int], name: str) -> None:
         raise IndexError(f"{name} contains out-of-range indices {bad} for action dim D={D}")
 
 
+def _reject_frame_weight_loss(space: "BaseActionSpace", frame_weight_loss) -> None:
+    """逐 step loss 加权目前只在 ee6d 家族实现；其余 action space 显式报错而非静默 no-op。"""
+    if frame_weight_loss is not None:
+        raise NotImplementedError(
+            "frame_weight_loss (per-step loss weighting) is only implemented for the "
+            f"ee6d action-space family (ee6d / agibot_ee6d / arx_ee6d); "
+            f"got action space '{space.name}'"
+        )
+
+
 # =============================================================================
 # Implementations
 # =============================================================================
@@ -126,25 +190,28 @@ class EE6DActionSpace(BaseActionSpace):
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
 
-    def compute_loss(self, pred, target):
+    def compute_loss(self, pred, target, frame_weight_loss=None):
         assert pred.shape == target.shape, "pred/target shapes must match"
         B, T, D = pred.shape
         _ensure_indices_valid(D, self.gripper_idx, "gripper_idx")
 
-        # Gripper BCE
+        # 逐 step loss 权重：batch 内归一化到均值 1（doc §5.3）。None = 不加权。
+        w = self._normalize_step_weights(frame_weight_loss, pred)
+
+        # Gripper BCE —— 不参与关键帧加权（doc §5.4：gripper 权重恒为 1）
         g_losses = [self.bce(pred[:, :, gi], target[:, :, gi]) for gi in self.gripper_idx]
         gripper_loss = sum(g_losses) / len(self.gripper_idx) * self.GRIPPER_SCALE
 
         # XYZ position
         pos_loss = (
-            self.mse(pred[:, :, self.POS_IDX_1], target[:, :, self.POS_IDX_1]) +
-            self.mse(pred[:, :, self.POS_IDX_2], target[:, :, self.POS_IDX_2])
+            self._step_mse(pred, target, self.POS_IDX_1, w) +
+            self._step_mse(pred, target, self.POS_IDX_2, w)
         ) * self.XYZ_SCALE
 
         # Rotation 6D
         rot_loss = (
-            self.mse(pred[:, :, self.ROT_IDX_1], target[:, :, self.ROT_IDX_1]) +
-            self.mse(pred[:, :, self.ROT_IDX_2], target[:, :, self.ROT_IDX_2])
+            self._step_mse(pred, target, self.ROT_IDX_1, w) +
+            self._step_mse(pred, target, self.ROT_IDX_2, w)
         ) * self.ROT_SCALE
 
         return {
@@ -182,10 +249,11 @@ class JointActionSpace(BaseActionSpace):
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
 
-    def compute_loss(self, pred, target):
+    def compute_loss(self, pred, target, frame_weight_loss=None):
         assert pred.shape == target.shape
         B, T, D = pred.shape
         _ensure_indices_valid(D, self.gripper_idx, "gripper_idx")
+        _reject_frame_weight_loss(self, frame_weight_loss)
 
         g_losses = [self.bce(pred[:, :, gi], target[:, :, gi]) for gi in self.gripper_idx]
         gripper_loss = sum(g_losses) / len(self.gripper_idx) * self.GRIPPER_SCALE
@@ -231,19 +299,23 @@ class AGIBOTEE6DActionSpace(BaseActionSpace):
         super().__init__()
         self.mse = nn.MSELoss()
 
-    def compute_loss(self, pred, target):
+    def compute_loss(self, pred, target, frame_weight_loss=None):
         assert pred.shape == target.shape
         B, T, D = pred.shape
         _ensure_indices_valid(D, self.gripper_idx, "gripper_idx")
 
+        # 逐 step loss 权重：batch 内归一化到均值 1（doc §5.3）。None = 不加权。
+        w = self._normalize_step_weights(frame_weight_loss, pred)
+
+        # Gripper —— 不参与关键帧加权（doc §5.4：gripper 权重恒为 1）
         gripper_loss = self.mse(pred[:, :, self.gripper_idx], target[:, :, self.gripper_idx]) * self.GRIPPER_SCALE
         pos_loss = (
-            self.mse(pred[:, :, self.POS_IDX_1], target[:, :, self.POS_IDX_1]) +
-            self.mse(pred[:, :, self.POS_IDX_2], target[:, :, self.POS_IDX_2])
+            self._step_mse(pred, target, self.POS_IDX_1, w) +
+            self._step_mse(pred, target, self.POS_IDX_2, w)
         ) * self.XYZ_SCALE
         rot_loss = (
-            self.mse(pred[:, :, self.ROT_IDX_1], target[:, :, self.ROT_IDX_1]) +
-            self.mse(pred[:, :, self.ROT_IDX_2], target[:, :, self.ROT_IDX_2])
+            self._step_mse(pred, target, self.ROT_IDX_1, w) +
+            self._step_mse(pred, target, self.ROT_IDX_2, w)
         ) * self.ROT_SCALE
 
         return {
@@ -286,19 +358,23 @@ class ARXEE6DActionSpace(BaseActionSpace):
         super().__init__()
         self.mse = nn.MSELoss()
 
-    def compute_loss(self, pred, target):
+    def compute_loss(self, pred, target, frame_weight_loss=None):
         assert pred.shape == target.shape
         B, T, D = pred.shape
         _ensure_indices_valid(D, self.gripper_idx, "gripper_idx")
 
+        # 逐 step loss 权重：batch 内归一化到均值 1（doc §5.3）。None = 不加权。
+        w = self._normalize_step_weights(frame_weight_loss, pred)
+
+        # Gripper —— 不参与关键帧加权（doc §5.4：gripper 权重恒为 1）
         gripper_loss = self.mse(pred[:, :, self.gripper_idx], target[:, :, self.gripper_idx]) * self.GRIPPER_SCALE
         pos_loss = (
-            self.mse(pred[:, :, self.POS_IDX_1], target[:, :, self.POS_IDX_1]) +
-            self.mse(pred[:, :, self.POS_IDX_2], target[:, :, self.POS_IDX_2])
+            self._step_mse(pred, target, self.POS_IDX_1, w) +
+            self._step_mse(pred, target, self.POS_IDX_2, w)
         ) * self.XYZ_SCALE
         rot_loss = (
-            self.mse(pred[:, :, self.ROT_IDX_1], target[:, :, self.ROT_IDX_1]) +
-            self.mse(pred[:, :, self.ROT_IDX_2], target[:, :, self.ROT_IDX_2])
+            self._step_mse(pred, target, self.ROT_IDX_1, w) +
+            self._step_mse(pred, target, self.ROT_IDX_2, w)
         ) * self.ROT_SCALE
 
         return {
@@ -361,7 +437,12 @@ class AutoActionSpace(BaseActionSpace):
         """Trim model output max_dim → real_dim."""
         return x[..., : self.real_dim]
 
-    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+    def compute_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        frame_weight_loss: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """
         Compute loss only on the first real_dim dimensions.
 
@@ -370,6 +451,7 @@ class AutoActionSpace(BaseActionSpace):
 
         Loss = MSE(pred[:,:,:real_dim], target[:,:,:real_dim])
         """
+        _reject_frame_weight_loss(self, frame_weight_loss)
         pred = self._pad_to_model_dim(pred)
         target = self._pad_to_model_dim(target)
         assert pred.shape == target.shape, f"Shape mismatch: pred {pred.shape} vs target {target.shape}"

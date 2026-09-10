@@ -195,11 +195,15 @@ class XVLA(PreTrainedModel):
         domain_id: torch.LongTensor,
         proprio: torch.Tensor,
         action: torch.Tensor,  # [B, T=num_actions, D=dim_action]
+        frame_weight_loss: torch.Tensor | None = None,  # [B, T] 逐 step loss 权重
     ) -> Dict[str, torch.Tensor]:
         """
         1) Encode multimodal inputs.
         2) Diffusion-style noisy mixture of actions: x_t = t*noise + (1-t)*gt.
         3) Space-specific preprocessing, prediction, and supervised loss.
+
+        frame_weight_loss 为数据集主表 frame_weight_loss 列按未来 T 步对齐后的权重，
+        None 表示不加权（与历史行为一致）。仅 ee6d 家族 action space 支持。
         """
         enc = self.forward_vlm(input_ids, image_input, image_mask)
 
@@ -217,7 +221,9 @@ class XVLA(PreTrainedModel):
             proprio=proprio_m,
             **enc,
         )
-        return self.action_space.compute_loss(pred_action, action)
+        return self.action_space.compute_loss(
+            pred_action, action, frame_weight_loss=frame_weight_loss
+        )
 
     # ================================= inference =================================
     @torch.no_grad()

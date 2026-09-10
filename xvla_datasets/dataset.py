@@ -36,6 +36,7 @@ class InfiniteDataReader(IterableDataset):
         'proprio': FloatTensor[dim_proprio],
         'action': FloatTensor[T, dim_action],
         'is_key_frame': int,          # v3.0 专属：该样本起始帧是否 key 帧（batch key 占比统计用）
+        'frame_weight_loss': FloatTensor[T],  # v3.0 专属且主表有该列时：与 action 逐行对齐的逐 step loss 权重
       }
     """
     def __init__(self,

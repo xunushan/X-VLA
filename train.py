@@ -34,6 +34,18 @@ from xvla_datasets import create_dataloader
 from models.configuration_xvla import XVLAConfig
 from models.modeling_xvla import XVLA
 from models.processing_xvla import XVLAProcessor
+from models.action_hub import (
+    AGIBOTEE6DActionSpace,
+    ARXEE6DActionSpace,
+    EE6DActionSpace,
+)
+
+# 支持 frame_weight_loss 逐 step 加权的 action space（实现于 models/action_hub.py）
+FRAME_WEIGHT_LOSS_ACTION_SPACES = (
+    EE6DActionSpace,
+    AGIBOTEE6DActionSpace,
+    ARXEE6DActionSpace,
+)
 
 import logging
 import os
@@ -132,6 +144,15 @@ def get_args_parser():
         default=False,
         help="Enable per-frame importance sampling for lerobot v3.0 datasets: frames with higher "
         "frame_weight_sampling (main table column) are over-sampled with replacement during training",
+    )
+    parser.add_argument(
+        "--frame_weight_loss",
+        action="store_true",
+        default=False,
+        help="Enable per-step loss weighting for lerobot v3.0 datasets: the main table "
+        "frame_weight_loss column (interpolated onto the future action chunk) weights the "
+        "position and rotation losses, normalized to mean 1.0 over the batch; gripper stays "
+        "unweighted. Only the ee6d action-space family is supported",
     )
     # Optimizer
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -668,6 +689,17 @@ def main(args):
         else XVLAProcessor.from_pretrained(args.models)
     )
 
+    # 逐 step loss 加权（--frame_weight_loss）：权重由数据集主表列随 batch 传入，只在
+    # ee6d 家族 action space 实现。非该家族直接报错，避免跑完才发现权重没生效。
+    if args.frame_weight_loss and not isinstance(
+        model.action_space, FRAME_WEIGHT_LOSS_ACTION_SPACES
+    ):
+        raise ValueError(
+            f"--frame_weight_loss is only supported by the ee6d action-space family "
+            f"(ee6d / agibot_ee6d / arx_ee6d); action_mode={model.action_mode!r} uses "
+            f"'{model.action_space.name}'"
+        )
+
     # Iterable dataloader。多进程数据分片：accelerate 对 IterableDataset 自动套
     # IterableDatasetShard 按 rank 切流（不是 DistributedSampler——那只适用 map-style
     # 数据集）。必须 device_placement=[False]：否则走 DataLoaderDispatcher，对 batch 内
@@ -748,6 +780,8 @@ def main(args):
     # key 帧占比统计：累计 key 帧数与带 key 信息的样本数（跨 micro-batch / rank 归并）
     effective_key_sum_local = 0.0
     effective_key_samples_local = 0
+    # --frame_weight_loss 开启但数据集缺列时只告警一次（每个 rank 各一次），训练降级为不加权
+    warned_missing_frame_weight_loss = False
     while global_step < args.iters:
         # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
         # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
@@ -767,6 +801,19 @@ def main(args):
                 effective_key_sum_local += float(batch_key.float().sum().item())
                 effective_key_samples_local += int(batch_key.numel())
 
+            # 逐 step loss 权重：无论开关如何都先 pop，避免 model(**inputs) 意外吃到该字段。
+            # 开关关闭即丢弃；开关开启但数据集无该列时告警一次并降级为不加权。
+            frame_weight_loss = batch.pop("frame_weight_loss", None)
+            if not args.frame_weight_loss:
+                frame_weight_loss = None
+            elif frame_weight_loss is None and not warned_missing_frame_weight_loss:
+                warned_missing_frame_weight_loss = True
+                logger.warning(
+                    "--frame_weight_loss is enabled but the dataset carries no "
+                    "frame_weight_loss column; per-step loss weighting is DISABLED for "
+                    "this run (train with unweighted loss)"
+                )
+
             # Encode language
             lang = processor.encode_language(batch["language_instruction"])
             batch.pop("language_instruction", None)
@@ -783,7 +830,9 @@ def main(args):
             }
 
             # Forward & backward
-            loss_dict: Dict[str, torch.Tensor] = model(**inputs)
+            loss_dict: Dict[str, torch.Tensor] = model(
+                **inputs, frame_weight_loss=frame_weight_loss
+            )
             loss = sum(loss_dict.values())
 
             # 日志聚合使用未被 Accelerate 按 accum steps 缩放的原始 loss。detach 后只保留
