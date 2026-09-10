@@ -70,3 +70,44 @@ def test_gripper_mse_continuous(space):
     g_pred = torch.zeros(1, 5, 20)[:, :, GRIPPER_IDX]
     g_tgt = torch.ones(1, 5, 20)[:, :, GRIPPER_IDX]
     assert loss["gripper_loss"].item() == pytest.approx((10 * g_pred.numel() / g_pred.numel()), rel=1e-5)
+
+
+def test_frame_weight_loss_uses_raw_multiplier_without_normalization(space):
+    """A uniformly high-weight chunk must stay high-weight, not collapse to 1."""
+    pred = torch.zeros(1, 30, 20)
+    target = torch.ones_like(pred)
+    weights = torch.full((1, 30), 1.75)
+
+    plain = space.compute_loss(pred, target)
+    weighted = space.compute_loss(pred, target, frame_weight_loss=weights)
+
+    assert weighted["position_loss"].item() == pytest.approx(
+        plain["position_loss"].item() * 1.75
+    )
+    assert weighted["rotate6D_loss"].item() == pytest.approx(
+        plain["rotate6D_loss"].item() * 1.75
+    )
+    assert weighted["gripper_loss"].item() == pytest.approx(plain["gripper_loss"].item())
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        torch.zeros(1, 30),
+        torch.full((1, 30), -1.0),
+        torch.full((1, 30), float("nan")),
+        torch.full((1, 30), float("inf")),
+    ],
+)
+def test_frame_weight_loss_rejects_invalid_values(space, weights):
+    pred = torch.zeros(1, 30, 20)
+    target = torch.ones_like(pred)
+    with pytest.raises(ValueError):
+        space.compute_loss(pred, target, frame_weight_loss=weights)
+
+
+def test_frame_weight_loss_rejects_wrong_shape(space):
+    pred = torch.zeros(2, 30, 20)
+    target = torch.ones_like(pred)
+    with pytest.raises(ValueError, match="must be \\[B, T\\]"):
+        space.compute_loss(pred, target, frame_weight_loss=torch.ones(2, 29))

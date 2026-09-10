@@ -91,16 +91,17 @@ class BaseActionSpace(nn.Module):
     # Per-step loss weighting (frame_weight_loss, 见 docs/dual_arm_tasks_failure_
     # and_keyframe_plan.md §5.3/§5.4)
     # ---------------------------------------------------------------------
-    def _normalize_step_weights(
+    def _prepare_step_weights(
         self,
         frame_weight_loss: torch.Tensor | None,
         like: torch.Tensor,
     ) -> torch.Tensor | None:
-        """[B, H] 逐 step 权重 → 在 batch 内归一化到均值 1；None 表示不加权。
+        """Validate and cast raw [B, H] per-step weights; None means unweighted.
 
-        不按单样本归一化：否则某个 chunk 整体处于关键阶段时权重效果会被完全抵消。
-        权重同为常数 c 时 c/mean 恒为 1.0（浮点除自身精确为 1）→ 结果与不加权逐 bit 一致。
-        权重含非有限值或均值非正时返回 None（该 batch 退化为不加权），由调用方决定告警。
+        The configured values (currently 1/1.25/1.5/1.75) are the final loss
+        multipliers.  Do not normalize dynamically: batch- or chunk-wise
+        normalization can cancel the intended extra supervision when all future
+        steps in a chunk are important.
         """
         if frame_weight_loss is None:
             return None
@@ -110,10 +111,11 @@ class BaseActionSpace(nn.Module):
                 f"frame_weight_loss must be [B, T]={tuple(like.shape[:2])} "
                 f"matching pred/target; got {tuple(w.shape)}"
             )
-        mean = w.mean()
-        if not torch.isfinite(w).all() or not torch.isfinite(mean) or mean <= 0:
-            return None
-        return w / mean
+        if not torch.isfinite(w).all():
+            raise ValueError("frame_weight_loss contains NaN or Inf")
+        if not (w > 0).all():
+            raise ValueError("frame_weight_loss values must all be > 0")
+        return w
 
     def _step_mse(
         self,
@@ -195,8 +197,8 @@ class EE6DActionSpace(BaseActionSpace):
         B, T, D = pred.shape
         _ensure_indices_valid(D, self.gripper_idx, "gripper_idx")
 
-        # 逐 step loss 权重：batch 内归一化到均值 1（doc §5.3）。None = 不加权。
-        w = self._normalize_step_weights(frame_weight_loss, pred)
+        # 逐 step loss 权重直接使用数据集中的最终乘数（doc §5.3）。
+        w = self._prepare_step_weights(frame_weight_loss, pred)
 
         # Gripper BCE —— 不参与关键帧加权（doc §5.4：gripper 权重恒为 1）
         g_losses = [self.bce(pred[:, :, gi], target[:, :, gi]) for gi in self.gripper_idx]
@@ -304,8 +306,8 @@ class AGIBOTEE6DActionSpace(BaseActionSpace):
         B, T, D = pred.shape
         _ensure_indices_valid(D, self.gripper_idx, "gripper_idx")
 
-        # 逐 step loss 权重：batch 内归一化到均值 1（doc §5.3）。None = 不加权。
-        w = self._normalize_step_weights(frame_weight_loss, pred)
+        # 逐 step loss 权重直接使用数据集中的最终乘数（doc §5.3）。
+        w = self._prepare_step_weights(frame_weight_loss, pred)
 
         # Gripper —— 不参与关键帧加权（doc §5.4：gripper 权重恒为 1）
         gripper_loss = self.mse(pred[:, :, self.gripper_idx], target[:, :, self.gripper_idx]) * self.GRIPPER_SCALE
@@ -363,8 +365,8 @@ class ARXEE6DActionSpace(BaseActionSpace):
         B, T, D = pred.shape
         _ensure_indices_valid(D, self.gripper_idx, "gripper_idx")
 
-        # 逐 step loss 权重：batch 内归一化到均值 1（doc §5.3）。None = 不加权。
-        w = self._normalize_step_weights(frame_weight_loss, pred)
+        # 逐 step loss 权重直接使用数据集中的最终乘数（doc §5.3）。
+        w = self._prepare_step_weights(frame_weight_loss, pred)
 
         # Gripper —— 不参与关键帧加权（doc §5.4：gripper 权重恒为 1）
         gripper_loss = self.mse(pred[:, :, self.gripper_idx], target[:, :, self.gripper_idx]) * self.GRIPPER_SCALE

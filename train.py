@@ -151,7 +151,7 @@ def get_args_parser():
         default=False,
         help="Enable per-step loss weighting for lerobot v3.0 datasets: the main table "
         "frame_weight_loss column (interpolated onto the future action chunk) weights the "
-        "position and rotation losses, normalized to mean 1.0 over the batch; gripper stays "
+        "position and rotation losses directly without normalization; gripper stays "
         "unweighted. Only the ee6d action-space family is supported",
     )
     # Optimizer
@@ -374,6 +374,50 @@ def resolve_resume(args) -> dict | None:
             f"--resume={args.resume}: weights dir missing: {info['weights_dir']}"
         )
     return info
+
+
+def validate_resume_training_options(resume_info: dict | None, args, logger) -> None:
+    """Prevent a resumed run from silently changing loss/sampling semantics.
+
+    Older checkpoints do not contain these fields; they remain loadable with an
+    explicit warning.  Checkpoints written by this version are strict.
+    """
+    if resume_info is None:
+        return
+    state_path = Path(resume_info["weights_dir"]) / "state.json"
+    with open(state_path) as f:
+        state = json.load(f)
+    saved = state.get("training_options")
+    if saved is None:
+        logger.warning(
+            f"Resume checkpoint {state_path} predates training_options metadata; "
+            "cannot verify frame-weight settings"
+        )
+        return
+    current = {
+        "frame_weight_sampling": bool(args.frame_weight_sampling),
+        "frame_weight_loss": bool(args.frame_weight_loss),
+    }
+    mismatches = {
+        key: (saved.get(key), value)
+        for key, value in current.items()
+        if saved.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "Resume frame-weight settings differ from checkpoint "
+            f"{state_path}: {mismatches}. Use the same flags or start a new run."
+        )
+
+
+def checkpoint_state(args, global_step: int) -> dict:
+    return {
+        "global_step": global_step,
+        "training_options": {
+            "frame_weight_sampling": bool(args.frame_weight_sampling),
+            "frame_weight_loss": bool(args.frame_weight_loss),
+        },
+    }
 
 
 def save_rng_state(path):
@@ -647,6 +691,7 @@ def main(args):
 
     # ---- Resume 解析：None 或 {weights_dir, model_state_dir, global_step} ----
     resume_info = resolve_resume(args)
+    validate_resume_training_options(resume_info, args, logger)
 
     set_seed(args.seed + accelerator.process_index)
     if resume_info is not None:
@@ -780,8 +825,6 @@ def main(args):
     # key 帧占比统计：累计 key 帧数与带 key 信息的样本数（跨 micro-batch / rank 归并）
     effective_key_sum_local = 0.0
     effective_key_samples_local = 0
-    # --frame_weight_loss 开启但数据集缺列时只告警一次（每个 rank 各一次），训练降级为不加权
-    warned_missing_frame_weight_loss = False
     while global_step < args.iters:
         # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
         # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
@@ -802,16 +845,14 @@ def main(args):
                 effective_key_samples_local += int(batch_key.numel())
 
             # 逐 step loss 权重：无论开关如何都先 pop，避免 model(**inputs) 意外吃到该字段。
-            # 开关关闭即丢弃；开关开启但数据集无该列时告警一次并降级为不加权。
+            # 开关关闭即丢弃；开关开启但数据集无该列时立即停止，避免静默变成不加权训练。
             frame_weight_loss = batch.pop("frame_weight_loss", None)
             if not args.frame_weight_loss:
                 frame_weight_loss = None
-            elif frame_weight_loss is None and not warned_missing_frame_weight_loss:
-                warned_missing_frame_weight_loss = True
-                logger.warning(
-                    "--frame_weight_loss is enabled but the dataset carries no "
-                    "frame_weight_loss column; per-step loss weighting is DISABLED for "
-                    "this run (train with unweighted loss)"
+            elif frame_weight_loss is None:
+                raise RuntimeError(
+                    "--frame_weight_loss is enabled but this batch carries no "
+                    "frame_weight_loss. Check the dataset main-table column and handler."
                 )
 
             # Encode language
@@ -1061,12 +1102,13 @@ def main(args):
                         optim.state_dict(),
                         os.path.join(model_state_dir, "optimizer.pt"),
                     )
+                    state = checkpoint_state(args, global_step)
                     with open(os.path.join(model_state_dir, "state.json"), "w") as f:
-                        json.dump({"global_step": global_step}, f)
+                        json.dump(state, f)
                     base_model.save_pretrained(weights_dir, safe_serialization=True)
                     processor.save_pretrained(weights_dir)
                     with open(os.path.join(weights_dir, "state.json"), "w") as f:
-                        json.dump({"global_step": global_step}, f)
+                        json.dump(state, f)
                 # 所有进程各自保存自己的 RNG（per-rank 文件，在 model_state 目录），
                 # resume 后各 rank 随机性独立
                 save_rng_state(
