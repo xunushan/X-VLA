@@ -230,22 +230,34 @@ class WristActionResidualXVLA(XVLA):
         `WristActionResidual.__init__` 的零初始化覆盖掉，进而破坏契约要求的
         「第 0 步与单主相机 base 数值等价」。
 
-        这里用 HF 自己的 missing_keys 判断，而不是猜路径：源含腕部权重（resume R0/R1
-        checkpoint）时一个键都不缺，分支不会被重建，已训权重安全。
+        这里用 HF 自己的 missing_keys 判断，而不是猜路径：源完全不含腕部权重时才
+        初始化整个新增分支；源含完整腕部权重（resume R0/R1 checkpoint）时不重建；
+        仅缺少部分腕部权重则立即报错，避免静默清空已经训练的残差参数。
         """
         wants_loading_info = bool(kwargs.get("output_loading_info", False))
         kwargs["output_loading_info"] = True
         model, loading_info = super().from_pretrained(
             pretrained_model_name_or_path, *model_args, **kwargs
         )
-        missing_wrist = [
+        missing_wrist = {
             key
             for key in (loading_info or {}).get("missing_keys", ())
             if key.startswith("wrist_residual.")
-        ]
-        if missing_wrist:
+        }
+        expected_wrist = {
+            f"wrist_residual.{key}"
+            for key in model.wrist_residual.state_dict().keys()
+        }
+        if missing_wrist == expected_wrist:
             model.wrist_residual.load_state_dict(
                 model._make_wrist_residual().state_dict()
+            )
+        elif missing_wrist:
+            absent = sorted(missing_wrist)
+            raise RuntimeError(
+                "Incomplete wrist residual checkpoint: "
+                f"missing {len(missing_wrist)}/{len(expected_wrist)} keys; "
+                f"first missing keys: {absent[:5]}"
             )
         if wants_loading_info:
             return model, loading_info

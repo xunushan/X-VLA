@@ -94,6 +94,7 @@ def test_from_pretrained_rebuilds_branch_when_source_lacks_wrist(monkeypatch):
     覆盖不到这里。
     """
     module = build("r0")
+    missing_keys = [f"wrist_residual.{key}" for key in module.state_dict()]
     with torch.no_grad():
         for parameter in module.parameters():
             parameter.fill_(float("nan"))
@@ -109,7 +110,7 @@ def test_from_pretrained_rebuilds_branch_when_source_lacks_wrist(monkeypatch):
         classmethod(
             lambda cls, *args, **kwargs: (
                 fake,
-                {"missing_keys": ["wrist_residual.output_head.weight"]},
+                {"missing_keys": missing_keys},
             )
         ),
     )
@@ -119,6 +120,28 @@ def test_from_pretrained_rebuilds_branch_when_source_lacks_wrist(monkeypatch):
     assert rebuilt == [True]
     assert torch.count_nonzero(module.output_head.weight).item() == 0
     assert torch.isfinite(module.output_head.bias).all()
+
+
+def test_from_pretrained_rejects_partially_missing_wrist_branch(monkeypatch):
+    """R0/R1 checkpoint 只缺部分 wrist 键时必须报错，不能静默重建整支。"""
+    module = build("r0")
+    fake = types.SimpleNamespace(
+        wrist_residual=module,
+        _make_wrist_residual=lambda: pytest.fail("部分缺失时不应重建腕部残差分支"),
+    )
+    monkeypatch.setattr(
+        XVLA,
+        "from_pretrained",
+        classmethod(
+            lambda cls, *args, **kwargs: (
+                fake,
+                {"missing_keys": ["wrist_residual.output_head.weight"]},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Incomplete wrist residual checkpoint"):
+        WristActionResidualXVLA.from_pretrained("dummy")
 
 
 def test_from_pretrained_keeps_branch_when_source_has_wrist(monkeypatch):
