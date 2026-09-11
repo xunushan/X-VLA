@@ -163,3 +163,68 @@ def test_from_pretrained_keeps_branch_when_source_has_wrist(monkeypatch):
     result = WristActionResidualXVLA.from_pretrained("dummy")
     assert result is fake
     assert module.output_head.bias.abs().max().item() == pytest.approx(0.25)
+
+
+def _r0_stats() -> dict:
+    return {
+        "residual_raw_mean_abs": torch.tensor(0.5),
+        "residual_raw_p95_abs": torch.tensor(0.9),
+        "residual_raw_max_abs": torch.tensor(1.5),
+        "residual_effective_mean_abs": torch.tensor(0.25),
+        "residual_effective_p50_abs": torch.tensor(0.2),
+        "residual_effective_p95_abs": torch.tensor(0.6),
+        "residual_effective_max_abs": torch.tensor(0.8),
+        "residual_effective_left_mean_abs": torch.tensor(0.3),
+        "residual_effective_right_mean_abs": torch.tensor(0.2),
+    }
+
+
+def _r1_stats() -> dict:
+    return {
+        **_r0_stats(),
+        "arm_gate_left": torch.tensor(0.12),
+        "arm_gate_right": torch.tensor(0.34),
+        "arm_gate_left_p10": torch.tensor(0.10),
+        "arm_gate_right_p10": torch.tensor(0.30),
+        "arm_gate_left_p90": torch.tensor(0.14),
+        "arm_gate_right_p90": torch.tensor(0.38),
+    }
+
+
+def test_collect_training_logs_prints_residual_line(capsys):
+    """残差幅度必须出现在控制台——train.py 的 f-string 不含这些键，只能由 hook 单独打。"""
+    from train_wrist_action_residual import collect_training_logs
+
+    module = types.SimpleNamespace(last_stats=_r0_stats())
+    model = types.SimpleNamespace(wrist_residual=module)
+    logs = collect_training_logs(model, None, 200, None)
+
+    out = capsys.readouterr().out
+    assert "[wrist-residual] step=200" in out
+    assert "eff mean=" in out
+    assert "raw mean=" in out
+    assert "L=" in out and "R=" in out
+    # train.py 的控制台格式仍需要这两个占位键
+    assert logs["lr_transformer_core"] == 0.0
+    assert logs["lr_vlm"] == 0.0
+    assert logs["residual_raw_mean_abs"] == pytest.approx(0.5)
+
+
+def test_residual_line_reports_gates_only_when_present(capsys):
+    """R0 无门控参数，不能打出门控字段；R1 必须打。"""
+    from train_wrist_action_residual import collect_training_logs
+
+    def run(stats):
+        model = types.SimpleNamespace(
+            wrist_residual=types.SimpleNamespace(last_stats=stats)
+        )
+        collect_training_logs(model, None, 200, None)
+        return capsys.readouterr().out
+
+    r0_line = run(_r0_stats())
+    assert "gate" not in r0_line
+
+    r1_line = run(_r1_stats())
+    assert "gate L=0.1200" in r1_line
+    assert "R=0.3400" in r1_line
+    assert "p10=" in r1_line and "p90=" in r1_line

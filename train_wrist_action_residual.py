@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
 from torch.optim import AdamW
 
 import train as base_train
@@ -105,8 +106,41 @@ def configure_training_step(optimizer, step: int, args) -> None:
             parameter.requires_grad = True
 
 
+def _is_main_process() -> bool:
+    """collect_training_logs 的签名里没有 accelerator，直接问 torch。"""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
+def format_residual_line(step: int, logs: dict) -> str:
+    """把腕部残差幅度和门控压成一行——train.py 的控制台格式不含这些字段。"""
+    line = (
+        f"[wrist-residual] step={step} "
+        f"raw mean={logs['residual_raw_mean_abs']:.3e} "
+        f"p95={logs['residual_raw_p95_abs']:.3e} "
+        f"max={logs['residual_raw_max_abs']:.3e} | "
+        f"eff mean={logs['residual_effective_mean_abs']:.3e} "
+        f"p50={logs['residual_effective_p50_abs']:.3e} "
+        f"p95={logs['residual_effective_p95_abs']:.3e} "
+        f"max={logs['residual_effective_max_abs']:.3e} | "
+        f"L={logs['residual_effective_left_mean_abs']:.3e} "
+        f"R={logs['residual_effective_right_mean_abs']:.3e}"
+    )
+    if "arm_gate_left" in logs:
+        line += (
+            f" | gate L={logs['arm_gate_left']:.4f} "
+            f"(p10={logs['arm_gate_left_p10']:.4f} "
+            f"p90={logs['arm_gate_left_p90']:.4f}) "
+            f"R={logs['arm_gate_right']:.4f} "
+            f"(p10={logs['arm_gate_right_p10']:.4f} "
+            f"p90={logs['arm_gate_right_p90']:.4f})"
+        )
+    return line
+
+
 def collect_training_logs(model, optim, step: int, args):
-    del optim, step, args
+    del optim, args
     logs = {
         name: float(value.detach().float().item())
         for name, value in model.wrist_residual.last_stats.items()
@@ -118,6 +152,10 @@ def collect_training_logs(model, optim, step: int, args):
     # train.py's stable console format expects these two names.
     logs["lr_transformer_core"] = 0.0
     logs["lr_vlm"] = 0.0
+    # 残差幅度只会进 TensorBoard（train.py 的控制台 f-string 不含这些键），
+    # 而它正是判断腕部支路是否真的在学东西的核心指标，故单独打一行。
+    if _is_main_process():
+        print(format_residual_line(step, logs), flush=True)
     return logs
 
 
