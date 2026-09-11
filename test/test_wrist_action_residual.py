@@ -66,6 +66,27 @@ def test_r0_has_no_gate_parameters():
     assert not any(name.startswith("arm_gate") for name, _ in module.named_parameters())
 
 
+@pytest.mark.parametrize("mode", ["r0", "r1"])
+def test_forward_supports_bfloat16(mode):
+    """混合精度下 forward 必须可用。
+
+    回归测试：R1 以 bf16 训练时 gates 是 bf16，而 torch.quantile 只接受
+    float/double，会抛 "quantile() input tensor must be either float or double
+    dtype"。R0 无 arm_gate 分支，故这条路径此前一直没被覆盖，冒烟（只跑 R0）
+    也测不到。
+    """
+    module = build(mode).to(torch.bfloat16).eval()
+    data = {
+        key: value.to(torch.bfloat16) if value.is_floating_point() else value
+        for key, value in inputs().items()
+    }
+    output = module(**data)
+    assert output.dtype == torch.bfloat16
+    assert module.last_stats, "统计信息不应为空"
+    for name, value in module.last_stats.items():
+        assert torch.isfinite(value).all(), f"{name} 不是有限值"
+
+
 def test_disable_residual_is_exactly_zero_even_with_nonzero_head():
     module = build("r1").eval()
     with torch.no_grad():

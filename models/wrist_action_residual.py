@@ -157,18 +157,22 @@ class WristActionResidual(nn.Module):
                 ].mean(),
             }
             if self.arm_gate is not None:
+                # quantile 只接受 float/double，而混合精度下 gates 是 bf16，
+                # 故先 detach 到 float32 再统计（与上面的 raw/effective 同口径）。
+                gate_left = gates[:, 0].detach().float()
+                gate_right = gates[:, 1].detach().float()
                 self.last_stats.update(
                     {
-                        "arm_gate_left": gates[:, 0].mean(),
-                        "arm_gate_right": gates[:, 1].mean(),
-                        "arm_gate_left_std": gates[:, 0].std(unbiased=False),
-                        "arm_gate_right_std": gates[:, 1].std(unbiased=False),
-                        "arm_gate_left_p10": torch.quantile(gates[:, 0], 0.10),
-                        "arm_gate_right_p10": torch.quantile(gates[:, 1], 0.10),
-                        "arm_gate_left_p50": torch.quantile(gates[:, 0], 0.50),
-                        "arm_gate_right_p50": torch.quantile(gates[:, 1], 0.50),
-                        "arm_gate_left_p90": torch.quantile(gates[:, 0], 0.90),
-                        "arm_gate_right_p90": torch.quantile(gates[:, 1], 0.90),
+                        "arm_gate_left": gate_left.mean(),
+                        "arm_gate_right": gate_right.mean(),
+                        "arm_gate_left_std": gate_left.std(unbiased=False),
+                        "arm_gate_right_std": gate_right.std(unbiased=False),
+                        "arm_gate_left_p10": torch.quantile(gate_left, 0.10),
+                        "arm_gate_right_p10": torch.quantile(gate_right, 0.10),
+                        "arm_gate_left_p50": torch.quantile(gate_left, 0.50),
+                        "arm_gate_right_p50": torch.quantile(gate_right, 0.50),
+                        "arm_gate_left_p90": torch.quantile(gate_left, 0.90),
+                        "arm_gate_right_p90": torch.quantile(gate_right, 0.90),
                     }
                 )
         return effective
