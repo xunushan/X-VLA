@@ -15,6 +15,9 @@ import pandas as pd
 
 # 逐帧关键帧标签列：新数据集用 keyframe_label（多标签，'|' 分隔），旧数据集的单串 stage 仍兼容。
 LABEL_COLUMN = "keyframe_label"
+# 双机械臂数据集把标签拆成左右臂两列（left/right_keyframe_label），没有合并列时取两列并集——
+# 这与数据集自身的 is_key_frame（= 任一臂非 none）逐帧一致，也复现了此前合并列的口径。
+ARM_LABEL_COLUMNS = ("left_keyframe_label", "right_keyframe_label")
 LEGACY_LABEL_COLUMN = "stage"
 LABEL_SEPARATOR = "|"
 # 非关键帧的标签取值（不计入任何标签桶，但仍计入 __all__）
@@ -121,6 +124,33 @@ def parse_labels(value) -> tuple[str, ...]:
     return tuple(dict.fromkeys(labels))
 
 
+def detect_label_columns(header) -> tuple[str | None, tuple[str, ...]]:
+    """定位逐帧标签来源，返回 (规范列名, 实际读取的源列)。
+
+    优先用合并列 keyframe_label；没有则退回左右臂两列（调用方取并集）；再退回旧 stage。
+    规范列名恒为 LABEL_COLUMN（左右臂场景也如此），使入库口径与历史行保持一致。
+    """
+    if LABEL_COLUMN in header:
+        return LABEL_COLUMN, (LABEL_COLUMN,)
+    if all(column in header for column in ARM_LABEL_COLUMNS):
+        return LABEL_COLUMN, ARM_LABEL_COLUMNS
+    if LEGACY_LABEL_COLUMN in header:
+        return LEGACY_LABEL_COLUMN, (LEGACY_LABEL_COLUMN,)
+    return None, ()
+
+
+def merge_label_columns(frame: pd.DataFrame, sources: tuple[str, ...]) -> pd.Series:
+    """从一列或多列标签构造每行标签元组；多列（左右臂）取并集，去重保序。"""
+    if len(sources) == 1:
+        return frame[sources[0]].map(parse_labels)
+    return frame.apply(
+        lambda row: tuple(
+            dict.fromkeys(label for column in sources for label in parse_labels(row[column]))
+        ),
+        axis=1,
+    )
+
+
 @lru_cache(maxsize=None)
 def bucket_keys(labels: tuple[str, ...]) -> tuple[str, ...]:
     """目标帧命中的所有标签桶 + 关键帧桶 + __all__。
@@ -141,18 +171,12 @@ def add_error(accumulator: dict, key: tuple, error: dict[str, float]) -> None:
 
 def load_inputs(
     baseline_csv: str | Path, split_file: str | Path, predictions_csv: str | Path
-) -> tuple[pd.DataFrame, pd.DataFrame, str, str, int, dict[int, str], str | None]:
+) -> tuple[pd.DataFrame, pd.DataFrame, str, str, int, dict[int, str], str | None, tuple[str, ...]]:
     validation, episode_to_task, task_names = split_metadata(split_file)
     header = pd.read_csv(baseline_csv, nrows=0).columns
-    if LABEL_COLUMN in header:
-        label_column = LABEL_COLUMN
-    elif LEGACY_LABEL_COLUMN in header:
-        label_column = LEGACY_LABEL_COLUMN
-    else:
-        label_column = None
+    label_column, label_sources = detect_label_columns(header)
     columns = ["episode_index", "frame_index", "action", "task_index"]
-    if label_column is not None:
-        columns.append(label_column)
+    columns.extend(label_sources)
     baseline = pd.read_csv(baseline_csv, usecols=columns)
     baseline = baseline[baseline["episode_index"].astype(int).isin(validation)].copy()
     if baseline.empty:
@@ -164,8 +188,8 @@ def load_inputs(
     if baseline["task_index"].isna().any():
         raise ValueError("some validation rows have no task_index")
     baseline["task_index"] = baseline["task_index"].astype(int)
-    if label_column is not None:
-        baseline["labels"] = baseline[label_column].map(parse_labels)
+    if label_sources:
+        baseline["labels"] = merge_label_columns(baseline, label_sources)
     else:
         baseline["labels"] = [() for _ in range(len(baseline))]
     baseline["action_array"] = baseline["action"].map(lambda value: parse_vector(value, 16))
@@ -218,7 +242,7 @@ def load_inputs(
     baseline = baseline.drop(columns=["action"])
     return (
         baseline, predictions, str(model_ids[0]), str(checkpoint_ids[0]), horizon,
-        task_names, label_column,
+        task_names, label_column, label_sources,
     )
 
 
@@ -371,7 +395,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    baseline, predictions, model_id, checkpoint_id, horizon, task_names, label_column = load_inputs(
+    (baseline, predictions, model_id, checkpoint_id, horizon, task_names,
+     label_column, label_sources) = load_inputs(
         args.baseline_csv, args.split_file, args.predictions_csv
     )
     per_episode = compute_curves(baseline, predictions, horizon)
@@ -392,6 +417,7 @@ def main() -> None:
         "execution_window": EXECUTION_WINDOW,
         "aggregation": ["frame", "episode", "task", "overall"],
         "label_column": label_column,
+        "label_source_columns": list(label_sources),
         "label_assignment": "target_frame",
         "bucket_keys": {"all": ALL_BUCKET, "keyframe": KEYFRAME_BUCKET},
         "keyframe_definition": f"{LABEL_COLUMN} != '{KEYFRAME_NONE_LABEL}'",
