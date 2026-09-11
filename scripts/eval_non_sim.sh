@@ -21,6 +21,9 @@ DOMAIN_ID="${XVLA_DOMAIN_ID:-}"
 # docstring：评估用默认不反转，baseline CSV 亦按此生成），故这里默认不反转。
 INVERT_GRIPPER="${XVLA_INVERT_GRIPPER:-false}"
 DTYPE="${XVLA_DTYPE:-auto}"
+# 推理入口（相对 evaluation/）默认为标准 X-VLA；R0/R1 腕部残差模型需换成
+# batch_inference_wrist_residual.py（它 monkeypatch 掉 load_model，CLI 参数完全一致）。
+INFER_ENTRY="${XVLA_INFER_ENTRY:-batch_inference.py}"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
@@ -46,4 +49,4 @@ else
   args+=(--no-invert-gripper)
 fi
 
-PYTHONPATH="${PROJECT_ROOT}" python "${PROJECT_ROOT}/evaluation/batch_inference.py" "${args[@]}"
+PYTHONPATH="${PROJECT_ROOT}" python "${PROJECT_ROOT}/evaluation/${INFER_ENTRY}" "${args[@]}"
