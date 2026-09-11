@@ -245,8 +245,7 @@ class WristActionResidualXVLA(XVLA):
             if key.startswith("wrist_residual.")
         }
         expected_wrist = {
-            f"wrist_residual.{key}"
-            for key in model.wrist_residual.state_dict().keys()
+            f"wrist_residual.{key}" for key in model.wrist_residual.state_dict().keys()
         }
         if missing_wrist == expected_wrist:
             model.wrist_residual.load_state_dict(
