@@ -177,11 +177,8 @@ class WristActionResidual(nn.Module):
 class WristActionResidualXVLA(XVLA):
     """X-VLA whose frozen single-camera base is corrected by wrist residuals."""
 
-    def __init__(self, config, *args, **kwargs):
-        super().__init__(config, *args, **kwargs)
-        mode = getattr(config, "wrist_residual_mode", None)
-        if mode not in {"r0", "r1"}:
-            raise ValueError(f"wrist_residual_mode must be 'r0' or 'r1', got {mode!r}")
+    def _se3_index_groups(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """左右臂各自允许残差修正的 action 维度下标。"""
         action_space = self.action_space
         required = ("POS_IDX_1", "POS_IDX_2", "ROT_IDX_1", "ROT_IDX_2")
         if not all(hasattr(action_space, name) for name in required):
@@ -190,26 +187,69 @@ class WristActionResidualXVLA(XVLA):
             )
         left = tuple(action_space.POS_IDX_1) + tuple(action_space.ROT_IDX_1)
         right = tuple(action_space.POS_IDX_2) + tuple(action_space.ROT_IDX_2)
-        visual_dim = int(self.vlm.config.projection_dim)
-        action_dim = action_space.dim_action
-        proprio_dim = getattr(action_space, "dim_proprio", action_dim)
-        self.wrist_residual = WristActionResidual(
-            visual_dim=visual_dim,
-            action_dim=action_dim,
-            proprio_dim=proprio_dim,
+        return left, right
+
+    def _make_wrist_residual(self) -> WristActionResidual:
+        """按 config 构造腕部残差分支；output_head 由 WristActionResidual 零初始化。"""
+        config = self.config
+        action_space = self.action_space
+        left, right = self._se3_index_groups()
+        return WristActionResidual(
+            visual_dim=int(self.vlm.config.projection_dim),
+            action_dim=action_space.dim_action,
+            proprio_dim=getattr(action_space, "dim_proprio", action_space.dim_action),
             time_dim=config.dim_time,
             hidden_size=int(getattr(config, "wrist_hidden_size", 384)),
             depth=int(getattr(config, "wrist_depth", 3)),
             num_heads=int(getattr(config, "wrist_num_heads", 6)),
             dropout=float(getattr(config, "wrist_dropout", 0.0)),
-            use_arm_gate=mode == "r1",
+            use_arm_gate=getattr(config, "wrist_residual_mode", None) == "r1",
             gate_init_logit=float(getattr(config, "wrist_gate_init_logit", -2.0)),
             se3_indices=left + right,
             left_se3_indices=left,
             right_se3_indices=right,
         )
+
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        mode = getattr(config, "wrist_residual_mode", None)
+        if mode not in {"r0", "r1"}:
+            raise ValueError(f"wrist_residual_mode must be 'r0' or 'r1', got {mode!r}")
+        self._se3_index_groups()  # 提前校验 action space 是双臂 SE(3)
+        self.wrist_residual = self._make_wrist_residual()
         self._freeze_base = True
         self._verify_step0 = bool(getattr(config, "wrist_verify_step0", False))
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """加载权重后保证腕部残差分支处于正确的初始状态。
+
+        源 checkpoint 不含 `wrist_residual.*`（官方 base 就是如此）时，这些参数不在
+        state dict 里，低内存加载路径用 `to_empty` 把它们留成**未初始化内存**，而 XVLA
+        没有定义 `_init_weights` 兜底——实测 output_head 会变成 NaN / ~5e20，把
+        `WristActionResidual.__init__` 的零初始化覆盖掉，进而破坏契约要求的
+        「第 0 步与单主相机 base 数值等价」。
+
+        这里用 HF 自己的 missing_keys 判断，而不是猜路径：源含腕部权重（resume R0/R1
+        checkpoint）时一个键都不缺，分支不会被重建，已训权重安全。
+        """
+        wants_loading_info = bool(kwargs.get("output_loading_info", False))
+        kwargs["output_loading_info"] = True
+        model, loading_info = super().from_pretrained(
+            pretrained_model_name_or_path, *model_args, **kwargs
+        )
+        missing_wrist = [
+            key
+            for key in (loading_info or {}).get("missing_keys", ())
+            if key.startswith("wrist_residual.")
+        ]
+        if missing_wrist:
+            model.wrist_residual.load_state_dict(
+                model._make_wrist_residual().state_dict()
+            )
+        if wants_loading_info:
+            return model, loading_info
+        return model
 
     def train(self, mode: bool = True):
         super().train(mode)
