@@ -49,6 +49,7 @@ def args():
     a.freeze_steps = 100
     a.warmup_steps = 200
     a.iters = 1000
+    a.cosine_decay_end_step = None
     a.min_lr_ratio = 0.1
     a.use_cosine_decay = True
     return a
@@ -109,6 +110,23 @@ def test_linear_warmup_cosine(args):
     # cosine 衰减段：step=500 → 已达峰值后衰减
     v2 = linear_warmup_cosine(500, 100, 200, 1000, 1e-4, 0.1)
     assert v2 < 1e-4 and v2 > 1e-5
+
+
+def test_cosine_decay_end_step_is_independent_from_iters(args):
+    from train import build_optimizer, configure_training_step, linear_warmup_cosine
+
+    model = FakeXVLA()
+    optim = build_optimizer(model, args.learning_rate, 0.0, (0.9, 0.95), args.learning_coef)
+    args.iters = 500
+    args.cosine_decay_end_step = 1000
+    configure_training_step(optim, step=500, args=args)
+    lrs = {g["name"]: g["lr"] for g in optim.param_groups}
+
+    # The LR follows the independent 1000-step cosine horizon rather than
+    # reaching min_lr_ratio at the shorter 500-step training stop.
+    expected = linear_warmup_cosine(500, 100, 200, 1000, 1e-4, 0.1)
+    assert lrs["action_heads"] == pytest.approx(expected)
+    assert lrs["action_heads"] > 1e-5
 
 
 # ---------------------------------------------------------------- Accelerator 梯度累积
@@ -202,12 +220,20 @@ def test_resolve_resume_none(tmp_path):
 def test_checkpoint_state_records_frame_weight_options():
     from train import checkpoint_state
 
-    args = argparse.Namespace(frame_weight_sampling=True, frame_weight_loss=False)
+    args = argparse.Namespace(
+        frame_weight_sampling=True,
+        frame_weight_loss=False,
+        use_cosine_decay=True,
+        cosine_decay_end_step=500,
+        iters=123,
+    )
     assert checkpoint_state(args, 123) == {
         "global_step": 123,
         "training_options": {
             "frame_weight_sampling": True,
             "frame_weight_loss": False,
+            "use_cosine_decay": True,
+            "cosine_decay_end_step": 500,
         },
     }
 

@@ -97,6 +97,15 @@ def get_args_parser():
     parser.add_argument("--freeze_steps", type=int, default=1000)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--use_cosine_decay", action="store_true", default=False)
+    parser.add_argument(
+        "--cosine_decay_end_step",
+        type=int,
+        default=None,
+        help=(
+            "Global optimizer step at which cosine decay reaches min_lr_ratio. "
+            "Defaults to --iters for backward compatibility."
+        ),
+    )
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
 
     # Logging / saving
@@ -166,7 +175,17 @@ def update_group_lrs(optim, step, args):
         "action_heads": args.learning_rate,
     }
     def schedule(step, base_lr):
-        return linear_warmup_cosine(step, args.freeze_steps, args.warmup_steps, args.iters, base_lr, args.min_lr_ratio)
+        cosine_end = getattr(args, "cosine_decay_end_step", None)
+        cosine_end = args.iters if cosine_end is None else cosine_end
+        if (
+            getattr(args, "cosine_decay_end_step", None) is not None
+            and cosine_end <= args.freeze_steps + args.warmup_steps
+        ):
+            raise ValueError(
+                "cosine_decay_end_step must be greater than "
+                "freeze_steps + warmup_steps"
+            )
+        return linear_warmup_cosine(step, args.freeze_steps, args.warmup_steps, cosine_end, base_lr, args.min_lr_ratio)
     if step < args.freeze_steps:
         set_group_lr(optim, "vlm", 0.0)
         set_group_lr(optim, "transformer_core", 0.0)

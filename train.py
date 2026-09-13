@@ -171,6 +171,17 @@ def get_args_parser():
     parser.add_argument("--freeze_steps", type=int, default=1000)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--use_cosine_decay", action="store_true", default=False)
+    parser.add_argument(
+        "--cosine_decay_end_step",
+        type=int,
+        default=None,
+        help=(
+            "Global optimizer step at which cosine decay reaches min_lr_ratio. "
+            "Defaults to --iters, preserving the legacy schedule. This can be "
+            "larger than --iters when training is intentionally stopped before "
+            "the cosine schedule reaches its minimum."
+        ),
+    )
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
 
     # Logging / saving
@@ -398,6 +409,12 @@ def validate_resume_training_options(resume_info: dict | None, args, logger) -> 
         "frame_weight_sampling": bool(args.frame_weight_sampling),
         "frame_weight_loss": bool(args.frame_weight_loss),
     }
+    if "use_cosine_decay" in saved:
+        current["use_cosine_decay"] = bool(getattr(args, "use_cosine_decay", False))
+    if "cosine_decay_end_step" in saved:
+        current["cosine_decay_end_step"] = (
+            getattr(args, "cosine_decay_end_step", None) or args.iters
+        )
     mismatches = {
         key: (saved.get(key), value)
         for key, value in current.items()
@@ -405,7 +422,7 @@ def validate_resume_training_options(resume_info: dict | None, args, logger) -> 
     }
     if mismatches:
         raise ValueError(
-            "Resume frame-weight settings differ from checkpoint "
+            "Resume training settings differ from checkpoint "
             f"{state_path}: {mismatches}. Use the same flags or start a new run."
         )
 
@@ -416,6 +433,10 @@ def checkpoint_state(args, global_step: int) -> dict:
         "training_options": {
             "frame_weight_sampling": bool(args.frame_weight_sampling),
             "frame_weight_loss": bool(args.frame_weight_loss),
+            "use_cosine_decay": bool(getattr(args, "use_cosine_decay", False)),
+            "cosine_decay_end_step": (
+                getattr(args, "cosine_decay_end_step", None) or args.iters
+            ),
         },
     }
 
@@ -611,11 +632,21 @@ def configure_training_step(optim, step, args):
     }
 
     def schedule(step, base_lr):
+        cosine_end = getattr(args, "cosine_decay_end_step", None)
+        cosine_end = args.iters if cosine_end is None else cosine_end
+        if (
+            getattr(args, "cosine_decay_end_step", None) is not None
+            and cosine_end <= args.freeze_steps + args.warmup_steps
+        ):
+            raise ValueError(
+                "cosine_decay_end_step must be greater than "
+                "freeze_steps + warmup_steps"
+            )
         return linear_warmup_cosine(
             step,
             args.freeze_steps,
             args.warmup_steps,
-            args.iters,
+            cosine_end,
             base_lr,
             args.min_lr_ratio,
         )
