@@ -45,6 +45,16 @@ description: Run X-VLA validation-set batch inference once on the GPU server, do
 
 换 GPU / 改图像分辨率时先用小 batch 探针确认显存上限，再经 `XVLA_BATCH_SIZE` 覆盖。
 
+**推理入口（`XVLA_INFER_ENTRY`，默认 `batch_inference.py`）**：标准 X-VLA 模型不用设。
+R0/R1 腕部残差模型（`models/wrist_action_residual.py`）必须设
+`XVLA_INFER_ENTRY=batch_inference_wrist_residual.py`——该入口 monkeypatch 掉
+`batch_inference.load_model` 换成 `WristActionResidualXVLA`，**CLI 参数与标准入口完全一致**。
+两个约束：
+- R0/R1 **强制 3 路**（模型内 `_encode_main_and_wrists` 要求 `[main,left_wrist,right_wrist]`
+  顺序且三路全有效，否则抛 ValueError），故必须 `XVLA_NUM_VIEWS=3` / `XVLA_BATCH_SIZE=192`。
+- checkpoint 的 `config.json` 必须含 `wrist_residual_mode`（训练脚本会写入）；含 71 个
+  `wrist_residual.*` 键时 `from_pretrained` 走"保留已训权重"分支，不会重建分支。
+
 其余口径（勿改动）：
 - **gripper 不要反转**。指标口径 canonical EE16 的 gripper 与 X-VLA 20 维原生极性一致
   （`xvla_datasets/utils.py::xvla20_to_ee16` docstring：评估用默认不反转，baseline CSV 同口径）。
@@ -119,8 +129,32 @@ python evaluation/evaluate_ee.py \
 
 指标口径：`comparisons`=参与平均的逐帧误差观测数；
 位置 `mean_position_cm`(cm)/`mean_position_mse_cm2`(cm²)、旋转 `mean_rotation_deg`(deg，quat 夹角
-2·acos|dot|)/`mean_rotation_mse_deg2`(deg²) 均为左右臂 mean 级；gripper 统一 `mean_gripper_mse`
-(0..1 无量纲)。均按 episode 宏平均；lead=预测第 L 步 vs 专家 f+L，execution=整窗执行平均单步误差。
+2·acos|dot|)/`mean_rotation_mse_deg2`(deg²)、gripper `mean_gripper_mse`(0..1 无量纲)。
+均按 episode 宏平均；**lead L = 站在 t−L 用 chunk 第 L 步预测 a_t 的误差**（目标帧 t 为中心），
+execution = 每 30 帧一个 anchor，评价该 anchor 前 30 个实际执行动作的单步误差。
+
+**输出范围（2026-09-13 口径）**：
+- 整体 + 每个任务各出 `__all__`：`execution 30` + `lead 1/10/20/30`。
+- 每个任务额外出**按标签名**的桶（不分臂建桶）：**只出 lead 1/10/20/30**，不出 execution。
+- `__keyframe__`（双标签并集）桶已取消。
+
+**标签桶的臂口径**：`left_keyframe_label`/`right_keyframe_label` 逐臂读取，标签桶只统计
+**真的带了该标签的那条臂**的误差。旧口径取两臂均值，把不做该事件的另一条臂的误差混了进来——
+偏差方向取决于哪条臂更差，不是单向：全库 65 行实测 2424 个标签桶 lead 节点中 2116 个变大、
+308 个变小，倍数 x0.50–x2.86（中位 x1.47），相对变化中位 47%。同帧两臂带同名标签时取两臂均值
+（本数据集不出现）。
+
+- 桶归属按**目标帧**（预测第 L 步对齐的专家帧 t），与 anchor 无关。
+- 单帧多标签在每个命中标签桶里各计一次；`by_task`/`by_episode` 使用
+  `arm_assignment=per_target_frame`，`physical_arms_seen` 仅表示不同目标帧或 episode 中
+  曾承担该事件的物理臂并集，不表示每帧都对这些手臂求均值。
+- 标签桶没有 `left_*`/`right_*` 分臂列（`mean_*` 就是所选臂的值，MSE 在
+  `evaluate_ee.py` 里显式计算而非入库时反推）；`__all__` 仍有全部分臂列。
+- 各任务标签不同（task0 笔/笔筒，task1 插头，task2 碗）；**标签桶只在 task 层**，
+  overall 仍只有 `__all__`（不跨任务统计）。无标签列时退化为只有 `__all__`。
+- 同时存在逐臂列与历史合并列时优先逐臂列。只有单列标签（历史合并 `keyframe_label` / 旧
+  `stage`）时因没有臂归属信息，标签桶才退化为双臂均值（等价历史口径），
+  `physical_arms_seen` 显示 `left|right`。
 
 ② 登记进统一 SQLite（本地 `evaluation/record_offline_sqlite.py`）：
 
@@ -135,7 +169,9 @@ python evaluation/record_offline_sqlite.py \
 - 全仓库只有一个 `offline_evaluations.sqlite`，主键 `(model_id, checkpoint_id)`，重复登记即覆盖。
 - 表字段（已确认）：`model_id, checkpoint_id, eval_date, action_horizon, num_predictions,
   predictions_csv, results_json`。除预测结果文件路径外，其它文件路径不入表；
-  指标以 `results_json`（聚合 overall + per-task 的 lead/execution 曲线 + 可选 inference 性能）存 JSON。
+  指标以 `results_json`（聚合 overall + per-task 的 lead/execution 曲线 + 可选 inference 性能）存 JSON；
+  `metrics.tasks.<t>.metrics` 下按桶名嵌套（各任务标签桶不同），`metrics.overall.metrics` 只有 `__all__`，
+  另有 `buckets` 自述块（label_column/关键帧定义/多标签口径/各任务标签清单）。
 - `--flat-csv` 由 DB 反解刷新一行一 run 的可读 CSV 表。
 
 ## 4. 测试期清理
