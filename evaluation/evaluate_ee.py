@@ -15,34 +15,46 @@ import pandas as pd
 
 # 逐帧关键帧标签列：新数据集用 keyframe_label（多标签，'|' 分隔），旧数据集的单串 stage 仍兼容。
 LABEL_COLUMN = "keyframe_label"
-# 双机械臂数据集把标签拆成左右臂两列（left/right_keyframe_label），没有合并列时取两列并集——
-# 这与数据集自身的 is_key_frame（= 任一臂非 none）逐帧一致，也复现了此前合并列的口径。
+# 双机械臂数据集把标签拆成左右臂两列（left/right_keyframe_label）。标签桶**按标签名**建，
+# 每个标签只统计“真的带了该标签的那条臂”，绝不把没做该动作的另一条臂算进来。
 ARM_LABEL_COLUMNS = ("left_keyframe_label", "right_keyframe_label")
 LEGACY_LABEL_COLUMN = "stage"
 LABEL_SEPARATOR = "|"
 # 非关键帧的标签取值（不计入任何标签桶，但仍计入 __all__）
 KEYFRAME_NONE_LABEL = "none"
-# 桶名：__all__ = 全部帧；__keyframe__ = 目标帧是关键帧（label != 'none'）。
+# 唯一保留的桶名：__all__ = 全部帧（双臂）。标签桶直接用标签名本身。
 ALL_BUCKET = "__all__"
-KEYFRAME_BUCKET = "__keyframe__"
 
-METRIC_NAMES = (
+ARM_LEFT = "left"
+ARM_RIGHT = "right"
+ARMS_BOTH = (ARM_LEFT, ARM_RIGHT)
+
+# 单臂可分辨的指标（只对双臂都参与的桶有意义；单臂标签桶里为 NaN）
+SIDE_METRICS = (
     "left_position_cm",
     "right_position_cm",
-    "mean_position_cm",
     "left_position_mse_cm2",
     "right_position_mse_cm2",
     "left_rotation_deg",
     "right_rotation_deg",
-    "mean_rotation_deg",
     "left_rotation_mse_deg2",
     "right_rotation_mse_deg2",
     "left_gripper_mae",
     "right_gripper_mae",
-    "mean_gripper_mae",
     "left_gripper_mse",
     "right_gripper_mse",
 )
+# “该桶所选臂”的均值级指标：__all__ = 双臂均值；单臂标签桶 = 该臂的值。
+# mean_*_mse 在此显式计算（而不是入库时用 (左+右)/2 反推），单臂桶才能承载自己的平方误差。
+MEAN_METRICS = (
+    "mean_position_cm",
+    "mean_position_mse_cm2",
+    "mean_rotation_deg",
+    "mean_rotation_mse_deg2",
+    "mean_gripper_mae",
+    "mean_gripper_mse",
+)
+METRIC_NAMES = SIDE_METRICS + MEAN_METRICS
 
 LEAD_STEPS = (1, 10, 20, 30)
 EXECUTION_WINDOW = 30
@@ -99,16 +111,37 @@ def ee_errors(predicted: np.ndarray, expert: np.ndarray) -> dict[str, float]:
         "mean_position_cm": (left_position + right_position) / 2.0,
         "left_position_mse_cm2": left_position**2,
         "right_position_mse_cm2": right_position**2,
+        "mean_position_mse_cm2": (left_position**2 + right_position**2) / 2.0,
         "left_rotation_deg": left_rotation,
         "right_rotation_deg": right_rotation,
         "mean_rotation_deg": (left_rotation + right_rotation) / 2.0,
         "left_rotation_mse_deg2": left_rotation**2,
         "right_rotation_mse_deg2": right_rotation**2,
+        "mean_rotation_mse_deg2": (left_rotation**2 + right_rotation**2) / 2.0,
         "left_gripper_mae": left_gripper,
         "right_gripper_mae": right_gripper,
         "mean_gripper_mae": (left_gripper + right_gripper) / 2.0,
         "left_gripper_mse": left_gripper**2,
         "right_gripper_mse": right_gripper**2,
+        "mean_gripper_mse": (left_gripper**2 + right_gripper**2) / 2.0,
+    }
+
+
+def arm_mean_metrics(error: dict[str, float], arms: tuple[str, ...]) -> dict[str, float]:
+    """把双臂 15 项误差收敛成“所选臂”的 mean 级指标。
+
+    单臂 → 直接取该臂；双臂 → 两臂均值（与 ee_errors 的 mean_* 完全一致，故 __all__ 桶数值不变）。
+    """
+    if len(arms) == 2:
+        return {name: error[name] for name in MEAN_METRICS}
+    arm = arms[0]
+    return {
+        "mean_position_cm": error[f"{arm}_position_cm"],
+        "mean_position_mse_cm2": error[f"{arm}_position_mse_cm2"],
+        "mean_rotation_deg": error[f"{arm}_rotation_deg"],
+        "mean_rotation_mse_deg2": error[f"{arm}_rotation_mse_deg2"],
+        "mean_gripper_mae": error[f"{arm}_gripper_mae"],
+        "mean_gripper_mse": error[f"{arm}_gripper_mse"],
     }
 
 
@@ -127,46 +160,73 @@ def parse_labels(value) -> tuple[str, ...]:
 def detect_label_columns(header) -> tuple[str | None, tuple[str, ...]]:
     """定位逐帧标签来源，返回 (规范列名, 实际读取的源列)。
 
-    优先用合并列 keyframe_label；没有则退回左右臂两列（调用方取并集）；再退回旧 stage。
-    规范列名恒为 LABEL_COLUMN（左右臂场景也如此），使入库口径与历史行保持一致。
+    优先用左右臂两列（逐臂读取，标签桶只用带标签那条臂）；没有才退回合并列
+    keyframe_label，再退回旧 stage。规范列名恒为 LABEL_COLUMN（左右臂场景也如此），
+    使入库口径与历史行一致。
     """
-    if LABEL_COLUMN in header:
-        return LABEL_COLUMN, (LABEL_COLUMN,)
     if all(column in header for column in ARM_LABEL_COLUMNS):
         return LABEL_COLUMN, ARM_LABEL_COLUMNS
+    if LABEL_COLUMN in header:
+        return LABEL_COLUMN, (LABEL_COLUMN,)
     if LEGACY_LABEL_COLUMN in header:
         return LEGACY_LABEL_COLUMN, (LEGACY_LABEL_COLUMN,)
     return None, ()
 
 
-def merge_label_columns(frame: pd.DataFrame, sources: tuple[str, ...]) -> pd.Series:
-    """从一列或多列标签构造每行标签元组；多列（左右臂）取并集，去重保序。"""
-    if len(sources) == 1:
-        return frame[sources[0]].map(parse_labels)
-    return frame.apply(
-        lambda row: tuple(
-            dict.fromkeys(label for column in sources for label in parse_labels(row[column]))
-        ),
-        axis=1,
-    )
+def arm_label_columns(frame: pd.DataFrame, sources: tuple[str, ...]) -> tuple[pd.Series, pd.Series]:
+    """返回 (左臂标签, 右臂标签)。
+
+    双列数据集逐臂读取；单列（历史合并 keyframe_label / 旧 stage）两臂同值——这类数据没有
+    臂归属信息，标签桶退化为双臂均值，等价于历史口径。
+    """
+    if tuple(sources) == ARM_LABEL_COLUMNS:
+        return (
+            frame[ARM_LABEL_COLUMNS[0]].map(parse_labels),
+            frame[ARM_LABEL_COLUMNS[1]].map(parse_labels),
+        )
+    if sources:
+        labels = frame[sources[0]].map(parse_labels)
+        return labels, labels
+    empty = pd.Series([()] * len(frame), index=frame.index)
+    return empty, empty
 
 
 @lru_cache(maxsize=None)
-def bucket_keys(labels: tuple[str, ...]) -> tuple[str, ...]:
-    """目标帧命中的所有标签桶 + 关键帧桶 + __all__。
+def label_arms(
+    left_labels: tuple[str, ...], right_labels: tuple[str, ...]
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """目标帧上 标签名 -> 带该标签的臂；多标签帧在每个命中标签桶里各计一次。"""
+    arms: dict[str, list[str]] = {}
+    for arm, labels in ((ARM_LEFT, left_labels), (ARM_RIGHT, right_labels)):
+        for label in labels:
+            arms.setdefault(label, []).append(arm)
+    return tuple((label, tuple(values)) for label, values in arms.items())
 
-    多标签帧（如 'grasp_pen|place_pen'）在每个标签桶里各计一次。
+
+def new_cell() -> dict:
+    return {
+        "comparisons": 0,
+        "side_comparisons": 0,  # 双臂都参与的比较数：决定 side 指标是否有值
+        "arms": defaultdict(int),
+        "sums": defaultdict(float),
+    }
+
+
+def add_error(accumulator: dict, key: tuple, error: dict[str, float], arms: tuple[str, ...]) -> None:
+    """把一次比较累加进一个桶；mean 级指标只取 `arms`（真的带了该桶标签的臂）。
+
+    `arms` 为双臂时同时累加 left_*/right_* 分臂指标；单臂标签桶不产 side 指标（记 NaN）。
     """
-    if not labels:
-        return (ALL_BUCKET,)
-    return (ALL_BUCKET, KEYFRAME_BUCKET, *labels)
-
-
-def add_error(accumulator: dict, key: tuple, error: dict[str, float]) -> None:
     cell = accumulator[key]
     cell["comparisons"] += 1
-    for name, value in error.items():
-        cell[name] += value
+    for arm in arms:
+        cell["arms"][arm] += 1
+    if len(arms) == 2:
+        cell["side_comparisons"] += 1
+        for name in SIDE_METRICS:
+            cell["sums"][name] += error[name]
+    for name, value in arm_mean_metrics(error, arms).items():
+        cell["sums"][name] += value
 
 
 def load_inputs(
@@ -188,10 +248,7 @@ def load_inputs(
     if baseline["task_index"].isna().any():
         raise ValueError("some validation rows have no task_index")
     baseline["task_index"] = baseline["task_index"].astype(int)
-    if label_sources:
-        baseline["labels"] = merge_label_columns(baseline, label_sources)
-    else:
-        baseline["labels"] = [() for _ in range(len(baseline))]
+    baseline["left_labels"], baseline["right_labels"] = arm_label_columns(baseline, label_sources)
     baseline["action_array"] = baseline["action"].map(lambda value: parse_vector(value, 16))
 
     predictions = pd.read_csv(predictions_csv)
@@ -251,7 +308,7 @@ def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: i
         raise ValueError(
             f"action_horizon={horizon} is shorter than execution_window={EXECUTION_WINDOW}"
         )
-    accumulator = defaultdict(lambda: defaultdict(float))
+    accumulator: dict[tuple, dict] = defaultdict(new_cell)
     base_by_episode = {
         int(episode): group.set_index("frame_index")
         for episode, group in baseline.groupby("episode_index", sort=False)
@@ -264,61 +321,61 @@ def compute_curves(baseline: pd.DataFrame, predictions: pd.DataFrame, horizon: i
         task_index = int(expert_rows["task_index"].iloc[0])
 
         # lead 指标以“待评价的目标帧”为中心：对于目标帧 t 和提前量 L，
-        # 严格取 anchor=t-L 的 action chunk 中第 L 步预测。这样关键帧标签天然
-        # 属于当前被预测的目标帧，而不是属于发起预测的 anchor。
+        # 严格取 anchor=t-L 的 action chunk 中第 L 步预测（即 a_t 的误差，站在 t-L 去预测 a_t）。
+        # 这样关键帧标签天然属于当前被预测的目标帧，而不是属于发起预测的 anchor。
         predictions_by_anchor = {
             int(row.frame_index): row.prediction_array
             for row in rows.itertuples(index=False)
         }
         for target in expert_rows.index:
             target = int(target)
-            target_keys = bucket_keys(expert_rows.loc[target, "labels"])
-            expert_action = expert_rows.loc[target, "action_array"]
+            expert_row = expert_rows.loc[target]
+            arms_by_label = label_arms(expert_row["left_labels"], expert_row["right_labels"])
+            expert_action = expert_row["action_array"]
             for lead in LEAD_STEPS:
                 anchor = target - lead
                 predicted = predictions_by_anchor.get(anchor)
                 if predicted is None:
                     continue
                 error = ee_errors(predicted[lead - 1], expert_action)
-                for label_key in target_keys:
-                    add_error(accumulator, (episode, task_index, "lead", lead, label_key), error)
+                # __all__ 恒为双臂；标签桶只取“真的带该标签”的那条臂
+                add_error(accumulator, (episode, task_index, "lead", lead, ALL_BUCKET), error, ARMS_BOTH)
+                for label, arms in arms_by_label:
+                    add_error(accumulator, (episode, task_index, "lead", lead, label), error, arms)
 
-        # execution 指标保持部署时的执行逻辑：每 30 帧推理一次，并评价该
-        # anchor 的前 30 个实际执行动作；每一步仍按其目标帧标签归类。
+        # execution 指标保持部署时的执行逻辑：每 30 帧推理一次，评价该 anchor 的前 30 个
+        # 实际执行动作（a_{anchor+1..anchor+30} 的误差），只有 __all__ 桶（标签桶只出 lead）。
         for row in rows.itertuples(index=False):
             anchor = int(row.frame_index)
             if anchor not in expert_rows.index:
                 raise ValueError(f"prediction anchor missing from baseline: episode={episode} frame={anchor}")
+            if anchor % EXECUTION_WINDOW != 0:
+                continue
             predicted = row.prediction_array
-            execution_errors = []
+            key = (episode, task_index, "execution", EXECUTION_WINDOW, ALL_BUCKET)
             for lead in range(1, EXECUTION_WINDOW + 1):
-                target = anchor + lead
-                error = ee_errors(predicted[lead - 1], expert_rows.loc[target, "action_array"])
-                # 桶按“目标帧”（预测第 L 步对齐的专家帧 f+L）的标签归属，与 anchor 无关
-                target_keys = bucket_keys(expert_rows.loc[target, "labels"])
-                execution_errors.append((error, target_keys))
-
-            if anchor % EXECUTION_WINDOW == 0:
-                for error, target_keys in execution_errors:
-                    for label_key in target_keys:
-                        add_error(
-                            accumulator,
-                            (episode, task_index, "execution", EXECUTION_WINDOW, label_key),
-                            error,
-                        )
+                error = ee_errors(predicted[lead - 1], expert_rows.loc[anchor + lead, "action_array"])
+                add_error(accumulator, key, error, ARMS_BOTH)
 
     records = []
-    for (episode, task, curve, step, label), values in accumulator.items():
-        count = int(values["comparisons"])
+    for (episode, task, curve, step, label), cell in accumulator.items():
+        count = int(cell["comparisons"])
+        side_count = int(cell["side_comparisons"])
         record = {
             "episode_index": episode,
             "task_index": task,
             "label": label,
+            "physical_arms_seen": "|".join(sorted(cell["arms"])),
+            "arm_assignment": "per_target_frame",
             "curve": curve,
             "step": step,
             "comparisons": count,
         }
-        record.update({name: values[name] / count for name in METRIC_NAMES})
+        # side 指标只在双臂都参与时有意义（单臂标签桶记 NaN，不参与聚合）
+        for name in SIDE_METRICS:
+            record[name] = (cell["sums"][name] / side_count) if side_count else float("nan")
+        for name in MEAN_METRICS:
+            record[name] = cell["sums"][name] / count
         records.append(record)
     if not records:
         raise ValueError("no aligned prediction/expert comparisons")
@@ -332,6 +389,11 @@ def aggregate_episode_macro(per_episode: pd.DataFrame) -> pd.DataFrame:
         record = dict(zip(keys, key, strict=True))
         record["aggregation_level"] = "task"
         record["macro_unit"] = "episode"
+        record["physical_arms_seen"] = "|".join(sorted({
+            arm for value in group["physical_arms_seen"]
+            for arm in str(value).split("|") if arm
+        }))
+        record["arm_assignment"] = "per_target_frame"
         record["num_episodes"] = int(group["episode_index"].nunique())
         record["num_tasks"] = 1
         record["comparisons"] = int(group["comparisons"].sum())
@@ -348,6 +410,11 @@ def aggregate_episode_macro(per_episode: pd.DataFrame) -> pd.DataFrame:
         record = {"task_index": -1, "label": ALL_BUCKET, **dict(zip(overall_keys, key, strict=True))}
         record["aggregation_level"] = "overall"
         record["macro_unit"] = "task"
+        record["physical_arms_seen"] = "|".join(sorted({
+            arm for value in group["physical_arms_seen"]
+            for arm in str(value).split("|") if arm
+        }))
+        record["arm_assignment"] = "per_target_frame"
         record["num_episodes"] = int(group["num_episodes"].sum())
         record["num_tasks"] = int(group["task_index"].nunique())
         record["comparisons"] = int(group["comparisons"].sum())
@@ -359,13 +426,32 @@ def aggregate_episode_macro(per_episode: pd.DataFrame) -> pd.DataFrame:
 
 
 def task_label_stats(baseline: pd.DataFrame) -> dict[str, dict]:
-    """逐任务的标签清单与关键帧占比（标签框定数据集/训练口径，便于核对）。"""
+    """逐任务的标签清单、各标签的归属臂与样本量（直接对应标签桶取哪些帧、算哪条臂）。"""
     stats: dict[str, dict] = {}
     for task_index, group in baseline.groupby("task_index", sort=True):
-        labels = sorted({label for row in group["labels"] for label in row})
-        keyframes = int(group["labels"].map(len).gt(0).sum())
+        label_arms_seen: dict[str, set[str]] = {}
+        label_frames: dict[str, int] = {}
+        label_arm_frames: dict[str, dict[str, int]] = {}
+        for left_labels, right_labels in zip(
+            group["left_labels"], group["right_labels"], strict=True
+        ):
+            for label in dict.fromkeys((*left_labels, *right_labels)):
+                label_frames[label] = label_frames.get(label, 0) + 1
+            for arm, labels in ((ARM_LEFT, left_labels), (ARM_RIGHT, right_labels)):
+                for label in labels:
+                    label_arms_seen.setdefault(label, set()).add(arm)
+                    label_arm_frames.setdefault(label, {})
+                    label_arm_frames[label][arm] = label_arm_frames[label].get(arm, 0) + 1
+        keyframes = int(
+            (group["left_labels"].map(len) + group["right_labels"].map(len)).gt(0).sum()
+        )
         stats[str(int(task_index))] = {
-            "labels": labels,
+            "labels": sorted(label_arms_seen),
+            "label_arms": {key: sorted(label_arms_seen[key]) for key in sorted(label_arms_seen)},
+            "label_frames": {key: label_frames[key] for key in sorted(label_frames)},
+            "label_arm_frames": {
+                key: label_arm_frames[key] for key in sorted(label_arm_frames)
+            },
             "keyframe_frames": keyframes,
             "total_frames": int(len(group)),
             "keyframe_fraction": round(keyframes / len(group), 4) if len(group) else 0.0,
@@ -419,10 +505,24 @@ def main() -> None:
         "label_column": label_column,
         "label_source_columns": list(label_sources),
         "label_assignment": "target_frame",
-        "bucket_keys": {"all": ALL_BUCKET, "keyframe": KEYFRAME_BUCKET},
-        "keyframe_definition": f"{LABEL_COLUMN} != '{KEYFRAME_NONE_LABEL}'",
-        "multilabel_policy": "a frame carrying several labels counts in every one of them",
+        "label_buckets": {
+            "key": "标签名本身（不分臂建桶）",
+            "arm_assignment": "per_target_frame，只统计目标帧中带该标签的手臂",
+            "corner": "同一帧两臂带同一标签时，取两臂误差均值",
+            "curves": [f"lead {step}" for step in LEAD_STEPS],
+        },
+        "mean_metric_scope": (
+            "mean_* 为“该桶所选臂”的均值：__all__=双臂，标签桶=带标签那条臂；"
+            "标签桶不出 left_*/right_* 分臂值"
+        ),
         "overall_buckets": [ALL_BUCKET],
+        "keyframe_definition": (
+            f"{ARM_LABEL_COLUMNS[0]} != '{KEYFRAME_NONE_LABEL}' OR "
+            f"{ARM_LABEL_COLUMNS[1]} != '{KEYFRAME_NONE_LABEL}'"
+            if tuple(label_sources) == ARM_LABEL_COLUMNS
+            else f"{label_column} != '{KEYFRAME_NONE_LABEL}'"
+        ),
+        "multilabel_policy": "a frame carrying several labels counts in every one of them",
         "task_labels": task_label_stats(baseline),
         "bucket_episodes": bucket_episode_counts(per_episode),
         "validation_episodes": int(per_episode["episode_index"].nunique()),

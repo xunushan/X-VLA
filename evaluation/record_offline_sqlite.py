@@ -34,34 +34,42 @@ EXEC_STEPS = ("30",)
 
 
 def build_metrics_node(rows: pd.DataFrame) -> dict:
-    """Nest by_task rows into {label: {curve: {step: {mean_* metric, comparisons}}}}.
+    """Nest by_task rows into {label: {curve: {step: {mean_* metrics and coverage}}}}.
 
-    label 即 evaluate_ee.py 的桶名：`__all__`（全部帧）、`__keyframe__`（目标帧是关键帧，
-    仅任务层有）、以及该任务各自的 keyframe_label 标签（多标签帧在各标签桶各计一次）。
-    lead 只保留 1/10/20/30，execution 只保留 30；mean_mse 由 evaluate 输出的
-    per-side (left/right) 平方误差取平均得到；数值四舍五入到 4 位小数省体积。
+    label 即 evaluate_ee.py 的桶名：`__all__`（全部帧、双臂）或该任务的某个标签名
+    （只统计真的带了该标签的那条臂）。lead 只保留 1/10/20/30，execution 只保留 30
+    （标签桶本来也不出 execution）。mean_* 为“该桶所选臂”的指标，由 evaluate 直接给出；
+    旧 run dir 没有这些列时退回分臂平方误差的均值。数值四舍五入到 4 位小数省体积。
     """
     keep = {LEAD_CURVE: LEAD_STEPS, EXEC_CURVE: EXEC_STEPS}
+    has_mean_metrics = "mean_position_mse_cm2" in rows.columns
     node: dict[str, dict] = {}
     for (label, curve, step), group in rows.groupby(["label", "curve", "step"], sort=True):
         step_key = str(int(step))
         if step_key not in keep.get(curve, ()):
             continue
         r = group.iloc[0]
-        node.setdefault(label, {}).setdefault(curve, {})[step_key] = {
+        if has_mean_metrics:
+            position_mse = float(r["mean_position_mse_cm2"])
+            rotation_mse = float(r["mean_rotation_mse_deg2"])
+            gripper_mse = float(r["mean_gripper_mse"])
+        else:
+            position_mse = (float(r["left_position_mse_cm2"]) + float(r["right_position_mse_cm2"])) / 2.0
+            rotation_mse = (float(r["left_rotation_mse_deg2"]) + float(r["right_rotation_mse_deg2"])) / 2.0
+            gripper_mse = (float(r["left_gripper_mse"]) + float(r["right_gripper_mse"])) / 2.0
+        entry = {
             "comparisons": int(r["comparisons"]),
+            "num_episodes": int(r["num_episodes"]),
             "mean_position_cm": round(float(r["mean_position_cm"]), 4),
-            "mean_position_mse_cm2": round(
-                (float(r["left_position_mse_cm2"]) + float(r["right_position_mse_cm2"])) / 2.0, 4
-            ),
+            "mean_position_mse_cm2": round(position_mse, 4),
             "mean_rotation_deg": round(float(r["mean_rotation_deg"]), 4),
-            "mean_rotation_mse_deg2": round(
-                (float(r["left_rotation_mse_deg2"]) + float(r["right_rotation_mse_deg2"])) / 2.0, 4
-            ),
-            "mean_gripper_mse": round(
-                (float(r["left_gripper_mse"]) + float(r["right_gripper_mse"])) / 2.0, 6
-            ),
+            "mean_rotation_mse_deg2": round(rotation_mse, 4),
+            "mean_gripper_mse": round(gripper_mse, 6),
         }
+        if "physical_arms_seen" in rows.columns:
+            entry["arm_assignment"] = str(r.get("arm_assignment", "per_target_frame"))
+            entry["physical_arms_seen"] = str(r["physical_arms_seen"])
+        node.setdefault(label, {}).setdefault(curve, {})[step_key] = entry
     return node
 
 
@@ -96,9 +104,13 @@ def build_results_json(
         ].iloc[0])),
         "inference": stats or {},
         "task_names": {k: v for k, v in summary.get("task_names", {}).items()},
-        # 桶口径自述，便于脱离代码解读 results_json 里的 __keyframe__ / 标签桶
+        # 桶口径自述，便于脱离代码解读 results_json 里的 __all__ / 标签桶
         "buckets": {
             "label_column": summary.get("label_column"),
+            "label_source_columns": summary.get("label_source_columns"),
+            "label_assignment": summary.get("label_assignment"),
+            "label_buckets": summary.get("label_buckets"),
+            "mean_metric_scope": summary.get("mean_metric_scope"),
             "keyframe_definition": summary.get("keyframe_definition"),
             "multilabel_policy": summary.get("multilabel_policy"),
             "overall_buckets": summary.get("overall_buckets"),
