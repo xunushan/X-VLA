@@ -350,6 +350,7 @@ def main(args):
         "algorithm_version": {
             "time_global": "time_global_v1",
             "full": "full_v1",
+            "natural": "natural_v1",
         }.get(args.sampling_mode, "legacy_v1"),
         "sampling_mode": args.sampling_mode,
         "sampling_ratio": args.sampling_ratio if args.sampling_mode == "time_global" else None,
