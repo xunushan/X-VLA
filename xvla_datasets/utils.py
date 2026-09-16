@@ -41,6 +41,15 @@ def load_episode_indices(path, split: str = "train") -> list[int]:
         obj = None
     if isinstance(obj, dict):
         idxs = obj.get(split)
+        # GOAI train_val_split.json stores per-task episode lists instead of a
+        # single top-level train/val list.
+        if idxs is None and isinstance(obj.get("tasks"), dict):
+            nested_key = f"{split}_episode_idx"
+            idxs = [
+                episode
+                for task in obj["tasks"].values()
+                for episode in task.get(nested_key, [])
+            ]
         if idxs is None:
             raise ValueError(f"splits file {p} has no '{split}' key (keys: {list(obj)[:10]})")
         idxs = list(idxs)

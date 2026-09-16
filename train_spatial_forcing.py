@@ -162,6 +162,7 @@ def build_sf_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
             )
     vision = model.vlm.vision_tower.blocks[3][0]
     aux = model.transformer.aux_visual_proj
+    main_visual = getattr(model.transformer, "main_visual_proj", None)
     tr = model.transformer
     domain_params = [tr.soft_prompt_hub.weight, tr.action_encoder.fc.weight,
                      tr.action_encoder.bias.weight, tr.action_decoder.fc.weight,
@@ -184,6 +185,11 @@ def build_sf_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
         # of optimizer/DDP state despite a permanent zero LR.
         {"name": "vlm", "params": []},
     ]
+    if main_visual is not None:
+        groups[4:4] = [
+            {"name": "main_visual_weight", "params": [main_visual.weight]},
+            {"name": "main_visual_bias", "params": [main_visual.bias]},
+        ]
     selected = {id(p) for g in groups for p in g["params"]}
     if sum(len(g["params"]) for g in groups) != len(selected):
         raise RuntimeError("duplicate parameter in SF optimizer groups")
@@ -194,7 +200,8 @@ def build_sf_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
 
     model._sf_capture_features = bool(ARGS.enable_sf)
     print(f"[sf] student_dim={student_dim}, teacher_dim={teacher_dim}, "
-          f"vision=vlm.vision_tower.blocks.3.0, cache_samples={len(CACHE.entries)}")
+          f"vision=vlm.vision_tower.blocks.3.0, cache_samples={len(CACHE.entries)}, "
+          f"main_visual_projection={main_visual is not None}")
     return AdamW(groups, betas=betas)
 
 
@@ -213,6 +220,8 @@ def configure_sf_step(optimizer, step, args):
         "vision_last": args.sf_vision_lr,
         "aux_visual_weight": 0.0 if phase1 else args.sf_aux_lr,
         "aux_visual_bias": 0.0 if phase1 else args.sf_aux_bias_lr,
+        "main_visual_weight": 0.0 if phase1 else args.sf_aux_lr,
+        "main_visual_bias": 0.0 if phase1 else args.sf_aux_bias_lr,
         "soft_prompt": 0.0 if phase1 else args.sf_soft_prompt_lr,
         "action_encoder": 0.0 if phase1 else args.sf_action_lr,
         "action_decoder": 0.0 if phase1 else args.sf_action_lr,
@@ -326,6 +335,11 @@ def main(args):
         raise ValueError(
             "--sf_natural_augmentation_rehearsal requires --sf_cache_fraction 0.5"
         )
+    if args.state_dropout_prob != 0.0:
+        raise ValueError(
+            "Spatial Forcing must keep state dropout disabled; "
+            "use --state_dropout_prob 0"
+        )
     if args.sf_natural_augmentation_rehearsal:
         print(
             "[sf] natural action-only branch uses Random-Aug rehearsal "
@@ -372,7 +386,9 @@ def main(args):
     base_train.configure_training_step = configure_and_track
     XVLA.forward = sf_model_forward
     # Reuse existing group logger for relevant names.
-    base_train._GRADIENT_MONITOR_GROUPS.update({"sf_projector", "vision_last"})
+    base_train._GRADIENT_MONITOR_GROUPS.update(
+        {"sf_projector", "vision_last", "main_visual_weight", "main_visual_bias"}
+    )
     base_train.main(args)
 
 
@@ -383,9 +399,9 @@ def parser():
     p.add_argument("--target_domain", type=int, default=0)
     p.add_argument("--sf_phase1_steps", type=int, default=500)
     p.add_argument("--sf_warmup_steps", type=int, default=100)
-    p.add_argument("--sf_loss_weight", type=float, default=0.1)
+    p.add_argument("--sf_loss_weight", type=float, default=0.2)
     p.add_argument(
-        "--sf_cache_fraction", type=float, default=1.0,
+        "--sf_cache_fraction", type=float, default=0.5,
         help="1.0=legacy all-cache sampling; 0.5=exact cached/uncached natural alternation.",
     )
     p.add_argument(
@@ -402,12 +418,12 @@ def parser():
     p.add_argument(
         "--sf_projector_phase2_lr",
         type=float,
-        default=None,
-        help=("Projector LR after sf_phase1_steps. Defaults to sf_projector_lr "
-              "for backward-compatible behavior."),
+        default=1e-5,
+        help=("Projector LR after sf_phase1_steps (default 1e-5). Pass the same "
+              "value as --sf_projector_lr to reproduce the legacy schedule."),
     )
-    p.add_argument("--sf_vision_lr", type=float, default=1e-7)
-    p.add_argument("--sf_transformer_lr", type=float, default=5e-7)
+    p.add_argument("--sf_vision_lr", type=float, default=2e-6)
+    p.add_argument("--sf_transformer_lr", type=float, default=1e-6)
     p.add_argument("--sf_aux_lr", type=float, default=5e-6)
     p.add_argument("--sf_aux_bias_lr", type=float, default=1e-7)
     p.add_argument("--sf_action_lr", type=float, default=2e-6)

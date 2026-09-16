@@ -25,6 +25,7 @@ def _optimizer():
     groups = []
     for name in (
         "sf_projector", "vision_last", "aux_visual_weight", "aux_visual_bias",
+        "main_visual_weight", "main_visual_bias",
         "soft_prompt", "action_encoder", "action_decoder", "transformer_core",
         "vlm",
     ):
@@ -46,11 +47,27 @@ def test_projector_uses_independent_phase2_lr_at_exact_boundary(monkeypatch):
     assert _lr(optimizer, "sf_projector") == 1e-4
     assert _lr(optimizer, "vision_last") == 1e-6
     assert _lr(optimizer, "action_encoder") == 0.0
+    assert _lr(optimizer, "main_visual_weight") == 0.0
 
     sf.configure_sf_step(optimizer, 500, args)
     assert _lr(optimizer, "sf_projector") == 1e-5
     assert _lr(optimizer, "vision_last") == 1e-6
     assert _lr(optimizer, "action_encoder") == 2e-6
+    assert _lr(optimizer, "main_visual_weight") == 5e-6
+    assert _lr(optimizer, "main_visual_bias") == 1e-7
+
+
+def test_new_sf_defaults_match_time_global_plan():
+    args = sf.parser().parse_args([
+        "--models", "model", "--train_metas_path", "meta",
+        "--teacher_cache", "cache",
+    ])
+    assert args.sf_cache_fraction == 0.5
+    assert args.sf_loss_weight == 0.2
+    assert args.sf_projector_phase2_lr == 1e-5
+    assert args.sf_vision_lr == 2e-6
+    assert args.sf_transformer_lr == 1e-6
+    assert args.state_dropout_prob == 0.0
 
 
 def test_omitted_phase2_lr_preserves_legacy_schedule(monkeypatch):

@@ -443,7 +443,10 @@ def validate_resume_training_options(resume_info: dict | None, args, logger) -> 
             current[key] = getattr(args, key)
     if "use_cosine_decay" in saved:
         current["use_cosine_decay"] = bool(getattr(args, "use_cosine_decay", False))
-    if "cosine_decay_end_step" in saved:
+    if "cosine_decay_end_step" in saved and (
+        bool(saved.get("use_cosine_decay"))
+        or bool(getattr(args, "use_cosine_decay", False))
+    ):
         current["cosine_decay_end_step"] = (
             getattr(args, "cosine_decay_end_step", None) or args.iters
         )

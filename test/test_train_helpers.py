@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -280,6 +281,34 @@ def test_resume_rejects_changed_frame_weight_options(tmp_path):
             args,
             logger,
         )
+
+
+def test_resume_can_extend_iters_when_cosine_decay_is_disabled(tmp_path):
+    from train import validate_resume_training_options
+
+    weights = tmp_path / "pretrained" / "ckpt-2000"
+    weights.mkdir(parents=True)
+    (weights / "state.json").write_text(json.dumps({
+        "global_step": 2000,
+        "training_options": {
+            "frame_weight_sampling": False,
+            "frame_weight_loss": False,
+            "use_cosine_decay": False,
+            "cosine_decay_end_step": 2000,
+        },
+    }))
+    args = argparse.Namespace(
+        frame_weight_sampling=False,
+        frame_weight_loss=False,
+        use_cosine_decay=False,
+        cosine_decay_end_step=None,
+        iters=4000,
+    )
+    validate_resume_training_options(
+        {"weights_dir": str(weights), "model_state_dir": None, "global_step": 2000},
+        args,
+        __import__("logging").getLogger("test-resume-extend"),
+    )
 
 
 def test_resolve_resume_latest_new_layout(tmp_path):

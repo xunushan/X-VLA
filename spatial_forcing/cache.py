@@ -127,6 +127,18 @@ def inspect_cache(path: str | Path) -> dict:
         "key_samples": key_count,
         "regular_samples": len(reader.entries) - key_count,
         "feature_shape": list(first.shape) if first is not None else None,
-        "finite_ratio": float(torch.isfinite(first.float()).float().mean()) if first is not None else None,
+        "first_feature_finite_ratio": (
+            float(torch.isfinite(first.float()).float().mean())
+            if first is not None else None
+        ),
+        # Backward-compatible key; historically this inspected the first
+        # feature only despite its broad name.
+        "finite_ratio": (
+            float(torch.isfinite(first.float()).float().mean())
+            if first is not None else None
+        ),
+        "each_cached_feature_checked_finite_during_build": reader.metadata.get(
+            "each_cached_feature_checked_finite"
+        ),
         "metadata": reader.metadata,
     }

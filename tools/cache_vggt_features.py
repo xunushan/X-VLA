@@ -115,8 +115,19 @@ def main(args):
         "target_token_grid": list(args.target_token_grid),
         "camera_order": camera_order,
         "selection_manifest": str(Path(args.selection).resolve()),
+        "selection_manifest_sha256": sha256(Path(args.selection)),
+        "training_meta": str(Path(args.metas_path).resolve()),
+        "training_meta_sha256": sha256(Path(args.metas_path)),
+        "each_cached_feature_checked_finite": True,
         "color_jitter": False,
     }
+    selection_metadata_path = Path(args.selection).with_suffix(
+        Path(args.selection).suffix + ".metadata.json"
+    )
+    if selection_metadata_path.exists():
+        metadata["selection_metadata"] = json.loads(
+            selection_metadata_path.read_text()
+        )
     seen = set()
     similarities = []
     writer = None
