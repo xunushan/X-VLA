@@ -190,6 +190,17 @@ def build_sf_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), lr_coef_soft=
             {"name": "main_visual_weight", "params": [main_visual.weight]},
             {"name": "main_visual_bias", "params": [main_visual.bias]},
         ]
+    elif ARGS.main_visual_projection:
+        # Assertion, not a switch: the architecture comes from the checkpoint's
+        # own config.json, so a false checkpoint silently yields a model whose
+        # main camera is not directly projected. Refuse to start rather than
+        # train a run that is not the experiment that was asked for.
+        raise RuntimeError(
+            "--main_visual_projection was requested but the loaded checkpoint has "
+            "no transformer.main_visual_proj (its config.json has "
+            "use_main_visual_projection=false). SF never mutates the architecture "
+            "config, so start from a checkpoint that already has it."
+        )
     selected = {id(p) for g in groups for p in g["params"]}
     if sum(len(g["params"]) for g in groups) != len(selected):
         raise RuntimeError("duplicate parameter in SF optimizer groups")
@@ -411,6 +422,16 @@ def parser():
             "Apply full-strength 50/40/10 synchronized Random-Aug only to the uncached "
             "action-only half of a 50/50 mixed stream. Use only when SF starts from a "
             "validated Random-Aug checkpoint; cached teacher samples are never augmented."
+        ),
+    )
+    p.add_argument(
+        "--main_visual_projection",
+        action="store_true",
+        help=(
+            "Assert the start checkpoint directly projects the main camera "
+            "(transformer.main_visual_proj). Not a switch: SF reads the architecture "
+            "from the checkpoint config and refuses to start if the flag is passed "
+            "but the checkpoint lacks the projection."
         ),
     )
     p.add_argument("--sf_hidden_dim", type=int, default=None)
