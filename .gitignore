@@ -224,3 +224,5 @@ outputs/
 # 本地文档与 Claude 配置（不推送到远程仓库）
 docs/
 .claude/
+# macOS
+.DS_Store

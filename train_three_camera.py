@@ -33,6 +33,16 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage1_end", type=int, default=1000)
     parser.add_argument("--stage2_end", type=int, default=3000)
     parser.add_argument(
+        "--main_visual_projection",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to projecting the main camera's pre-language visual tokens "
+            "directly into the action Transformer. Omitted/False preserves the "
+            "historical X1 architecture and token layout."
+        ),
+    )
+    parser.add_argument(
         "--stage3_lr_scale",
         type=float,
         default=1.0,
@@ -48,6 +58,23 @@ def get_args_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def configure_three_camera_model_config(config, args, *, is_resume: bool):
+    """Serialize and validate the optional main-camera action shortcut."""
+    requested = bool(args.main_visual_projection)
+    checkpoint_value = bool(getattr(config, "use_main_visual_projection", False))
+    if is_resume:
+        if checkpoint_value != requested:
+            raise ValueError(
+                "--main_visual_projection must match the resumed checkpoint: "
+                f"checkpoint={checkpoint_value}, requested={requested}. "
+                "Pass the flag when resuming an enabled run; use --models rather "
+                "than --resume to start a new architecture from existing weights."
+            )
+    else:
+        config.use_main_visual_projection = requested
+    return config
 
 
 def _mask_domain_row(parameter: torch.nn.Parameter, domain_id: int, name: str) -> None:
@@ -125,13 +152,32 @@ def build_three_camera_optimizer(
             "X-VLA-Pt_keys.txt; got " + type(aux).__name__
         )
 
+    main_visual = None
+    if _ARGS.main_visual_projection:
+        if not getattr(transformer, "use_main_visual_projection", False):
+            raise RuntimeError(
+                "Model config did not construct the requested main visual projection"
+            )
+        main_visual = getattr(transformer, "main_visual_proj", None)
+        if main_visual is None or type(main_visual) is not type(aux):
+            raise TypeError(
+                "main_visual_proj must exist and match aux_visual_proj type when enabled"
+            )
+
     # build_optimizer is called after pretrained weights are loaded and before
     # optimizer-state restore. A fresh X1 run always starts with a zero auxiliary
-    # projection weight; this is an invariant, not a user-facing switch.
+    # projection weight; this is an invariant, not a user-facing switch.  The
+    # optional main shortcut first copies the checkpoint-loaded auxiliary
+    # projection into an independent module so both biases match, then zeros
+    # both projection weights.  Their shared stage-1 LR warmup learns visual
+    # content gradually without injecting the foundation aux scale at step 0.
     model_id = id(model)
     if model_id not in _INITIALIZED_MODEL_IDS:
         if not _ARGS.resume:
             with torch.no_grad():
+                if main_visual is not None:
+                    main_visual.load_state_dict(aux.state_dict())
+                    main_visual.weight.zero_()
                 aux.weight.zero_()
         _INITIALIZED_MODEL_IDS.add(model_id)
 
@@ -156,6 +202,26 @@ def build_three_camera_optimizer(
 
     aux_hook_handle = aux.weight.register_hook(log_first_aux_grad)
 
+    if main_visual is not None:
+        first_main_grad_logged = False
+        main_hook_handle = None
+
+        def log_first_main_grad(grad: torch.Tensor) -> torch.Tensor:
+            nonlocal first_main_grad_logged, main_hook_handle
+            if not first_main_grad_logged:
+                print(
+                    "[three-camera] first main visual backward: "
+                    f"weight_norm={main_visual.weight.detach().float().norm().item():.6e}, "
+                    f"grad_norm={grad.detach().float().norm().item():.6e}, "
+                    f"grad_nonzero_ratio={(grad != 0).float().mean().item():.6f}"
+                )
+                first_main_grad_logged = True
+                if main_hook_handle is not None:
+                    main_hook_handle.remove()
+            return grad
+
+        main_hook_handle = main_visual.weight.register_hook(log_first_main_grad)
+
     domain_parameters = {
         "soft_prompt": transformer.soft_prompt_hub.weight,
         "action_encoder_fc": transformer.action_encoder.fc.weight,
@@ -166,7 +232,15 @@ def build_three_camera_optimizer(
     for name, parameter in domain_parameters.items():
         _mask_domain_row(parameter, _ARGS.target_domain, name)
 
-    groups = [
+    groups = []
+    if main_visual is not None:
+        groups.extend(
+            [
+                _group("main_visual_weight", [main_visual.weight]),
+                _group("main_visual_bias", [main_visual.bias]),
+            ]
+        )
+    groups.extend([
         _group("aux_visual_weight", [aux.weight]),
         _group("aux_visual_bias", [aux.bias]),
         _group(
@@ -192,7 +266,7 @@ def build_three_camera_optimizer(
             weight_decay=weight_decay,
         ),
         _group("vlm", model.vlm.parameters(), weight_decay=weight_decay),
-    ]
+    ])
 
     grouped_ids = _validate_groups(model, groups)
     for parameter in model.parameters():
@@ -204,7 +278,8 @@ def build_three_camera_optimizer(
     print(
         f"[three-camera] optimizer selected {selected:,}/{total:,} parameters; "
         f"target_domain={_ARGS.target_domain}; aux_zeroed="
-        f"{not _ARGS.resume}"
+        f"{not _ARGS.resume}; main_visual_projection={main_visual is not None}; "
+        f"main_tokens={'enabled' if main_visual is not None else 'omitted'}"
     )
     return optimizer
 
@@ -230,9 +305,14 @@ def configure_three_camera_step(optimizer, step: int, args) -> None:
             "transformer_core": 0.0,
             "vlm": 0.0,
         }
+        if args.main_visual_projection:
+            lrs["main_visual_weight"] = 1e-4
+            lrs["main_visual_bias"] = 0.0
         warmup = min(100, args.stage1_end)
         if step < warmup:
             lrs["aux_visual_weight"] *= float(step + 1) / warmup
+            if args.main_visual_projection:
+                lrs["main_visual_weight"] *= float(step + 1) / warmup
     elif step < args.stage2_end:
         stage = 2
         lrs = {
@@ -244,6 +324,9 @@ def configure_three_camera_step(optimizer, step: int, args) -> None:
             "transformer_core": 0.0,
             "vlm": 0.0,
         }
+        if args.main_visual_projection:
+            lrs["main_visual_weight"] = 5e-5
+            lrs["main_visual_bias"] = 1e-6
     else:
         stage = 3
         lrs = {
@@ -255,6 +338,9 @@ def configure_three_camera_step(optimizer, step: int, args) -> None:
             "transformer_core": 2e-6,
             "vlm": 0.0,
         }
+        if args.main_visual_projection:
+            lrs["main_visual_weight"] = 2e-5
+            lrs["main_visual_bias"] = 5e-7
         for name in lrs:
             if lrs[name] > 0.0:
                 lrs[name] *= args.stage3_lr_scale
@@ -323,10 +409,15 @@ def main(args: argparse.Namespace) -> None:
                 "[three-camera] full-state resume detected; do not restart continuation warmup "
                 f"(stage3_lr_scale={args.stage3_lr_scale})"
             )
-    # The original module resolves these names at runtime.  Replacing only these
-    # two extension points keeps its accumulation/checkpoint loop byte-for-byte.
+    # The original module resolves these names at runtime.  These process-local
+    # extension points keep its accumulation/checkpoint loop byte-for-byte.
+    base_train.configure_model_config = configure_three_camera_model_config
     base_train.build_optimizer = build_three_camera_optimizer
     base_train.configure_training_step = configure_three_camera_step
+    if args.main_visual_projection:
+        base_train._GRADIENT_MONITOR_GROUPS.update(
+            {"main_visual_weight", "main_visual_bias"}
+        )
     base_train.main(args)
 
 

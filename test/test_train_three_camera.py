@@ -35,6 +35,7 @@ def _args(**overrides):
         stage2_end=20,
         stage3_lr_scale=1.0,
         continuation_warmup_steps=0,
+        main_visual_projection=False,
         _continuation_warmup_start=None,
         resume=None,
     )
@@ -78,6 +79,58 @@ def test_optimizer_groups_and_domain_guard(capsys):
     loss = model.transformer.aux_visual_proj.weight.sum()
     loss.backward()
     assert "first aux backward" not in capsys.readouterr().out
+
+
+def test_main_visual_projection_is_opt_in_and_tracks_aux_schedule(capsys):
+    model = TinyModel()
+    model.transformer.use_main_visual_projection = True
+    model.transformer.main_visual_proj = nn.Linear(4, 4)
+    original_aux_bias = model.transformer.aux_visual_proj.bias.detach().clone()
+    trainer._ARGS = _args(main_visual_projection=True)
+
+    optimizer = trainer.build_three_camera_optimizer(
+        model, lr=1e-4, weight_decay=0.0
+    )
+
+    # Fresh opt-in initialization preserves the checkpoint-loaded aux bias in
+    # both independent paths while zeroing both visual projection weights.
+    assert torch.count_nonzero(model.transformer.main_visual_proj.weight) == 0
+    assert torch.equal(model.transformer.main_visual_proj.bias, original_aux_bias)
+    assert torch.count_nonzero(model.transformer.aux_visual_proj.weight) == 0
+    assert model.transformer.main_visual_proj.weight is not model.transformer.aux_visual_proj.weight
+
+    trainer.configure_three_camera_step(optimizer, 0, trainer._ARGS)
+    # Tiny test stage is 10 steps, so the shared min(100, stage1_end)
+    # warmup starts at 1/10 of 1e-4.
+    assert _lrs(optimizer)["main_visual_weight"] == pytest.approx(1e-5)
+    assert _lrs(optimizer)["main_visual_bias"] == 0.0
+    assert model.transformer.main_visual_proj.weight.requires_grad
+    assert not model.transformer.main_visual_proj.bias.requires_grad
+
+    loss = model.transformer.main_visual_proj.weight.sum()
+    loss.backward()
+    assert "first main visual backward" in capsys.readouterr().out
+
+
+def test_main_visual_projection_config_is_serialized_and_resume_checked():
+    class Config:
+        use_main_visual_projection = False
+
+    config = Config()
+    trainer.configure_three_camera_model_config(
+        config, _args(main_visual_projection=True), is_resume=False
+    )
+    assert config.use_main_visual_projection is True
+
+    with pytest.raises(ValueError, match="must match the resumed checkpoint"):
+        trainer.configure_three_camera_model_config(
+            config, _args(main_visual_projection=False), is_resume=True
+        )
+
+    resumed = trainer.configure_three_camera_model_config(
+        config, _args(main_visual_projection=True), is_resume=True
+    )
+    assert resumed is config
 
 
 def test_gradient_monitor_reports_active_domain_row_before_clipping():

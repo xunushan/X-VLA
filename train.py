@@ -154,6 +154,30 @@ def get_args_parser():
         "position and rotation losses directly without normalization; gripper stays "
         "unweighted. Only the ee6d action-space family is supported",
     )
+    parser.add_argument(
+        "--state_dropout_prob",
+        type=float,
+        default=0.0,
+        help="Maximum sample-level probability of zeroing the complete proprio/state vector during training",
+    )
+    parser.add_argument(
+        "--state_dropout_start_step",
+        type=int,
+        default=0,
+        help="Global optimizer step at which state-dropout warmup starts",
+    )
+    parser.add_argument(
+        "--state_dropout_warmup_steps",
+        type=int,
+        default=500,
+        help="Optimizer steps used to linearly warm state dropout from 0 to --state_dropout_prob",
+    )
+    parser.add_argument(
+        "--state_dropout_seed",
+        type=int,
+        default=0,
+        help="Base seed for the state-dropout mask RNG (rank is added automatically)",
+    )
     # Optimizer
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument(
@@ -409,6 +433,14 @@ def validate_resume_training_options(resume_info: dict | None, args, logger) -> 
         "frame_weight_sampling": bool(args.frame_weight_sampling),
         "frame_weight_loss": bool(args.frame_weight_loss),
     }
+    for key in (
+        "state_dropout_prob",
+        "state_dropout_start_step",
+        "state_dropout_warmup_steps",
+        "state_dropout_seed",
+    ):
+        if key in saved:
+            current[key] = getattr(args, key)
     if "use_cosine_decay" in saved:
         current["use_cosine_decay"] = bool(getattr(args, "use_cosine_decay", False))
     if "cosine_decay_end_step" in saved:
@@ -433,6 +465,14 @@ def checkpoint_state(args, global_step: int) -> dict:
         "training_options": {
             "frame_weight_sampling": bool(args.frame_weight_sampling),
             "frame_weight_loss": bool(args.frame_weight_loss),
+            "state_dropout_prob": float(getattr(args, "state_dropout_prob", 0.0)),
+            "state_dropout_start_step": int(
+                getattr(args, "state_dropout_start_step", 0)
+            ),
+            "state_dropout_warmup_steps": int(
+                getattr(args, "state_dropout_warmup_steps", 500)
+            ),
+            "state_dropout_seed": int(getattr(args, "state_dropout_seed", 0)),
             "use_cosine_decay": bool(getattr(args, "use_cosine_decay", False)),
             "cosine_decay_end_step": (
                 getattr(args, "cosine_decay_end_step", None) or args.iters
@@ -441,7 +481,7 @@ def checkpoint_state(args, global_step: int) -> dict:
     }
 
 
-def save_rng_state(path):
+def save_rng_state(path, state_dropout_generator=None):
     """保存 RNG（torch/cuda/numpy/random）供 resume 恢复模型内 dropout 序列。
 
     按进程独立调用：每个 rank 写入 `rng_state_rank{process_index}.pt`，resume 时各 rank
@@ -456,6 +496,11 @@ def save_rng_state(path):
         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "numpy": np.random.get_state(),
         "random": random.getstate(),
+        "state_dropout": (
+            state_dropout_generator.get_state()
+            if state_dropout_generator is not None
+            else None
+        ),
     }
     torch.save(state, path)
 
@@ -469,6 +514,7 @@ def load_rng_state(path):
         torch.cuda.set_rng_state_all(state["cuda"][: torch.cuda.device_count()])
     np.random.set_state(state["numpy"])
     random.setstate(state["random"])
+    return state.get("state_dropout")
 
 
 def resolve_rng_path(resume_dir, process_index) -> str | None:
@@ -672,6 +718,33 @@ def prepare_batch_for_step(batch, step: int, args):
     return batch
 
 
+def state_dropout_probability(step: int, args) -> float:
+    """Return the scheduled sample-level state-dropout probability."""
+    maximum = float(args.state_dropout_prob)
+    if not 0.0 <= maximum <= 1.0:
+        raise ValueError("state_dropout_prob must be in [0, 1]")
+    if args.state_dropout_start_step < 0:
+        raise ValueError("state_dropout_start_step must be >= 0")
+    if args.state_dropout_warmup_steps < 0:
+        raise ValueError("state_dropout_warmup_steps must be >= 0")
+    if maximum == 0.0 or step <= args.state_dropout_start_step:
+        return 0.0
+    if args.state_dropout_warmup_steps == 0:
+        return maximum
+    progress = (step - args.state_dropout_start_step) / args.state_dropout_warmup_steps
+    return maximum * min(1.0, max(0.0, progress))
+
+
+def apply_state_dropout(proprio, probability: float, generator):
+    """Zero the whole state vector independently per sample, without rescaling."""
+    if probability <= 0.0:
+        return proprio, 0
+    drop = torch.rand(
+        (proprio.shape[0], 1), device=proprio.device, generator=generator
+    ) < probability
+    return proprio.masked_fill(drop, 0.0), int(drop.sum().item())
+
+
 def collect_training_logs(model, optim, step: int, args) -> Dict[str, float]:
     return {}
 
@@ -725,16 +798,36 @@ def main(args):
     validate_resume_training_options(resume_info, args, logger)
 
     set_seed(args.seed + accelerator.process_index)
+    restored_state_dropout_rng = None
     if resume_info is not None:
         # 按 rank 恢复各自 RNG：避免多进程 resume 后所有进程随机序列同步（削弱多样性）
         # RNG 在 model_state/ckpt-{N}（旧布局则在权重同目录）
         rng_dir = resume_info["model_state_dir"] or resume_info["weights_dir"]
         rng_path = resolve_rng_path(rng_dir, accelerator.process_index)
         if rng_path is not None:
-            load_rng_state(rng_path)
+            restored_state_dropout_rng = load_rng_state(rng_path)
         else:
             logger.warning(f"No per-rank RNG state in {rng_dir}; skip RNG restore")
     logger.info(f"Args: {args}")
+    # A dedicated RNG keeps state masks from perturbing action-noise/timestep
+    # randomness. Each rank gets a distinct stream; checkpoints persist it.
+    state_dropout_generator = torch.Generator(device=accelerator.device)
+    state_dropout_generator.manual_seed(
+        args.state_dropout_seed + accelerator.process_index
+    )
+    if restored_state_dropout_rng is not None:
+        state_dropout_generator.set_state(restored_state_dropout_rng)
+    logger.info(
+        "State dropout: max_prob=%.4f start_step=%d warmup_steps=%d seed=%d "
+        "granularity=sample/full-state current_prob=%.4f",
+        args.state_dropout_prob,
+        args.state_dropout_start_step,
+        args.state_dropout_warmup_steps,
+        args.state_dropout_seed,
+        state_dropout_probability(
+            resume_info["global_step"] if resume_info is not None else 0, args
+        ),
+    )
 
     # Load model & processor
     # 正常训练：预训练权重 + action_mode 覆盖（覆盖属配置层职责，由 XVLAConfig 完成）。
@@ -856,6 +949,8 @@ def main(args):
     # key 帧占比统计：累计 key 帧数与带 key 信息的样本数（跨 micro-batch / rank 归并）
     effective_key_sum_local = 0.0
     effective_key_samples_local = 0
+    effective_state_dropped_local = 0
+    effective_state_samples_local = 0
     while global_step < args.iters:
         # 统一配置：学习率 + 冻结状态。放在 forward/backward 之前生效，
         # 冻结参数才真正不计算梯度（每 micro-batch 调用，幂等；训练组恒 True、
@@ -900,6 +995,16 @@ def main(args):
                 )
                 for k, v in inputs.items()
             }
+
+            # Sample-level, whole-vector state dropout. The action-space
+            # preprocess that follows inside XVLA.forward only clones/masks/pads
+            # proprio, so a fully zeroed input stays fully zeroed there.
+            state_dropout_p = state_dropout_probability(global_step, args)
+            inputs["proprio"], dropped = apply_state_dropout(
+                inputs["proprio"], state_dropout_p, state_dropout_generator
+            )
+            effective_state_dropped_local += dropped
+            effective_state_samples_local += int(inputs["proprio"].shape[0])
 
             # Forward & backward
             loss_dict: Dict[str, torch.Tensor] = model(
@@ -993,12 +1098,20 @@ def main(args):
                         ),
                         effective_loss_total_sum.new_tensor(float(effective_key_sum_local)),
                         effective_loss_total_sum.new_tensor(float(effective_key_samples_local)),
+                        effective_loss_total_sum.new_tensor(
+                            float(effective_state_dropped_local)
+                        ),
+                        effective_loss_total_sum.new_tensor(
+                            float(effective_state_samples_local)
+                        ),
                     ]
                 )
                 global_stats = accelerator.reduce(local_stats, reduction="sum")
-                effective_batch_samples_global = float(global_stats[-3].item())
-                key_sum_global = float(global_stats[-2].item())
-                key_samples_global = float(global_stats[-1].item())
+                effective_batch_samples_global = float(global_stats[-5].item())
+                key_sum_global = float(global_stats[-4].item())
+                key_samples_global = float(global_stats[-3].item())
+                state_dropped_global = float(global_stats[-2].item())
+                state_samples_global = float(global_stats[-1].item())
                 denominator = max(effective_batch_samples_global, 1.0)
                 logs = {
                     name: float(global_stats[index].item() / denominator)
@@ -1011,12 +1124,18 @@ def main(args):
                         for index, name in enumerate(metric_names)
                     }
                 )
-                logs["loss_total"] = float(global_stats[-4].item() / denominator)
+                logs["loss_total"] = float(global_stats[-6].item() / denominator)
                 if "gripper_loss" in logs and "gripper_target_entropy" in logs:
                     logs["gripper_excess_bce"] = (
                         logs["gripper_loss"] - logs["gripper_target_entropy"]
                     )
                 logs["effective_batch_samples"] = effective_batch_samples_global
+                # Probability actually used by the just-completed optimizer
+                # step (global_step has already been incremented above).
+                logs["state_dropout_prob"] = state_dropout_p
+                logs["state_dropout_ratio"] = state_dropped_global / max(
+                    state_samples_global, 1.0
+                )
                 # 本 optimizer step 全量样本（跨 micro-batch / rank）的 key 帧占比
                 if key_samples_global > 0:
                     logs["key_frame_ratio"] = key_sum_global / key_samples_global
@@ -1080,6 +1199,8 @@ def main(args):
                         f"[{loss_parts}] "
                         f"effective_batch={int(logs['effective_batch_samples'])} "
                         f"key_ratio={key_pct} "
+                        f"state_drop={logs['state_dropout_ratio'] * 100:.1f}%"
+                        f"(p={logs['state_dropout_prob']:.4f}) "
                         f"grad_norm={logs['grad_norm']:.4f} "
                         f"clip_coef={logs['grad_clip_coef']:.3e} "
                         f"lr_core={logs['lr_transformer_core']:.2e} "
@@ -1101,6 +1222,8 @@ def main(args):
             effective_batch_samples_local = 0
             effective_key_sum_local = 0.0
             effective_key_samples_local = 0
+            effective_state_dropped_local = 0
+            effective_state_samples_local = 0
 
             # Checkpointing
             if (
@@ -1145,7 +1268,8 @@ def main(args):
                 save_rng_state(
                     os.path.join(
                         model_state_dir, f"rng_state_rank{accelerator.process_index}.pt"
-                    )
+                    ),
+                    state_dropout_generator=state_dropout_generator,
                 )
                 accelerator.wait_for_everyone()
 

@@ -232,10 +232,35 @@ def test_checkpoint_state_records_frame_weight_options():
         "training_options": {
             "frame_weight_sampling": True,
             "frame_weight_loss": False,
+            "state_dropout_prob": 0.0,
+            "state_dropout_start_step": 0,
+            "state_dropout_warmup_steps": 500,
+            "state_dropout_seed": 0,
             "use_cosine_decay": True,
             "cosine_decay_end_step": 500,
         },
     }
+
+
+def test_state_dropout_schedule_and_full_vector_mask():
+    from train import apply_state_dropout, state_dropout_probability
+
+    args = argparse.Namespace(
+        state_dropout_prob=0.1,
+        state_dropout_start_step=100,
+        state_dropout_warmup_steps=500,
+    )
+    assert state_dropout_probability(100, args) == 0.0
+    assert state_dropout_probability(350, args) == pytest.approx(0.05)
+    assert state_dropout_probability(600, args) == pytest.approx(0.1)
+
+    proprio = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    masked, dropped = apply_state_dropout(
+        proprio, 1.0, torch.Generator().manual_seed(7)
+    )
+    assert dropped == 3
+    assert torch.count_nonzero(masked) == 0
+    assert torch.equal(proprio, torch.arange(12, dtype=torch.float32).reshape(3, 4))
 
 
 def test_resume_rejects_changed_frame_weight_options(tmp_path):

@@ -106,6 +106,7 @@ class XVLA(PreTrainedModel):
             dim_time=config.dim_time,
             max_len_seq=config.max_len_seq,
             use_hetero_proj=config.use_hetero_proj,
+            use_main_visual_projection=config.use_main_visual_projection,
         )
 
         self.sf_projector = None
@@ -184,7 +185,12 @@ class XVLA(PreTrainedModel):
         aux_features = image_features[:, 1:]
         aux_features = self._apply_aux_view_gates(aux_features)
         aux_visual_inputs = aux_features.reshape(B, -1, D)  # remaining views flattened
-        return {"vlm_features": enc_out, "aux_visual_inputs": aux_visual_inputs}
+        result = {"vlm_features": enc_out, "aux_visual_inputs": aux_visual_inputs}
+        if self.config.use_main_visual_projection:
+            # Reuse the already encoded main view before language fusion.  This
+            # is an action-side shortcut; it does not run the vision tower twice.
+            result["main_visual_inputs"] = image_features[:, 0]
+        return result
 
     # ================================= training =================================
     def forward(

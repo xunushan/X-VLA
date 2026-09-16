@@ -49,6 +49,7 @@ class XVLAConfig(PretrainedConfig):
         use_aux_view_gates: bool = False,
         num_aux_views: int = 2,
         aux_gate_init_logit: float = -4.0,
+        use_main_visual_projection: bool = False,
 
         # === Action & proprio ===
         max_action_dim: int = 20,  # Maximum action dimension for padding (used by "auto" action mode)
@@ -85,6 +86,9 @@ class XVLAConfig(PretrainedConfig):
         self.use_aux_view_gates = use_aux_view_gates
         self.num_aux_views = num_aux_views
         self.aux_gate_init_logit = aux_gate_init_logit
+        # Optional action-side shortcut for the main-camera pre-language visual
+        # tokens.  False preserves the historical token layout and parameters.
+        self.use_main_visual_projection = use_main_visual_projection
 
         # Action/proprioception settings
         self.num_actions = num_actions
