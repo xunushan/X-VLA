@@ -11,6 +11,12 @@
 #   bash scripts/post_eval_local.sh <SERVER> <REMOTE_OUT_ROOT> <MID> <CKPT> [<CKPT>...]
 # 例:
 #   bash scripts/post_eval_local.sh train-4090 /data/outputs X1_130 ckpt-4000 ckpt-5000 ckpt-6000
+#
+# 环境变量 MARK_DIR（可选）：全部成功后，在服务器上 touch
+#   <MARK_DIR>/local_eval_ok_<MID>
+# 服务器侧的 x1_130_group_v2.sh 会等这个标记才肯删 checkpoint —— 因为
+# 「推理跑完」和「指标算出来」是两件事，删权重前必须两件都成立。
+# 例: MARK_DIR=/cloud/cloud-ssd1/x1_130_uploads bash scripts/post_eval_local.sh ...
 set -uo pipefail
 
 SERVER="${1:?用法: post_eval_local.sh <SERVER> <REMOTE_OUT_ROOT> <MID> <CKPT>...}"
@@ -69,4 +75,15 @@ done
 
 echo "=============================================="
 echo "[post] $MID 完成: ok=$ok fail=$fail"
-[ "$fail" -eq 0 ] && echo "POST_EVAL_ALL_OK" || { echo "POST_EVAL_HAS_FAILURES"; exit 1; }
+if [ "$fail" -ne 0 ]; then
+  echo "POST_EVAL_HAS_FAILURES"
+  exit 1
+fi
+
+# 全部成功才在服务器上放开清理闸门
+if [ -n "${MARK_DIR:-}" ]; then
+  ssh "$SERVER" "touch '$MARK_DIR/local_eval_ok_$MID'" \
+    && echo "[post] 已放开服务器清理闸门: $MARK_DIR/local_eval_ok_$MID" \
+    || { echo "[post] 落标记失败，服务器侧不会清理"; exit 1; }
+fi
+echo "POST_EVAL_ALL_OK"
