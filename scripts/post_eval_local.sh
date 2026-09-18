@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# 本地离线评估后处理：把服务器上 batch_inference 产出的 predictions.csv 拉到本地，
+# 用 evaluate_ee.py 算指标，再登记进 offline_evaluations.sqlite。
+#
+# 分工（这是刻意的，不是重复）：
+#   服务器  : 只做推理 → /data/outputs/<MID>_<ck>/predictions.csv + predictions_inference_stats.json
+#   本地    : 算指标（evaluate_ee.py）+ 登记入库（record_offline_sqlite.py）
+# 所以「评估完成」这条飞书只能说明推理跑完，指标要到本地这一步才出来。
+#
+# 用法:
+#   bash scripts/post_eval_local.sh <SERVER> <REMOTE_OUT_ROOT> <MID> <CKPT> [<CKPT>...]
+# 例:
+#   bash scripts/post_eval_local.sh train-4090 /data/outputs X1_130 ckpt-4000 ckpt-5000 ckpt-6000
+set -uo pipefail
+
+SERVER="${1:?用法: post_eval_local.sh <SERVER> <REMOTE_OUT_ROOT> <MID> <CKPT>...}"
+REMOTE_ROOT="${2:?}"
+MID="${3:?}"
+shift 3
+[ "$#" -ge 1 ] || { echo "至少给一个 ckpt"; exit 1; }
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BASE_CSV="$REPO/../goai_2026/data/real_lerobot_v30_ee/real_lerobot_v30_ee.csv"
+SPLIT="$REPO/../goai_2026/data/real_lerobot_v30_ee/train_val_split.json"
+EVAL_ROOT="$REPO/outputs/eval_results/offline_ee"
+PRED_ROOT="$EVAL_ROOT/predictions"
+DB="$EVAL_ROOT/offline_evaluations.sqlite"
+FLAT="$EVAL_ROOT/offline_ee_results.csv"
+DATE="$(date +%Y%m%d)"
+
+for f in "$BASE_CSV" "$SPLIT"; do
+  [ -f "$f" ] || { echo "缺文件: $f"; exit 1; }
+done
+
+ok=0; fail=0
+for CK in "$@"; do
+  echo "=============== $MID $CK ==============="
+  REMOTE_DIR="$REMOTE_ROOT/${MID}_${CK}"
+  LOCAL_DIR="$PRED_ROOT/${MID}_${CK}"
+  mkdir -p "$LOCAL_DIR"
+
+  # 1) 拉预测 + 推理统计（stats 里的 n_predictions 是权威行数，比 wc -l 可靠）
+  for f in predictions.csv predictions_inference_stats.json; do
+    if [ -s "$LOCAL_DIR/$f" ]; then echo "[post] 已有 $f，跳过下载"; continue; fi
+    scp -q "$SERVER:$REMOTE_DIR/$f" "$LOCAL_DIR/$f" || echo "[post] 下载失败 $REMOTE_DIR/$f"
+  done
+  [ -s "$LOCAL_DIR/predictions.csv" ] || { echo "[post] FAIL 无 predictions.csv"; fail=$((fail+1)); continue; }
+
+  # 2) 算指标
+  RUN_DIR="$EVAL_ROOT/${MID}_${CK}_${DATE}"
+  mkdir -p "$RUN_DIR"
+  python3 "$REPO/evaluation/evaluate_ee.py" \
+    --baseline-csv    "$BASE_CSV" \
+    --split-file      "$SPLIT" \
+    --predictions-csv "$LOCAL_DIR/predictions.csv" \
+    --output-dir      "$RUN_DIR" || { echo "[post] FAIL evaluate_ee"; fail=$((fail+1)); continue; }
+
+  # 3) 登记入库 + 刷新扁平表
+  python3 "$REPO/evaluation/record_offline_sqlite.py" \
+    --run-dir   "$RUN_DIR" \
+    --db        "$DB" \
+    --stats-json "$LOCAL_DIR/predictions_inference_stats.json" \
+    --flat-csv  "$FLAT" \
+    --eval-date "$(date +%Y-%m-%d)" || { echo "[post] FAIL record_offline_sqlite"; fail=$((fail+1)); continue; }
+
+  echo "[post] OK $MID $CK  ->  $RUN_DIR"
+  ok=$((ok+1))
+done
+
+echo "=============================================="
+echo "[post] $MID 完成: ok=$ok fail=$fail"
+[ "$fail" -eq 0 ] && echo "POST_EVAL_ALL_OK" || { echo "POST_EVAL_HAS_FAILURES"; exit 1; }
