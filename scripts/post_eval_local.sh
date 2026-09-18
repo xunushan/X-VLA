@@ -25,6 +25,23 @@ MID="${3:?}"
 shift 3
 [ "$#" -ge 1 ] || { echo "至少给一个 ckpt"; exit 1; }
 
+# 本机 `python3` 是 /usr/local/bin/python3，没有 numpy —— 跑 evaluate_ee.py 会
+# ModuleNotFoundError。本地评估必须走 conda lerobot 环境（CLAUDE.md 约定）。
+# 可用 PYTHON=<path> 覆盖。
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for c in /opt/anaconda3/envs/lerobot/bin/python \
+           "$HOME/miniconda3/envs/lerobot/bin/python" \
+           "$HOME/anaconda3/envs/lerobot/bin/python"; do
+    [ -x "$c" ] && PYTHON="$c" && break
+  done
+  PYTHON="${PYTHON:-python3}"
+fi
+# fail-fast：宁可当场报错，也不要让三条 ckpt 全跑出半截结果
+"$PYTHON" -c 'import numpy, pandas' 2>/dev/null \
+  || { echo "解释器 $PYTHON 缺 numpy/pandas；用 PYTHON=<conda lerobot python> 覆盖"; exit 1; }
+echo "[post] 解释器: $PYTHON"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_CSV="$REPO/../goai_2026/data/real_lerobot_v30_ee/real_lerobot_v30_ee.csv"
 SPLIT="$REPO/../goai_2026/data/real_lerobot_v30_ee/train_val_split.json"
@@ -55,14 +72,14 @@ for CK in "$@"; do
   # 2) 算指标
   RUN_DIR="$EVAL_ROOT/${MID}_${CK}_${DATE}"
   mkdir -p "$RUN_DIR"
-  python3 "$REPO/evaluation/evaluate_ee.py" \
+  "$PYTHON" "$REPO/evaluation/evaluate_ee.py" \
     --baseline-csv    "$BASE_CSV" \
     --split-file      "$SPLIT" \
     --predictions-csv "$LOCAL_DIR/predictions.csv" \
     --output-dir      "$RUN_DIR" || { echo "[post] FAIL evaluate_ee"; fail=$((fail+1)); continue; }
 
   # 3) 登记入库 + 刷新扁平表
-  python3 "$REPO/evaluation/record_offline_sqlite.py" \
+  "$PYTHON" "$REPO/evaluation/record_offline_sqlite.py" \
     --run-dir   "$RUN_DIR" \
     --db        "$DB" \
     --stats-json "$LOCAL_DIR/predictions_inference_stats.json" \
