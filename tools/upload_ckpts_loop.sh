@@ -61,8 +61,9 @@ while true; do
     fi
     [ -f "$ck/model.safetensors" ] || continue   # 权重未写完整
 
-    # 并发闸门
-    while [ "$(pgrep -fc 'hf upload' 2>/dev/null || echo 0)" -ge "$MAX_CONC" ]; do
+    # 并发闸门（用 wc -l 而非 pgrep -fc：pgrep 无匹配时既打印 0 又返回 1，
+    # `|| echo 0` 会再补一行，得到 "0\n0" 让 [ -ge ] 报 integer expression expected）
+    while [ "$(pgrep -f 'hf upload' 2>/dev/null | wc -l)" -ge "$MAX_CONC" ]; do
       sleep 20
     done
 
