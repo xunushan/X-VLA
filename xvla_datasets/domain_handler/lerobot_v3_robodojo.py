@@ -481,7 +481,8 @@ class LeRobotV3RoboDojoHandler(DomainHandler):
                     f"missing for episode {ep_idx}. Run tools/add_frame_weight.py verify first."
                 )
             else:
-                # 候选帧 idxs = range(0, T-5) 帧序连续，fw 本身按帧序 → 直接切片前 len(idxs) 个即可
+                # 候选帧 idxs = range(0, T-num_actions) 帧序连续，fw 本身按帧序；
+                # allowlist 生效时 idxs 也可能是稀疏索引，因此始终按真实 idx 取权重。
                 # idxs may be sparse when an SF cache allowlist is active.
                 w = np.asarray([fw[i] for i in idxs], dtype=np.float64)
                 if not np.isfinite(w).all() or (w <= 0).any():
