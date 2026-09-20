@@ -52,7 +52,7 @@ probe(){   # 每项都带 KEY= 前缀并以 0 兜底 —— 裸位置取行会�
   ssh -n -o ConnectTimeout=15 -o BatchMode=yes "$HOST" "
     printf 'NOW=%s\n' \$(date -u +%s)
     printf 'TRAIN=%s\n' \$(pgrep -c -f 'train[a-z_]*\.py' || true)
-    printf 'CHAIN=%s\n' \$(pgrep -c -f 'x1_final_chain[.]sh' || true)
+    printf 'CHAIN=%s\n' \$(pgrep -c -f 'x1_train_chain[.]sh' || true)
     printf 'MTIME=%s\n' \$(stat -c %Y '$LOG' 2>/dev/null || echo 0)
     printf 'STEP=%s\n' \"\$(grep -oE '\[[0-9]+/[0-9]+\].*(s/it)' '$LOG' 2>/dev/null | tail -1)\"
     printf 'LASTCHAIN=%s\n' \"\$(tail -1 '$CHAIN_LOG' 2>/dev/null)\"
@@ -85,13 +85,18 @@ recover(){
           > "$D/upload_loop_120k.log" 2>&1 < /dev/null &
     fi
     pgrep -f "x1_blackbox[.]sh" > /dev/null || \
-      nohup bash /cloud/x1_blackbox.sh > /dev/null 2>&1 < /dev/null &
+      setsid nohup bash /cloud/x1_blackbox.sh > /dev/null 2>&1 < /dev/null &
     pgrep -f "x1_final_report_loop[.]sh" > /dev/null || \
-      nohup bash /cloud/x1_final_report_loop.sh > /dev/null 2>&1 < /dev/null &
+      setsid nohup bash /cloud/x1_final_report_loop.sh > /dev/null 2>&1 < /dev/null &
     pgrep -f "x1_prune_loop[.]sh" > /dev/null || \
-      nohup bash /cloud/x1_prune_loop.sh > /dev/null 2>&1 < /dev/null &
+      setsid nohup bash /cloud/x1_prune_loop.sh > /dev/null 2>&1 < /dev/null &
+    pgrep -f "x1_upload_daemon[.]sh" > /dev/null || \
+      setsid nohup bash /cloud/x1_upload_daemon.sh > /dev/null 2>&1 < /dev/null &
+    pgrep -f "x1_gpu_daemon[.]sh" > /dev/null || \
+      setsid nohup bash /cloud/x1_gpu_daemon.sh > /dev/null 2>&1 < /dev/null &
     sleep 2
-    nohup bash /cloud/x1_final_chain.sh > /cloud/x1_final_chain.stdout.log 2>&1 < /dev/null &
+    # 训练链只做训练，不带任何守护（用户 2026-09-20 定的边界）
+    setsid nohup bash /cloud/x1_train_chain.sh > /cloud/x1_train_chain.stdout.log 2>&1 < /dev/null &
     echo recovered' 2>/dev/null
 }
 
