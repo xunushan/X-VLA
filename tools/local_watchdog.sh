@@ -70,9 +70,11 @@ recover(){
   # 链脚本是幂等的：ckpt-6000 已完整的 run 会自己跳过，所以放心重入。
   ssh -n -o ConnectTimeout=20 -o BatchMode=yes "$HOST" '
     export HF_BIN=/cloud/envs/xvla/bin/hf
-    # hf_transfer：Rust 分块并发上传。窗口只有 ~4 分钟、3.52G @13MB/s 要 4.5 分钟，
-    # 走默认的单流 http 传输每轮都差一点。装好后（/cloud/envs/xvla）靠这个开关启用。
-    export HF_HUB_ENABLE_HF_TRANSFER=1
+    # 曾经想用 HF_HUB_ENABLE_HF_TRANSFER=1（Rust 分块并发）把 3.52G 压进 4 分钟窗口，
+    # 2026-09-20 22:17 实测否掉了：开 hf_transfer 后 eth0 TX = 11.4 MB/s，不开时 13.3 MB/s，
+    # **没变快反而略慢**，且它的进度条只报文件数（`0/1 [00:00<?, ?it/s]`）看不到字节，
+    # 比默认的 `443M/3.52G` 更不透明。瓶颈是 pod 出口带宽（~90–115 Mbps），不是协议开销，
+    # 换传输层无解 —— 所以回到默认 uploader。
     D=/cloud/data/outputs/x0_ee6d_real
     # X0 ckpt-120000 的补传：每轮 pod 存活窗口都值得试一次。已有 .done 就不重启它。
     if [ ! -f "$D/upload_ckpt-120000.done" ]; then
