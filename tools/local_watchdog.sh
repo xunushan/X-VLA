@@ -24,9 +24,14 @@ WEBHOOK_FILE="$HOME/.claude/feishu_webhook"
 STOP=/tmp/watchdog_stop
 STATE=/tmp/watchdog_last_state
 COOLDOWN_FILE=/tmp/watchdog_last_recover
-INTERVAL=300
+# 2026-09-20 深夜该 pod 进入抢占式 crash-loop，存活窗口实测短到 4 分钟（22:04:08→22:08:26），
+# 而 X1 训练要 ~9 分钟才落第一个 ckpt、X0 ckpt-120000 上传要 ~4.5 分钟 —— 每一秒窗口都是
+# 竞速。探测粒度必须细到能把窗口开头那几分钟抢回来，所以 60s（原先 180s 会吃掉大半个窗口）。
+INTERVAL=60
 STALE_S=900
-COOLDOWN_S=900      # 两次自动恢复之间至少隔这么久
+# 冷却只用来防「同一次死亡被反复重启」，不需要长：窗口本身就短，冷却长了反而
+# 让新窗口的前几分钟干等。90s 足够跨过 chain 启动到进程可见的那段。
+COOLDOWN_S=90
 
 notify(){
   curl -s -X POST -H 'Content-Type: application/json' \
@@ -65,6 +70,20 @@ recover(){
   # 链脚本是幂等的：ckpt-6000 已完整的 run 会自己跳过，所以放心重入。
   ssh -n -o ConnectTimeout=20 -o BatchMode=yes "$HOST" '
     export HF_BIN=/cloud/envs/xvla/bin/hf
+    # hf_transfer：Rust 分块并发上传。窗口只有 ~4 分钟、3.52G @13MB/s 要 4.5 分钟，
+    # 走默认的单流 http 传输每轮都差一点。装好后（/cloud/envs/xvla）靠这个开关启用。
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    D=/cloud/data/outputs/x0_ee6d_real
+    # X0 ckpt-120000 的补传：每轮 pod 存活窗口都值得试一次。已有 .done 就不重启它。
+    if [ ! -f "$D/upload_ckpt-120000.done" ]; then
+      # 模式必须写成 upload_ckpts_loop[.]sh —— 不然这段文字本身就在 ssh 的 bash -c
+      # 命令行里，pgrep 会匹配到自己 → 永远以为守护在跑 → 永远不重启它。
+      pgrep -f "upload_ckpts_loop[.]sh $D " > /dev/null || \
+        nohup bash /cloud/data/X-VLA/tools/upload_ckpts_loop.sh "$D" tianSeconds/X0-final - 2 120000 \
+          > "$D/upload_loop_120k.log" 2>&1 < /dev/null &
+    fi
+    pgrep -f "x1_blackbox[.]sh" > /dev/null || \
+      nohup bash /cloud/x1_blackbox.sh > /dev/null 2>&1 < /dev/null &
     pgrep -f "x1_final_report_loop[.]sh" > /dev/null || \
       nohup bash /cloud/x1_final_report_loop.sh > /dev/null 2>&1 < /dev/null &
     pgrep -f "x1_prune_loop[.]sh" > /dev/null || \
