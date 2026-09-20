@@ -59,7 +59,13 @@ while true; do
       echo "[$(date '+%H:%M:%S')] upload verified (from log): $name"
       continue
     fi
-    [ -f "$ck/model.safetensors" ] || continue   # 权重未写完整
+    # 权重未写完整 → 跳过，下轮再看。
+    # train.py 的保存序列是 optimizer → state.json → **权重 → state.json**，
+    # 两处 state.json 都在最后写，充当「保存完成」标记（见 train.py:checkpoint_is_complete
+    # 的 docstring）。而 safetensors 是直写目标文件、无 temp+rename，因此只判
+    # model.safetensors 存在会拿到被截断的文件 —— 必须等 state.json。
+    # 与 train.py:weights_dir_complete 的判据保持一致。
+    [ -f "$ck/state.json" ] && [ -f "$ck/model.safetensors" ] || continue
 
     # 并发闸门（用 wc -l 而非 pgrep -fc：pgrep 无匹配时既打印 0 又返回 1，
     # `|| echo 0` 会再补一行，得到 "0\n0" 让 [ -ge ] 报 integer expression expected）
