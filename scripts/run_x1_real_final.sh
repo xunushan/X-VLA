@@ -55,7 +55,7 @@ accelerate launch \
   --train_metas_path  /data/data/real_lerobot_v30_ee_6d/meta_3view.json \
   --output_dir        "$OUT" \
   --action_mode ee6d --target_domain 0 \
-  --batch_size 16 --gradient_accumulation_steps 2 --num_workers 8 \
+  --batch_size 16 --gradient_accumulation_steps 2 --num_workers "${X1_NUM_WORKERS:-4}" \
   --max_grad_norm 1.0 --weight_decay 0 --betas 0.9 0.95 \
   --stage1_end 1000 --stage2_end 3000 --stage3_lr_scale 1.0 \
   --iters 6000 --save_interval 1000 --log_interval 20 --seed 0
