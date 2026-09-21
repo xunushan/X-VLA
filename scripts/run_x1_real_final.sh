@@ -2,6 +2,16 @@
 # X1 real @ train-5090：以 X0-final 的两档权重为初值做三相机（cam_high + 左右腕）微调。
 #
 # 用法： bash scripts/run_x1_real_final.sh <120000|110000>
+#        X1_MAINVIS=1 bash scripts/run_x1_real_final.sh 120000   # 额外开主图直连
+#
+# ★ X1_MAINVIS=1 打开 --main_visual_projection：把主相机（cam_high）在进入语言模型
+#   **之前**的视觉 token 直接投进动作 Transformer，与腕部 aux_visual_proj 并列。
+#   打开后 TAG/OUT 自动带 _mainvis 后缀，所以**不会**覆盖已有的 from120k/from110k 产物。
+#   该开关只能配合 `--models` 使用，不能配合 `--resume` —— train_three_camera.py:63-73
+#   要求 resume 时 flag 必须与 checkpoint 里的 use_main_visual_projection 一致，
+#   X0 的 ckpt-120000 是 false，用 --resume 开这个开关会直接 ValueError。
+#   启用时 main_visual_proj 的权重在 step 0 被清零（bias 从 aux_visual_proj 复制），
+#   走 stage1 的 1e-4 线性 warmup 逐步学起来，见 train_three_camera.py:171-190。
 #
 # ★ 本入口**不是** scripts/train.sh 那种 env 覆盖式调用 —— three-camera 的 LR 是
 #   configure_three_camera_step() 里写死的三阶段常量（stage1 aux=1e-4 / stage2 aux=5e-5
@@ -28,6 +38,17 @@ case "$INIT" in
   *) echo "init must be 120000 or 110000, got '$INIT'" >&2; exit 2 ;;
 esac
 
+MAINVIS=${X1_MAINVIS:-0}
+# 空数组展开的兼容写法：`"${MV_ARGS[@]}"` 在 bash<4.4 配 set -u 会报 unbound，
+# 用 ${arr[@]+"${arr[@]}"} 在「未设置」时整体消掉。这里只在 MAINVIS=1 时非空。
+MV_ARGS=()
+if [ "$MAINVIS" = "1" ]; then
+  TAG="${TAG}_mainvis"
+  MV_ARGS=(--main_visual_projection)
+elif [ "$MAINVIS" != "0" ]; then
+  echo "X1_MAINVIS must be 0 or 1, got '$MAINVIS'" >&2; exit 2
+fi
+
 X0=/cloud/data/outputs/x0_ee6d_real/pretrained/ckpt-$INIT
 OUT=/cloud/data/outputs/x1_ee6d_real_$TAG
 
@@ -38,7 +59,7 @@ if [ ! -f "$X0/state.json" ] || [ ! -f "$X0/model.safetensors" ]; then
   exit 3
 fi
 
-echo "[run_x1_real_final] init=ckpt-$INIT out=$OUT"
+echo "[run_x1_real_final] init=ckpt-$INIT out=$OUT main_visual_projection=$MAINVIS"
 
 export PATH=/usr/local/miniconda3/bin:$PATH
 # 与 scripts/train.sh 同一套激活方式（env 实际落在 /cloud/envs/xvla，
@@ -55,6 +76,7 @@ accelerate launch \
   --train_metas_path  /data/data/real_lerobot_v30_ee_6d/meta_3view.json \
   --output_dir        "$OUT" \
   --action_mode ee6d --target_domain 0 \
+  ${MV_ARGS[@]+"${MV_ARGS[@]}"} \
   --batch_size 16 --gradient_accumulation_steps 2 --num_workers "${X1_NUM_WORKERS:-4}" \
   --max_grad_norm 1.0 --weight_decay 0 --betas 0.9 0.95 \
   --stage1_end 1000 --stage2_end 3000 --stage3_lr_scale 1.0 \
